@@ -1,0 +1,322 @@
+{
+  "version": "1.0",
+  "categories": {
+    "data_structure": {
+      "subcategories": {
+        "array": {
+          "topics": ["prefix_sum", "diff_array", "two_pointers", "sliding_window", "binary_search", "nsume"],
+          "aliases": {
+            "luogu": {"前缀和": "prefix_sum", "差分": "diff_array", "双指针": "two_pointers", "滑动窗口": "sliding_window", "二分查找": "binary_search", "N数之和": "nsume"},
+            "leetcode": {"Prefix Sum": "prefix_sum", "Two Pointers": "two_pointers", "Sliding Window": "sliding_window", "Binary Search": "binary_search", "N-Sum": "nsume"},
+            "codeforces": {"two pointers": "two_pointers", "binary search": "binary_search", "brute force": "sliding_window", "prefix sums": "prefix_sum"}
+          }
+        },
+        "linked_list": {
+          "topics": ["reverse", "merge", "cycle_detect", "palindrome", "k_group"],
+          "aliases": {
+            "luogu": {"反转链表": "reverse", "合并链表": "merge", "环形链表": "cycle_detect", "回文链表": "palindrome", "K个一组": "k_group"},
+            "leetcode": {"Linked List": "reverse", "Merge": "merge", "Cycle Detection": "cycle_detect", "Palindrome": "palindrome", "K-Group": "k_group"}
+          }
+        },
+        "stack_queue": {
+          "topics": ["monotonic_stack", "monotonic_queue", "parentheses", "calculator"],
+          "aliases": {
+            "luogu": {"单调栈": "monotonic_stack", "单调队列": "monotonic_queue", "括号匹配": "parentheses", "表达式求值": "calculator"},
+            "leetcode": {"Monotonic Stack": "monotonic_stack", "Monotonic Queue": "monotonic_queue", "Parentheses": "parentheses", "Calculator": "calculator"}
+          }
+        },
+        "tree": {
+          "topics": ["binary_tree_traverse", "bst", "segment_tree", "trie", "heap", "lca", "binary_indexed_tree", "balanced_tree"],
+          "aliases": {
+            "luogu": {"二叉树": "binary_tree_traverse", "二叉搜索树": "bst", "线段树": "segment_tree", "字典树": "trie", "堆": "heap", "最近公共祖先": "lca", "树状数组": "binary_indexed_tree", "平衡树": "balanced_tree"},
+            "leetcode": {"Binary Tree": "binary_tree_traverse", "Binary Search Tree": "bst", "Segment Tree": "segment_tree", "Trie": "trie", "Heap": "heap", "LCA": "lca", "Fenwick Tree": "binary_indexed_tree", "Balanced Tree": "balanced_tree"},
+            "codeforces": {"segment tree": "segment_tree", "Fenwick": "binary_indexed_tree", "trie": "trie", "LCA": "lca", "binary tree": "binary_tree_traverse"}
+          }
+        },
+        "graph": {
+          "topics": ["adjacency_list", "adjacency_matrix", "union_find"],
+          "aliases": {
+            "luogu": {"邻接表": "adjacency_list", "邻接矩阵": "adjacency_matrix", "并查集": "union_find"},
+            "leetcode": {"Adjacency List": "adjacency_list", "Union Find": "union_find", "Disjoint Set": "union_find"},
+            "codeforces": {"DSU": "union_find", "union find": "union_find", "dsu": "union_find"}
+          }
+        },
+        "hash": {
+          "topics": ["hash_map", "hash_set", "bloom_filter"],
+          "aliases": {
+            "luogu": {"哈希表": "hash_map", "哈希集合": "hash_set", "布隆过滤器": "bloom_filter"},
+            "leetcode": {"Hash Map": "hash_map", "Hash Set": "hash_set", "Bloom Filter": "bloom_filter"},
+            "codeforces": {"hash map": "hash_map", "map": "hash_map", "set": "hash_set"}
+          }
+        }
+      }
+    },
+    "search": {
+      "subcategories": {
+        "backtracking": {
+          "topics": ["permutation", "combination", "subset", "n_queens", "sudoku", "partition"],
+          "aliases": {
+            "luogu": {"全排列": "permutation", "组合": "combination", "子集": "subset", "N皇后": "n_queens", "数独": "sudoku"},
+            "leetcode": {"Backtracking": "permutation", "Permutation": "permutation", "Combination": "combination", "Subset": "subset", "N-Queens": "n_queens", "Sudoku": "sudoku"}
+          }
+        },
+        "bfs": {
+          "topics": ["level_order", "multi_source_bfs", "shortest_path_unweighted", "maze"],
+          "aliases": {
+            "luogu": {"层次遍历": "level_order", "多源BFS": "multi_source_bfs", "无权最短路": "shortest_path_unweighted", "迷宫": "maze"},
+            "leetcode": {"Level Order": "level_order", "Multi-Source BFS": "multi_source_bfs", "Shortest Path": "shortest_path_unweighted", "Maze": "maze"}
+          }
+        },
+        "dfs": {
+          "topics": ["island", "flood_fill", "connected_component", "topological_sort"],
+          "aliases": {
+            "luogu": {"岛屿": "island", "洪水填充": "flood_fill", "连通分量": "connected_component", "拓扑排序": "topological_sort"},
+            "leetcode": {"Island": "island", "Flood Fill": "flood_fill", "Connected Component": "connected_component", "Topological Sort": "topological_sort"}
+          }
+        },
+        "binary_search": {
+          "topics": ["left_boundary", "right_boundary", "rotated_array", "search_matrix"],
+          "aliases": {
+            "luogu": {"左边界二分": "left_boundary", "右边界二分": "right_boundary", "旋转数组": "rotated_array", "矩阵搜索": "search_matrix"},
+            "leetcode": {"Left Boundary": "left_boundary", "Right Boundary": "right_boundary", "Rotated Array": "rotated_array", "Search Matrix": "search_matrix"}
+          }
+        }
+      }
+    },
+    "dynamic_programming": {
+      "subcategories": {
+        "linear_dp": {
+          "topics": ["lis", "lcs", "edit_distance", "max_subarray", "house_robber"],
+          "aliases": {
+            "luogu": {"最长上升子序列": "lis", "最长公共子序列": "lcs", "编辑距离": "edit_distance", "最大子数组": "max_subarray", "打家劫舍": "house_robber"},
+            "leetcode": {"LIS": "lis", "LCS": "lcs", "Edit Distance": "edit_distance", "Maximum Subarray": "max_subarray", "House Robber": "house_robber"},
+            "codeforces": {"LIS": "lis", "dp": "lis"}
+          }
+        },
+        "knapsack": {
+          "topics": ["zero_one", "complete", "multiple", "group"],
+          "aliases": {
+            "luogu": {"01背包": "zero_one", "完全背包": "complete", "多重背包": "multiple", "分组背包": "group"},
+            "leetcode": {"0/1 Knapsack": "zero_one", "Unbounded Knapsack": "complete", "Bounded Knapsack": "multiple", "Group Knapsack": "group"},
+            "codeforces": {"knapsack": "zero_one"}
+          }
+        },
+        "interval_dp": {
+          "topics": ["burst_balloons", "stone_merge", "palindrome_partition"],
+          "aliases": {
+            "luogu": {"戳气球": "burst_balloons", "石子合并": "stone_merge", "回文分割": "palindrome_partition"},
+            "leetcode": {"Burst Balloons": "burst_balloons", "Stone Merge": "stone_merge", "Palindrome Partition": "palindrome_partition"}
+          }
+        },
+        "tree_dp": {
+          "topics": ["diameter", "rob_tree", "camera"],
+          "aliases": {
+            "luogu": {"树的直径": "diameter", "树上打劫": "rob_tree", "监控树": "camera"},
+            "leetcode": {"Tree Diameter": "diameter", "House Robber III": "rob_tree", "Binary Tree Cameras": "camera"}
+          }
+        },
+        "bitmask_dp": {
+          "topics": ["tsp", "assignment", "subset_cover"],
+          "aliases": {
+            "luogu": {"旅行商问题": "tsp", "分配问题": "assignment", "集合覆盖": "subset_cover"},
+            "leetcode": {"TSP": "tsp", "Assignment": "assignment", "Set Cover": "subset_cover"},
+            "codeforces": {"bitmask dp": "tsp", "TSP": "tsp"}
+          }
+        },
+        "game_dp": {
+          "topics": ["nim", "stone_game", "coin_game"],
+          "aliases": {
+            "luogu": {"Nim游戏": "nim", "石子游戏": "stone_game", "硬币游戏": "coin_game"},
+            "leetcode": {"Nim Game": "nim", "Stone Game": "stone_game", "Coin Game": "coin_game"}
+          }
+        },
+        "string_dp": {
+          "topics": ["regex_match", "wildcard", "word_break"],
+          "aliases": {
+            "luogu": {"正则匹配": "regex_match", "通配符": "wildcard", "单词拆分": "word_break"},
+            "leetcode": {"Regular Expression": "regex_match", "Wildcard Matching": "wildcard", "Word Break": "word_break"}
+          }
+        }
+      }
+    },
+    "graph_theory": {
+      "subcategories": {
+        "shortest_path": {
+          "topics": ["dijkstra", "bellman_ford", "floyd", "spfa"],
+          "aliases": {
+            "luogu": {"最短路": "dijkstra", "Dijkstra": "dijkstra", "Bellman-Ford": "bellman_ford", "Floyd": "floyd", "SPFA": "spfa"},
+            "leetcode": {"Dijkstra": "dijkstra", "Bellman-Ford": "bellman_ford", "Floyd-Warshall": "floyd", "SPFA": "spfa"},
+            "codeforces": {"shortest path": "dijkstra", "dijkstra": "dijkstra", "bfs": "dijkstra"}
+          }
+        },
+        "mst": {
+          "topics": ["kruskal", "prim"],
+          "aliases": {
+            "luogu": {"最小生成树": "kruskal", "Kruskal": "kruskal", "Prim": "prim"},
+            "leetcode": {"Kruskal": "kruskal", "Prim": "prim", "MST": "kruskal"},
+            "codeforces": {"MST": "kruskal", "kruskal": "kruskal"}
+          }
+        },
+        "connectivity": {
+          "topics": ["tarjan_scc", "bridge", "articulation_point"],
+          "aliases": {
+            "luogu": {"强连通分量": "tarjan_scc", "割边": "bridge", "割点": "articulation_point"},
+            "leetcode": {"SCC": "tarjan_scc", "Tarjan": "tarjan_scc", "Bridge": "bridge", "Articulation Point": "articulation_point"},
+            "codeforces": {"SCC": "tarjan_scc", "tarjan": "tarjan_scc", "bridge": "bridge"}
+          }
+        },
+        "matching": {
+          "topics": ["bipartite_match", "hungarian", "km"],
+          "aliases": {
+            "luogu": {"二分图匹配": "bipartite_match", "匈牙利算法": "hungarian", "KM算法": "km"},
+            "leetcode": {"Bipartite Matching": "bipartite_match", "Hungarian": "hungarian", "KM Algorithm": "km"},
+            "codeforces": {"matching": "bipartite_match", "bipartite": "bipartite_match"}
+          }
+        },
+        "flow": {
+          "topics": ["max_flow", "min_cost_flow", "dinic"],
+          "aliases": {
+            "luogu": {"最大流": "max_flow", "最小费用流": "min_cost_flow", "Dinic": "dinic"},
+            "leetcode": {"Max Flow": "max_flow", "Min Cost Flow": "min_cost_flow", "Dinic": "dinic"},
+            "codeforces": {"flow": "max_flow", "max flow": "max_flow", "dinic": "dinic"}
+          }
+        },
+        "euler": {
+          "topics": ["euler_path", "euler_circuit"],
+          "aliases": {
+            "luogu": {"欧拉路径": "euler_path", "欧拉回路": "euler_circuit"},
+            "leetcode": {"Euler Path": "euler_path", "Euler Circuit": "euler_circuit"},
+            "codeforces": {"euler": "euler_path", "eulerian path": "euler_path"}
+          }
+        }
+      }
+    },
+    "math": {
+      "subcategories": {
+        "number_theory": {
+          "topics": ["prime_sieve", "euler_phi", "mod_inverse", "crt", "exgcd"],
+          "aliases": {
+            "luogu": {"素数筛": "prime_sieve", "欧拉函数": "euler_phi", "模逆元": "mod_inverse", "中国剩余定理": "crt", "扩展欧几里得": "exgcd"},
+            "leetcode": {"Sieve": "prime_sieve", "Euler Totient": "euler_phi", "Modular Inverse": "mod_inverse", "CRT": "crt", "Extended GCD": "exgcd"},
+            "codeforces": {"number theory": "prime_sieve", "sieve": "prime_sieve", "gcd": "exgcd", "CRT": "crt"}
+          }
+        },
+        "combinatorics": {
+          "topics": ["catalan", "inclusion_exclusion", "mobius", "burnside"],
+          "aliases": {
+            "luogu": {"卡特兰数": "catalan", "容斥原理": "inclusion_exclusion", "莫比乌斯反演": "mobius", "Burnside引理": "burnside"},
+            "leetcode": {"Catalan": "catalan", "Inclusion-Exclusion": "inclusion_exclusion", "Mobius": "mobius", "Burnside": "burnside"},
+            "codeforces": {"combinatorics": "catalan", "catalan": "catalan", "inclusion-exclusion": "inclusion_exclusion"}
+          }
+        },
+        "linear_algebra": {
+          "topics": ["matrix_pow", "gaussian_elimination", "xor_basis"],
+          "aliases": {
+            "luogu": {"矩阵快速幂": "matrix_pow", "高斯消元": "gaussian_elimination", "异或基": "xor_basis"},
+            "leetcode": {"Matrix Power": "matrix_pow", "Gaussian Elimination": "gaussian_elimination", "XOR Basis": "xor_basis"},
+            "codeforces": {"matrix": "matrix_pow", "linear algebra": "gaussian_elimination", "xor basis": "xor_basis"}
+          }
+        },
+        "probability": {
+          "topics": ["expected_value", "probability_dp", "random_algorithm"],
+          "aliases": {
+            "luogu": {"期望值": "expected_value", "概率DP": "probability_dp", "随机算法": "random_algorithm"},
+            "leetcode": {"Expected Value": "expected_value", "Probability DP": "probability_dp", "Randomized": "random_algorithm"}
+          }
+        },
+        "geometry": {
+          "topics": ["convex_hull", "rotating_calipers", "half_plane", "circle"],
+          "aliases": {
+            "luogu": {"凸包": "convex_hull", "旋转卡壳": "rotating_calipers", "半平面交": "half_plane", "圆": "circle"},
+            "leetcode": {"Convex Hull": "convex_hull", "Rotating Calipers": "rotating_calipers", "Half-Plane": "half_plane", "Circle": "circle"},
+            "codeforces": {"geometry": "convex_hull", "convex hull": "convex_hull"}
+          }
+        }
+      }
+    },
+    "string": {
+      "subcategories": {
+        "pattern_match": {
+          "topics": ["kmp", "rabin_karp", "ac_automaton", "z_function"],
+          "aliases": {
+            "luogu": {"KMP": "kmp", "字符串匹配": "kmp", "Rabin Karp": "rabin_karp", "AC自动机": "ac_automaton", "Z函数": "z_function"},
+            "leetcode": {"KMP": "kmp", "Rabin-Karp": "rabin_karp", "Aho-Corasick": "ac_automaton", "Z Function": "z_function"},
+            "codeforces": {"KMP": "kmp", "string matching": "kmp", "hashing": "rabin_karp", "z-function": "z_function"}
+          }
+        },
+        "suffix_structure": {
+          "topics": ["suffix_array", "suffix_automaton", "sam"],
+          "aliases": {
+            "luogu": {"后缀数组": "suffix_array", "后缀自动机": "suffix_automaton", "SAM": "sam"},
+            "leetcode": {"Suffix Array": "suffix_array", "Suffix Automaton": "suffix_automaton", "SAM": "sam"},
+            "codeforces": {"suffix array": "suffix_array", "SA": "suffix_array", "SAM": "sam"}
+          }
+        },
+        "palindrome": {
+          "topics": ["manacher", "palindrome_tree"],
+          "aliases": {
+            "luogu": {"Manacher": "manacher", "回文树": "palindrome_tree"},
+            "leetcode": {"Manacher": "manacher", "Palindrome Tree": "palindrome_tree"},
+            "codeforces": {"manacher": "manacher", "palindromic tree": "palindrome_tree"}
+          }
+        },
+        "trie_advanced": {
+          "topics": ["trie", "ac_automaton", "xor_trie"],
+          "aliases": {
+            "luogu": {"字典树": "trie", "AC自动机": "ac_automaton", "异或Trie": "xor_trie"},
+            "leetcode": {"Trie": "trie", "Aho-Corasick": "ac_automaton", "XOR Trie": "xor_trie"},
+            "codeforces": {"trie": "trie", "binary trie": "xor_trie"}
+          }
+        }
+      }
+    },
+    "greedy": {
+      "subcategories": {
+        "interval": {
+          "topics": ["interval_scheduling", "interval_cover", "scan_line"],
+          "aliases": {
+            "luogu": {"区间调度": "interval_scheduling", "区间覆盖": "interval_cover", "扫描线": "scan_line"},
+            "leetcode": {"Interval Scheduling": "interval_scheduling", "Interval Cover": "interval_cover", "Sweep Line": "scan_line"},
+            "codeforces": {"greedy": "interval_scheduling", "intervals": "interval_scheduling", "sweep line": "scan_line"}
+          }
+        },
+        "sorting_greedy": {
+          "topics": ["activity_selection", "huffman", "fractional_knapsack"],
+          "aliases": {
+            "luogu": {"活动选择": "activity_selection", "哈夫曼编码": "huffman", "分数背包": "fractional_knapsack"},
+            "leetcode": {"Activity Selection": "activity_selection", "Huffman Coding": "huffman", "Fractional Knapsack": "fractional_knapsack"}
+          }
+        },
+        "constructive": {
+          "topics": ["math_constructive", "greedy_simulation"],
+          "aliases": {
+            "luogu": {"构造题": "math_constructive", "贪心模拟": "greedy_simulation"},
+            "leetcode": {"Constructive": "math_constructive", "Greedy Simulation": "greedy_simulation"},
+            "codeforces": {"constructive": "math_constructive", "greedy": "greedy_simulation"}
+          }
+        }
+      }
+    }
+  },
+  "dependency_graph": {
+    "search.backtracking": ["data_structure.tree.binary_tree_traverse"],
+    "search.bfs": ["data_structure.tree.binary_tree_traverse"],
+    "search.dfs": ["data_structure.tree.binary_tree_traverse"],
+    "search.binary_search": ["data_structure.array.binary_search"],
+    "dynamic_programming.knapsack": ["dynamic_programming.linear_dp"],
+    "dynamic_programming.tree_dp": ["data_structure.tree.binary_tree_traverse", "dynamic_programming.linear_dp"],
+    "dynamic_programming.bitmask_dp": ["search.backtracking"],
+    "dynamic_programming.string_dp": ["dynamic_programming.linear_dp"],
+    "graph_theory.shortest_path": ["data_structure.graph.union_find", "search.bfs"],
+    "graph_theory.mst": ["data_structure.graph.union_find"],
+    "graph_theory.connectivity": ["search.dfs"],
+    "graph_theory.matching": ["search.dfs", "search.bfs"],
+    "graph_theory.flow": ["search.bfs", "graph_theory.shortest_path"],
+    "graph_theory.euler": ["search.dfs"],
+    "string.pattern_match.kmp": ["data_structure.array.two_pointers"],
+    "string.trie_advanced.ac_automaton": ["string.pattern_match.kmp", "string.trie_advanced.trie"],
+    "string.trie_advanced": ["data_structure.hash.hash_map"],
+    "greedy.interval": ["data_structure.array.binary_search"],
+    "math.combinatorics": ["math.number_theory"]
+  }
+}
