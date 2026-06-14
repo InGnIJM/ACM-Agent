@@ -36,6 +36,7 @@ backend/prisma/migrations/
 
 # Python
 *.egg-info/
+python/data/
 
 # Logs
 *.log
