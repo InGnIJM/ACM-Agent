@@ -318,6 +318,11 @@ class TestCodeforcesFetchProblem:
                 },
             }
         )
+        c.fetch_with_fallback = MagicMock(return_value=CrawlResult(
+            success=True,
+            data="<div class='problem-statement'><div>problem text</div></div>",
+            source="http",
+        ))
         result = c.fetch_problem("1742E")
         assert result.success
         assert result.data["name"] == "Binary Search"
@@ -479,6 +484,11 @@ class TestCodeforcesEdgeCases:
                 },
             }
         )
+        c.fetch_with_fallback = MagicMock(return_value=CrawlResult(
+            success=True,
+            data="<div class='problem-statement'><div>problem text</div></div>",
+            source="http",
+        ))
         result = c.fetch_problem("1742E")
         assert result.success
         assert result.data["name"] == "Correct"
@@ -491,3 +501,130 @@ class TestCodeforcesEdgeCases:
         result = c.fetch_problem("1742E")
         assert not result.success
         assert "not found" in (result.error or "").lower()
+
+    def test_empty_html_returns_failure(self) -> None:
+        """When fetch_with_fallback succeeds but HTML text is empty, return failure."""
+        c = _mock_crawler()
+        c._http_request.return_value = _crawl_ok(
+            {
+                "status": "OK",
+                "result": {
+                    "problems": [
+                        {"contestId": 1742, "index": "E", "name": "Binary Search"},
+                    ]
+                },
+            }
+        )
+        c.fetch_with_fallback = MagicMock(return_value=CrawlResult(
+            success=True,
+            data={},  # dict with no 'text' or 'html' keys → empty string
+            source="http",
+            retry_count=1,
+        ))
+        result = c.fetch_problem("1742E")
+        assert not result.success
+        assert "Empty HTML" in (result.error or "")
+        assert result.retry_count == 1
+
+
+# ──────────────────────────────────────────────
+# _cf_extract — adjacent MathJax block merging
+# ──────────────────────────────────────────────
+
+# Minimal valid HTML wrapper that _cf_extract needs to parse
+def _wrap_html(body: str) -> str:
+    return f"""<div class="problem-statement">
+<div class="header"><div class="title">Test</div>
+<div class="time-limit"><div class="property-title">time limit per test</div>1 second</div>
+<div class="memory-limit"><div class="property-title">memory limit per test</div>256 megabytes</div>
+</div>
+<div>{body}</div>
+</div>"""
+
+
+def _extract_description(html: str) -> str:
+    """Run _cf_extract on the 'problem-statement' class and return cleaned text."""
+    return CodeforcesCrawler._cf_extract(html, "problem-statement", skip_header=True)
+
+
+class TestCfExtractAdjacentMath:
+    """Tests for merging adjacent $$$ blocks in _cf_extract.
+
+    On Codeforces HTML pages, a single mathematical expression may be
+    split across multiple adjacent $$$...$$$ blocks:
+      $$$x \\cdot {lcm}(p_1, p_2, \\ldots, p_n)$$$$$$^{\\text{∗}}$$$
+    These MUST be merged into $x \\cdot {lcm}(...)^{\\ast}$ for KaTeX.
+    """
+
+    def test_adjacent_two_blocks_merged(self) -> None:
+        """$$$A$$$$$$B$$$ → $AB$ (two adjacent blocks merged)."""
+        html = _wrap_html(
+            '<p>Check $$$x \\cdot y$$$$$$^{\\text{∗}}$$$ here.</p>'
+        )
+        text = _extract_description(html)
+        # The two math blocks should be merged: ^{\ast} inside the same $...$
+        # After tex preprocessing, ^{\text{∗}} → ^{\ast}
+        assert r"^{\ast}$" in text, f"^{{\\ast}} should be inside math block, got: {text}"
+        # Verify the complete merged block
+        assert r"$x \cdot y^{\ast}$" in text, f"Got: {text}"
+
+    def test_adjacent_three_blocks_merged(self) -> None:
+        """$$$A$$$$$$B$$$$$$C$$$ → $ABC$ (chain of 3 blocks merged)."""
+        html = _wrap_html(
+            '<p>$$$a$$$$$$b$$$$$$c$$$ end.</p>'
+        )
+        text = _extract_description(html)
+        # All three should be in a single $...$ block
+        assert "$abc$" in text.replace(" ", ""), f"Got: {text}"
+
+    def test_orphaned_superscript_merged(self) -> None:
+        """Real CF bug: ^{\text{∗}} orphaned from main expression.
+
+        The = is plain text in the original HTML (outside $$$), so it stays
+        between two math blocks: $...lcm(...)^{*}$ = $product$.
+        This is correct rendering — the equals sign was never inside math mode.
+        """
+        html = _wrap_html(
+            '<p>Ideal if $$$x \\cdot {lcm}(p_1, p_2, \\ldots, p_n)$$$$$$^{\\text{∗}}$$$ = $$$p_1 \\cdot p_2 \\cdot \\ldots \\cdot p_n$$$.</p>'
+        )
+        text = _extract_description(html)
+        no_spaces = text.replace(" ", "")
+        # The ^{\ast} should be INSIDE the first $...$ block, not orphaned
+        expected_merged = r"$x\cdot{lcm}(p_1,p_2,\ldots,p_n)^{\ast}$"
+        assert expected_merged in no_spaces, \
+            f"^{{\\ast}} not merged into math block, got: {no_spaces}"
+        # The = stays as plain text (was outside $$$ in original HTML)
+        # The second math block is separate
+        assert r"$p_1\cdotp_2\cdot\ldots\cdotp_n$" in no_spaces, \
+            f"Product math block not found, got: {no_spaces}"
+
+    def test_non_adjacent_blocks_not_merged(self) -> None:
+        """$$$A$$$ text $$$B$$$ → $A$ text $B$ (separate blocks stay separate)."""
+        html = _wrap_html(
+            '<p>Value $$$x$$$ is not $$$y$$$ here.</p>'
+        )
+        text = _extract_description(html)
+        # Two separate math blocks with text between them
+        assert "$x$" in text
+        assert "$y$" in text
+        # They should NOT be merged into one block
+        assert "$x$ is not $y$" in text or "$x$ is not $y$" in text.replace("  ", " ")
+
+    def test_footnote_orphaned_superscripts(self) -> None:
+        """CF footnotes: $$$^{\\text{∗}}$$$$$$lcm$$$ → $^{\\ast}lcm$."""
+        html = _wrap_html(
+            '<div class="statement-footnote"><p>$$$^{\\text{∗}}$$$$$$lcm$$$ — least common multiple.</p></div>'
+        )
+        text = _extract_description(html)
+        no_spaces = text.replace(" ", "")
+        assert r"$^{\ast}lcm$" in no_spaces, f"Got: {no_spaces}"
+
+    def test_dagger_orphaned_superscript_merged(self) -> None:
+        """CF bug companion: ^{\text{†}} orphaned after 'different'."""
+        html = _wrap_html(
+            '<p>Number of different$$$^{\\text{†}}$$$ arrays $$$p$$$.</p>'
+        )
+        text = _extract_description(html)
+        no_spaces = text.replace(" ", "")
+        # ^{\\dagger} in its own $ block (not adjacent to $p$ — text " arrays " separates them)
+        assert r"$^{\dagger}$" in no_spaces, f"Got: {no_spaces}"
