@@ -16,6 +16,7 @@ import InputOutlinedIcon from "@mui/icons-material/InputOutlined";
 import OutputOutlinedIcon from "@mui/icons-material/OutputOutlined";
 import TipsAndUpdatesOutlinedIcon from "@mui/icons-material/TipsAndUpdatesOutlined";
 import BarChartOutlinedIcon from "@mui/icons-material/BarChartOutlined";
+import LightbulbOutlinedIcon from "@mui/icons-material/LightbulbOutlined";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import CheckIcon from "@mui/icons-material/Check";
 import type { Components } from "react-markdown";
@@ -32,13 +33,13 @@ function headerIcon(text: string) {
   if (t.includes("输入")) return <InputOutlinedIcon fontSize="inherit" sx={{ mr: 0.5, verticalAlign: "middle" }} />;
   if (t.includes("输出")) return <OutputOutlinedIcon fontSize="inherit" sx={{ mr: 0.5, verticalAlign: "middle" }} />;
   if (t.includes("提示")) return <TipsAndUpdatesOutlinedIcon fontSize="inherit" sx={{ mr: 0.5, verticalAlign: "middle" }} />;
+  if (t.includes("解释")) return <LightbulbOutlinedIcon fontSize="inherit" sx={{ mr: 0.5, verticalAlign: "middle" }} />;
   if (t.includes("数据范围")) return <BarChartOutlinedIcon fontSize="inherit" sx={{ mr: 0.5, verticalAlign: "middle" }} />;
   return null;
 }
 
 /** Shared colour palette — Luogu-inspired: light surface, high-contrast text */
 const COLORS = {
-  inlineCodeText: "#1e293b",
   blockCodeBg: "#f8f9fa",
   blockCodeFg: "#1e293b",
   blockCodeBorder: "#e5e7eb",
@@ -646,7 +647,7 @@ export function Markdown({ content, sourcePlatform }: MarkdownProps) {
   if (!content) return <Typography color="text.secondary">暂无内容</Typography>;
   const processed = preprocessContent(content, sourcePlatform);
   return (
-    <Box sx={{ minWidth: 0, overflow: "hidden", wordBreak: "break-word", fontSize: "1rem" }} className="markdown-container">
+    <Box sx={{ minWidth: 0, overflow: "hidden", wordBreak: "break-word", fontSize: "1rem" }} className="markdown-body">
       <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={components}>
         {processed}
       </ReactMarkdown>
