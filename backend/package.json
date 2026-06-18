@@ -7,7 +7,7 @@
   "scripts": {
     "build": "nest build",
     "start": "nest start",
-    "start:dev": "nest start --watch",
+    "start:dev": "node -e \"try{require('fs').rmSync('tsconfig.tsbuildinfo',{force:true})}catch(e){}\" && nest start --watch",
     "start:prod": "node dist/main",
     "test": "jest",
     "test:cov": "jest --coverage",

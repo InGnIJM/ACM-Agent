@@ -35,7 +35,7 @@ interface NavItem {
   icon: ReactNode;
 }
 
-export const DRAWER_WIDTH = 220;
+export const DRAWER_WIDTH = 260;
 export const DRAWER_COLLAPSED = 64;
 
 const USER_ITEMS: NavItem[] = [
@@ -116,7 +116,7 @@ export default function Sidebar({ open, onToggle }: SidebarProps) {
               <Box sx={{ width: 32, height: 32, borderRadius: 1.5, background: (t) => `linear-gradient(135deg, ${t.palette.primary.main}, ${t.palette.primary.light})`, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 700, fontSize: 16, flexShrink: 0 }}>
                 A
               </Box>
-              <Typography variant="h6" noWrap sx={{ fontWeight: 700, color: "primary.main", fontSize: 18 }}>
+              <Typography variant="h6" noWrap sx={{ fontWeight: 700, color: "primary.main", fontSize: 22 }}>
                 ACM Agent
               </Typography>
             </>
@@ -164,13 +164,13 @@ export default function Sidebar({ open, onToggle }: SidebarProps) {
                     "&:hover": { backgroundColor: "action.hover" },
                   }}
                 >
-                  <ListItemIcon sx={{ minWidth: expanded ? 36 : 0, mr: expanded ? 1 : 0, justifyContent: "center", color: active ? "inherit" : "text.secondary" }}>
+                  <ListItemIcon sx={{ minWidth: expanded ? 40 : 0, mr: expanded ? 1 : 0, justifyContent: "center", color: active ? "inherit" : "text.secondary", "& .MuiSvgIcon-root": { fontSize: "1.35rem" } }}>
                     {item.icon}
                   </ListItemIcon>
                   {expanded && (
                     <ListItemText
                       primary={item.label}
-                      primaryTypographyProps={{ variant: "body2", fontWeight: active ? 600 : 400, noWrap: true }}
+                      primaryTypographyProps={{ variant: "body1", fontWeight: active ? 600 : 400, noWrap: true, fontSize: "1.15rem" }}
                     />
                   )}
                 </ListItemButton>
