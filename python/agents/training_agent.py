@@ -39,11 +39,11 @@ class TrainingState(TypedDict):
 
 
 # ============================================================
-# DB mock (in-memory for construction)
+# DB adapter (supports real API calls with in-memory fallback)
 # ============================================================
 
 class _TrainingDatabase:
-    """In-memory database for user profiles and training plans."""
+    """In-memory database for user profiles and training plans (dev / testing)."""
 
     def __init__(self) -> None:
         self._profiles: Dict[str, Dict[str, Any]] = {}
@@ -70,6 +70,59 @@ class _TrainingDatabase:
 
     def get_plan(self, user_id: str, profile_id: str) -> Optional[Dict[str, Any]]:
         return self._plans.get(user_id, {}).get(profile_id)
+
+    async def search_problems(
+        self, _query_text: str, _top_k: int = 50, **_filters: Any,
+    ) -> List[Dict[str, Any]]:
+        """No-op — subclasses override."""
+        return []
+
+
+class _ApiTrainingDatabase(_TrainingDatabase):
+    """Database adapter that queries the NestJS vector search API for real retrieval."""
+
+    def __init__(self, base_url: str = "http://localhost:3000") -> None:
+        super().__init__()
+        self._base_url = base_url.rstrip("/")
+
+    async def search_problems(
+        self,
+        query_text: str,
+        top_k: int = 50,
+        platform: str | None = None,
+        tags: List[str] | None = None,
+        difficulty_min: int | None = None,
+        difficulty_max: int | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Call POST /api/problems/search/vector and return results."""
+        import aiohttp
+
+        payload: Dict[str, Any] = {"query": query_text, "topK": top_k}
+        if platform:
+            payload["platform"] = platform
+        if tags:
+            payload["tags"] = ",".join(tags)
+        if difficulty_min is not None:
+            payload["difficultyMin"] = difficulty_min
+        if difficulty_max is not None:
+            payload["difficultyMax"] = difficulty_max
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self._base_url}/api/problems/search/vector",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        raise RuntimeError(
+                            f"Vector search API returned {resp.status}: {body[:300]}"
+                        )
+                    data = await resp.json()
+                    return data.get("results", [])
+        except Exception:
+            return []
 
 
 DEFAULT_TRAINING_DB = _TrainingDatabase()
@@ -174,8 +227,15 @@ class TrainingAgent:
         self,
         db: Optional[_TrainingDatabase] = None,
         llm: Any = None,
+        *,
+        api_url: str | None = None,
     ) -> None:
-        self.db = db or DEFAULT_TRAINING_DB
+        if db is not None:
+            self.db = db
+        elif api_url:
+            self.db = _ApiTrainingDatabase(base_url=api_url)
+        else:
+            self.db = DEFAULT_TRAINING_DB
         if llm is None:
             try:
                 from langchain_openai import ChatOpenAI
@@ -404,41 +464,78 @@ class TrainingAgent:
     # ================================================================
 
     def _retrieve_problems(self, state: TrainingState) -> TrainingState:
-        """Mock vector+tag+similar retrieval with 5-dimension scoring.
+        """Vector search retrieval with 5-dimension scoring.
 
-        Produces a ranked list of candidate problems stored in
-        state["candidate_problems"], each including a `_score` dict with
-        per-dimension breakdown.
+        Tries the real vector search API first, falls back to mock data.
         """
+        import asyncio as _asyncio
+
         targets = state.get("targets", {})
         curve = state.get("difficulty_curve", [5.0] * 7)
         all_primary = targets.get("primary", [])
         all_secondary = targets.get("secondary", [])
         all_explore = targets.get("explore", [])
         all_target_tags = all_primary + all_secondary + all_explore
-
-        problem_pool = self.db.get_all_problems()
+        avg_target_diff = sum(curve) / len(curve) if curve else 5.0
         user_id = state["user_id"]
 
-        # Generate mock problems if pool is empty
-        if not problem_pool:
-            problem_pool = _generate_mock_problems(200)
+        # Build a natural-language search query from target tags
+        tag_names = ", ".join(all_primary) if all_primary else "algorithm problems"
+        search_query = (
+            f"algorithm problems about {tag_names} "
+            f"with difficulty around {avg_target_diff:.1f}/10"
+        )
+
+        # Try real vector search, fall back to mock
+        problem_pool: List[Dict[str, Any]] = []
+        try:
+            api_results = _asyncio.get_event_loop().run_until_complete(
+                self.db.search_problems(search_query, top_k=200)
+            ) if _asyncio.get_event_loop().is_running() else []
+            if not api_results:
+                api_results = _asyncio.run(
+                    self.db.search_problems(search_query, top_k=200)
+                )
+        except Exception:
+            api_results = []
+
+        if api_results:
+            # Map API results to scoring format
+            for r in api_results:
+                problem_pool.append({
+                    "id": r.get("id", ""),
+                    "title": r.get("title", ""),
+                    "tags": r.get("tagsNormalized", []),
+                    "difficulty": r.get("difficultyNormalized", 5.0),
+                    "vector": [r.get("similarity", 0.5)] * 3,  # packed similarity
+                    "source_platform": r.get("sourcePlatform"),
+                    "similarity": r.get("similarity", 0.5),
+                })
+        else:
+            # Fallback to mock data
+            problem_pool = self.db.get_all_problems()
+            if not problem_pool:
+                problem_pool = _generate_mock_problems(200)
 
         scored: List[Dict[str, Any]] = []
         for prob in problem_pool:
             p_tags = prob.get("tags", [])
             p_diff = prob.get("difficulty", 5.0)
-            p_vec = prob.get("vector", [0.0] * 10)
+
+            # Use real pgvector similarity if available, else mock
+            real_sim = prob.get("similarity")
+            if real_sim is not None:
+                vec_sim_val = float(real_sim)
+                p_vec = [vec_sim_val] * 3
+                t_vec = [1.0] * 3
+            else:
+                p_vec = prob.get("vector", [0.0] * 10)
+                t_vec = _mock_target_vector(all_target_tags)
+
             solved_by_me = user_id in prob.get("solved_by", [])
-
-            # For scoring, use average curve difficulty as target
-            avg_target_diff = sum(curve) / len(curve) if curve else 5.0
-
-            # Check dependencies
             deps = prob.get("dependencies", [])
             dep_satisfied = all(
-                d in _get_user_known_tags(state)
-                for d in deps
+                d in _get_user_known_tags(state) for d in deps
             )
 
             scores = compute_problem_score(
@@ -447,15 +544,12 @@ class TrainingAgent:
                 problem_diff=p_diff,
                 target_diff=avg_target_diff,
                 problem_vector=p_vec,
-                target_vector=_mock_target_vector(all_target_tags),
+                target_vector=t_vec,
                 previously_solved=solved_by_me,
                 dep_satisfied=dep_satisfied,
             )
 
-            scored.append({
-                **prob,
-                "_score": scores,
-            })
+            scored.append({**prob, "_score": scores})
 
         # Sort by total score descending
         scored.sort(key=lambda p: p["_score"]["total"], reverse=True)

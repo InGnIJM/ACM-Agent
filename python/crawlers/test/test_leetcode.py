@@ -282,6 +282,529 @@ class TestLeetCodeFetchProblem:
         assert not result.success
         assert "not found" in (result.error or "").lower()
 
+    def test_prefers_translated_title_and_content(self) -> None:
+        """When translatedTitle/translatedContent are present, they replace title/content."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok(
+            {
+                "question": {
+                    "questionId": "1",
+                    "title": "Two Sum",
+                    "translatedTitle": "两数之和",
+                    "titleSlug": "two-sum",
+                    "difficulty": "Easy",
+                    "content": "<p>English description</p>",
+                    "translatedContent": "<p>中文描述</p>",
+                }
+            }
+        )
+        result = c.fetch_problem("two-sum")
+        assert result.success
+        assert result.data["title"] == "两数之和"
+        assert result.data["content"] == "<p>中文描述</p>"
+
+    def test_keeps_english_when_no_translation(self) -> None:
+        """When translatedTitle/translatedContent are absent or empty, keep original."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok(
+            {
+                "question": {
+                    "questionId": "1",
+                    "title": "Two Sum",
+                    "titleSlug": "two-sum",
+                    "difficulty": "Easy",
+                    "content": "<p>English description</p>",
+                }
+            }
+        )
+        result = c.fetch_problem("two-sum")
+        assert result.success
+        assert result.data["title"] == "Two Sum"
+        assert result.data["content"] == "<p>English description</p>"
+
+    def test_partial_translation_content_only(self) -> None:
+        """When only translatedContent is present (not translatedTitle)."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok(
+            {
+                "question": {
+                    "questionId": "1",
+                    "title": "Two Sum",
+                    "translatedContent": "<p>中文描述</p>",
+                    "titleSlug": "two-sum",
+                    "difficulty": "Easy",
+                    "content": "<p>English description</p>",
+                }
+            }
+        )
+        result = c.fetch_problem("two-sum")
+        assert result.success
+        assert result.data["title"] == "Two Sum"
+        assert result.data["content"] == "<p>中文描述</p>"
+
+    def test_null_translated_fields_not_used(self) -> None:
+        """When translatedTitle/translatedContent are None, keep original."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok(
+            {
+                "question": {
+                    "questionId": "1",
+                    "title": "Two Sum",
+                    "translatedTitle": None,
+                    "titleSlug": "two-sum",
+                    "content": "<p>English</p>",
+                    "translatedContent": None,
+                }
+            }
+        )
+        result = c.fetch_problem("two-sum")
+        assert result.success
+        assert result.data["title"] == "Two Sum"
+        assert result.data["content"] == "<p>English</p>"
+
+    def test_difficulty_normalized_easy(self) -> None:
+        """Difficulty string 'Easy' → numeric 1."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok(
+            {
+                "question": {
+                    "questionId": "1",
+                    "title": "Two Sum",
+                    "titleSlug": "two-sum",
+                    "difficulty": "Easy",
+                    "content": "<p>test</p>",
+                }
+            }
+        )
+        result = c.fetch_problem("two-sum")
+        assert result.success
+        assert result.data["difficulty"] == "Easy"  # original preserved
+        assert result.data["difficultyNormalized"] == 1
+
+    def test_difficulty_normalized_medium(self) -> None:
+        """Difficulty string 'Medium' → numeric 2."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok(
+            {
+                "question": {
+                    "questionId": "2",
+                    "title": "Add Two Numbers",
+                    "titleSlug": "add-two-numbers",
+                    "difficulty": "Medium",
+                    "content": "<p>test</p>",
+                }
+            }
+        )
+        result = c.fetch_problem("add-two-numbers")
+        assert result.success
+        assert result.data["difficultyNormalized"] == 2
+
+    def test_difficulty_normalized_hard(self) -> None:
+        """Difficulty string 'Hard' → numeric 3."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok(
+            {
+                "question": {
+                    "questionId": "3",
+                    "title": "Median of Two Sorted Arrays",
+                    "titleSlug": "median-of-two-sorted-arrays",
+                    "difficulty": "Hard",
+                    "content": "<p>test</p>",
+                }
+            }
+        )
+        result = c.fetch_problem("median-of-two-sorted-arrays")
+        assert result.success
+        assert result.data["difficultyNormalized"] == 3
+
+    def test_difficulty_normalized_unknown_defaults_to_1(self) -> None:
+        """Unknown/empty difficulty string defaults to 1."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok(
+            {
+                "question": {
+                    "questionId": "4",
+                    "title": "Unknown Diff",
+                    "titleSlug": "unknown-diff",
+                    "difficulty": "",
+                    "content": "<p>test</p>",
+                }
+            }
+        )
+        result = c.fetch_problem("unknown-diff")
+        assert result.success
+        assert result.data["difficultyNormalized"] == 1
+
+    def test_difficulty_normalized_case_insensitive(self) -> None:
+        """Difficulty mapping is case-insensitive."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok(
+            {
+                "question": {
+                    "questionId": "5",
+                    "title": "Case Test",
+                    "titleSlug": "case-test",
+                    "difficulty": "EASY",
+                    "content": "<p>test</p>",
+                }
+            }
+        )
+        result = c.fetch_problem("case-test")
+        assert result.success
+        assert result.data["difficultyNormalized"] == 1
+
+    def test_input_output_format_extraction(self) -> None:
+        """Extracts input/output format from HTML content with dedicated format sections."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok(
+            {
+                "question": {
+                    "questionId": "6",
+                    "title": "Format Test",
+                    "titleSlug": "format-test",
+                    "difficulty": "Easy",
+                    "content": (
+                        "<p>Problem description here.</p>"
+                        "<p><strong>输入格式：</strong>第一行包含一个整数 N。</p>"
+                        "<p><strong>输出格式：</strong>输出一个整数表示结果。</p>"
+                    ),
+                }
+            }
+        )
+        result = c.fetch_problem("format-test")
+        assert result.success
+        assert "第一行包含一个整数 N" in result.data["input_format"]
+        assert "输出一个整数表示结果" in result.data["output_format"]
+
+    def test_input_output_format_english_markers(self) -> None:
+        """Extracts format using English 'Input Format:' / 'Output Format:' markers."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok(
+            {
+                "question": {
+                    "questionId": "7",
+                    "title": "English Format",
+                    "titleSlug": "english-format",
+                    "difficulty": "Easy",
+                    "content": (
+                        "<p>Description.</p>"
+                        "<p><strong>Input Format:</strong>The first line contains T.</p>"
+                        "<p><strong>Output Format:</strong>Print the result.</p>"
+                    ),
+                }
+            }
+        )
+        result = c.fetch_problem("english-format")
+        assert result.success
+        assert "first line contains T" in result.data["input_format"]
+        assert "Print the result" in result.data["output_format"]
+
+    def test_input_output_format_no_markers_returns_empty(self) -> None:
+        """Returns empty strings when no format markers found."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok(
+            {
+                "question": {
+                    "questionId": "8",
+                    "title": "No Format",
+                    "titleSlug": "no-format",
+                    "difficulty": "Easy",
+                    "content": "<p>Just a simple problem with no format description.</p>",
+                }
+            }
+        )
+        result = c.fetch_problem("no-format")
+        assert result.success
+        assert result.data["input_format"] == ""
+        assert result.data["output_format"] == ""
+
+    def test_input_output_format_ignores_pre_blocks(self) -> None:
+        """Ignores 'Input:' / 'Output:' markers inside <pre> (example) blocks."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok(
+            {
+                "question": {
+                    "questionId": "9",
+                    "title": "Pre Block Test",
+                    "titleSlug": "pre-block-test",
+                    "difficulty": "Easy",
+                    "content": (
+                        "<p>Problem description.</p>"
+                        "<pre><strong>Input:</strong>1 2 3\n<strong>Output:</strong>6</pre>"
+                        "<p><strong>输入：</strong>输入包含两个整数。</p>"
+                        "<p><strong>输出：</strong>输出它们的和。</p>"
+                    ),
+                }
+            }
+        )
+        result = c.fetch_problem("pre-block-test")
+        assert result.success
+        # Should NOT have matched the example input/output inside <pre>
+        assert "输入包含两个整数" in result.data["input_format"]
+        assert "输出它们的和" in result.data["output_format"]
+
+    def test_hints_included_as_array(self) -> None:
+        """Hints array from GraphQL is preserved as-is in the returned data."""
+        c = _mock_crawler()
+        hints = ["Hint 1: Try sorting.", "Hint 2: Use two pointers."]
+        c._graphql.return_value = _crawl_ok(
+            {
+                "question": {
+                    "questionId": "10",
+                    "title": "Hint Test",
+                    "titleSlug": "hint-test",
+                    "difficulty": "Easy",
+                    "content": "<p>test</p>",
+                    "hints": hints,
+                }
+            }
+        )
+        result = c.fetch_problem("hint-test")
+        assert result.success
+        assert result.data["hints"] == hints
+        assert len(result.data["hints"]) == 2
+
+    def test_hints_defaults_to_empty_list(self) -> None:
+        """When hints is not in the GraphQL response, defaults to empty list."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok(
+            {
+                "question": {
+                    "questionId": "11",
+                    "title": "No Hints",
+                    "titleSlug": "no-hints",
+                    "difficulty": "Easy",
+                    "content": "<p>test</p>",
+                }
+            }
+        )
+        result = c.fetch_problem("no-hints")
+        assert result.success
+        assert result.data["hints"] == []
+
+    def test_hints_none_defaults_to_empty_list(self) -> None:
+        """When hints is present but None, defaults to empty list."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok(
+            {
+                "question": {
+                    "questionId": "12",
+                    "title": "Null Hints",
+                    "titleSlug": "null-hints",
+                    "difficulty": "Easy",
+                    "content": "<p>test</p>",
+                    "hints": None,
+                }
+            }
+        )
+        result = c.fetch_problem("null-hints")
+        assert result.success
+        assert result.data["hints"] == []
+
+    # ── sample parsing (sampleTestCase / exampleTestcases → [[in,out],..]) ──
+
+    def test_samples_single_param_multiple_examples(self) -> None:
+        """metaData with 1 param → each input line is one test case."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok({
+            "question": {
+                "questionId": "20",
+                "title": "Single Param",
+                "titleSlug": "single-param",
+                "difficulty": "Easy",
+                "content": "<p>test</p>",
+                "sampleTestCase": "1\n2\n3",
+                "exampleTestcases": "10\n20\n30",
+                "metaData": '{"name":"solve","params":[{"name":"n","type":"integer"}],"return":{"type":"integer"}}',
+            }
+        })
+        result = c.fetch_problem("single-param")
+        assert result.success
+        assert "samples" in result.data
+        samples = result.data["samples"]
+        assert len(samples) == 3
+        assert samples[0] == ["1", "10"]
+        assert samples[1] == ["2", "20"]
+        assert samples[2] == ["3", "30"]
+
+    def test_samples_two_param_problem(self) -> None:
+        """metaData with 2 params → every 2 input lines = one test case."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok({
+            "question": {
+                "questionId": "21",
+                "title": "Two Param",
+                "titleSlug": "two-param",
+                "difficulty": "Medium",
+                "content": "<p>test</p>",
+                "sampleTestCase": "[2,7,11,15]\n9\n[3,2,4]\n6",
+                "exampleTestcases": "[0,1]\n[1,2]",
+                "metaData": '{"name":"twoSum","params":[{"name":"nums","type":"integer[]"},{"name":"target","type":"integer"}],"return":{"type":"integer[]"}}',
+            }
+        })
+        result = c.fetch_problem("two-param")
+        assert result.success
+        samples = result.data["samples"]
+        assert len(samples) == 2
+        assert samples[0] == ["[2,7,11,15]\n9", "[0,1]"]
+        assert samples[1] == ["[3,2,4]\n6", "[1,2]"]
+
+    def test_samples_auto_detect_param_count_no_metadata(self) -> None:
+        """Without metaData, auto-detect param count from line counts (2 params, 2 examples)."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok({
+            "question": {
+                "questionId": "22",
+                "title": "Auto Detect",
+                "titleSlug": "auto-detect",
+                "difficulty": "Easy",
+                "content": "<p>test</p>",
+                "sampleTestCase": "1 2\n3\n4 5\n6",
+                "exampleTestcases": "3\n9",
+                "metaData": None,
+            }
+        })
+        result = c.fetch_problem("auto-detect")
+        assert result.success
+        samples = result.data["samples"]
+        assert len(samples) == 2
+        # Auto-detection: 4 input lines, 2 output lines → param_count=2
+        assert samples[0] == ["1 2\n3", "3"]
+        assert samples[1] == ["4 5\n6", "9"]
+
+    def test_samples_no_sample_data_present(self) -> None:
+        """When sampleTestCase/exampleTestcases missing, samples is not set."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok({
+            "question": {
+                "questionId": "23",
+                "title": "No Samples",
+                "titleSlug": "no-samples",
+                "difficulty": "Easy",
+                "content": "<p>test</p>",
+                "metaData": '{"name":"f","params":[{"name":"x","type":"integer"}]}',
+            }
+        })
+        result = c.fetch_problem("no-samples")
+        assert result.success
+        assert "samples" in result.data
+        assert result.data["samples"] == []
+        # Original string fields may still be absent (None)
+        assert result.data.get("sampleTestCase") is None
+
+    def test_samples_empty_strings_no_samples_set(self) -> None:
+        """Empty sampleTestCase/exampleTestcases should not produce samples."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok({
+            "question": {
+                "questionId": "24",
+                "title": "Empty Samples",
+                "titleSlug": "empty-samples",
+                "difficulty": "Easy",
+                "content": "<p>test</p>",
+                "sampleTestCase": "",
+                "exampleTestcases": "   ",
+                "metaData": '{"name":"f","params":[{"name":"x","type":"integer"}]}',
+            }
+        })
+        result = c.fetch_problem("empty-samples")
+        assert result.success
+        assert "samples" in result.data
+        assert result.data["samples"] == []
+
+    def test_samples_metadata_parse_failure_auto_detects(self) -> None:
+        """Invalid JSON metaData → fallback to auto-detection."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok({
+            "question": {
+                "questionId": "25",
+                "title": "Bad Metadata",
+                "titleSlug": "bad-metadata",
+                "difficulty": "Easy",
+                "content": "<p>test</p>",
+                "sampleTestCase": "a\nb\nc",
+                "exampleTestcases": "x\ny\nz",
+                "metaData": "not-valid-json",
+            }
+        })
+        result = c.fetch_problem("bad-metadata")
+        assert result.success
+        samples = result.data["samples"]
+        # Auto-detection: 3 input lines, 3 output lines → param_count=1
+        assert len(samples) == 3
+        assert samples[0] == ["a", "x"]
+        assert samples[1] == ["b", "y"]
+        assert samples[2] == ["c", "z"]
+
+    def test_samples_partial_output_count_graceful(self) -> None:
+        """When there are more input groups than output lines, output lines
+        are paired as available."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok({
+            "question": {
+                "questionId": "26",
+                "title": "Partial Outputs",
+                "titleSlug": "partial-outputs",
+                "difficulty": "Easy",
+                "content": "<p>test</p>",
+                "sampleTestCase": "1\n2\n3",
+                "exampleTestcases": "10",
+                "metaData": '{"name":"f","params":[{"name":"x","type":"integer"}]}',
+            }
+        })
+        result = c.fetch_problem("partial-outputs")
+        assert result.success
+        samples = result.data["samples"]
+        # Only 1 output for 3 inputs — first group paired, rest get empty
+        assert len(samples) == 3
+        assert samples[0] == ["1", "10"]
+        assert samples[1] == ["2", ""]
+        assert samples[2] == ["3", ""]
+
+    def test_samples_metadata_no_params_auto_detects(self) -> None:
+        """metaData with empty params array → auto-detect."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok({
+            "question": {
+                "questionId": "27",
+                "title": "No Params",
+                "titleSlug": "no-params",
+                "difficulty": "Easy",
+                "content": "<p>test</p>",
+                "sampleTestCase": "X\nY",
+                "exampleTestcases": "A\nB",
+                "metaData": '{"name":"f","params":[]}',
+            }
+        })
+        result = c.fetch_problem("no-params")
+        assert result.success
+        samples = result.data["samples"]
+        # Auto-detection: 2 in, 2 out → param_count=1
+        assert len(samples) == 2
+        assert samples[0] == ["X", "A"]
+        assert samples[1] == ["Y", "B"]
+
+    def test_samples_preserves_raw_string_fields(self) -> None:
+        """sampleTestCase and exampleTestcases are kept alongside samples."""
+        c = _mock_crawler()
+        c._graphql.return_value = _crawl_ok({
+            "question": {
+                "questionId": "28",
+                "title": "Raw Preserved",
+                "titleSlug": "raw-preserved",
+                "difficulty": "Easy",
+                "content": "<p>test</p>",
+                "sampleTestCase": "42",
+                "exampleTestcases": "84",
+                "metaData": '{"name":"f","params":[{"name":"x","type":"integer"}]}',
+            }
+        })
+        result = c.fetch_problem("raw-preserved")
+        assert result.success
+        assert result.data["sampleTestCase"] == "42"
+        assert result.data["exampleTestcases"] == "84"
+        assert result.data["samples"] == [["42", "84"]]
+
 
 # ──────────────────────────────────────────────
 # fetch_problems_by_tag

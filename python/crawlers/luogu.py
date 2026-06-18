@@ -86,6 +86,29 @@ class LuoguCrawler(BaseCrawler):
                 source="http",
                 retry_count=result.retry_count,
             )
+
+        # Fallback: Luogu CDN-rendered pages embed data in <script id="lentille-context">
+        if isinstance(raw, str):
+            import re as _re
+            match = _re.search(
+                r'<script\s+id="lentille-context"[^>]*type="application/json"[^>]*>(.*?)</script>',
+                raw, _re.DOTALL,
+            )
+            if match:
+                try:
+                    envelope = json.loads(match.group(1))
+                    # envelope.status === 200, envelope.data contains old currentData structure
+                    if envelope.get("status") == 200:
+                        inner = envelope.get("data", {})
+                        return CrawlResult(
+                            success=True,
+                            data=inner,
+                            source="http",
+                            retry_count=result.retry_count,
+                        )
+                except (json.JSONDecodeError, KeyError) as exc:
+                    logger.warning("Failed to parse lentille-context JSON: %s", exc)
+
         return result
 
     # ── abstract method implementations ─────────────────────────
@@ -175,76 +198,85 @@ class LuoguCrawler(BaseCrawler):
         )
 
     def fetch_problem(self, source_id: str) -> CrawlResult:
-        """Fetch a single problem's metadata.
-
-        Uses browser mode to extract embedded JSON from the rendered page.
+        """Fetch a single problem's full metadata via HTTP + lentille-context.
 
         Args:
             source_id: Luogu problem ID (e.g. ``"P1001"``).
 
         Returns:
-            CrawlResult with problem data.
+            CrawlResult with full problem data including description.
         """
-        url = f"{self.BASE_URL}/problem/{source_id}"
-        logger.debug("Luogu browser GET: %s", url)
+        url = f"{self.BASE_URL}/problem/{source_id}?_contentOnly=1"
+        logger.debug("Luogu HTTP GET: %s", url)
 
-        self._rate_limiter.wait()
-        try:
-            browser = self._get_browser()
-            browser.get(url)
-            browser.wait(2)  # Wait for JS to render
-            html = browser.html
+        result = self.fetch_with_fallback(url)
+        if not result.success:
+            return result
 
-            # Extract embedded JSON: search for {"pid":"P1001"...
+        raw = result.data
+        # Try lentille-context extraction from HTML (same as _get_json fallback)
+        if isinstance(raw, str):
             import re as _re
-            match = _re.search(r'\{"pid":\s*"' + _re.escape(source_id) + r'"', html)
-            if not match:
-                return CrawlResult(success=False, error="Problem data not found in page")
+            match = _re.search(
+                r'<script\s+id="lentille-context"[^>]*type="application/json"[^>]*>(.*?)</script>',
+                raw, _re.DOTALL,
+            )
+            if match:
+                try:
+                    envelope = json.loads(match.group(1))
+                    if envelope.get("status") == 200:
+                        problem = envelope.get("data", {}).get("problem", {})
+                        contenu = problem.get("contenu") or {}
+                        pid_val = problem.get("pid") or source_id
+                        return CrawlResult(success=True, data={
+                            "pid": problem.get("pid") or source_id,
+                            "title": problem.get("name") or contenu.get("name") or "",
+                            "difficulty": problem.get("difficulty") or 0,
+                            "tags": problem.get("tags") or [],
+                            "total_submit": problem.get("totalSubmit") or 0,
+                            "total_ac": problem.get("totalAccepted") or 0,
+                            "background": contenu.get("background") or "",
+                            "description": contenu.get("description") or "",
+                            "input_format": contenu.get("formatI") or "",
+                            "output_format": contenu.get("formatO") or "",
+                            "hint": contenu.get("hint") or "",
+                            "samples": problem.get("samples") or [],
+                            "limits": problem.get("limits") or {},
+                            "source_url": f"https://www.luogu.com.cn/problem/{pid_val}",
+                        }, source="http")
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        elif isinstance(raw, dict):
+            problem = raw.get("currentData", {}).get("problem", {})
+            if problem:
+                contenu = problem.get("contenu") or {}
+                pid_val = problem.get("pid") or source_id
+                return CrawlResult(success=True, data={
+                    "pid": problem.get("pid") or source_id,
+                    "title": problem.get("name") or contenu.get("name") or "",
+                    "difficulty": problem.get("difficulty") or 0,
+                    "tags": problem.get("tags") or [],
+                    "total_submit": problem.get("totalSubmit") or 0,
+                    "total_ac": problem.get("totalAccepted") or 0,
+                    "background": contenu.get("background") or "",
+                    "description": contenu.get("description") or "",
+                    "input_format": contenu.get("formatI") or "",
+                    "output_format": contenu.get("formatO") or "",
+                    "hint": contenu.get("hint") or "",
+                    "samples": problem.get("samples") or [],
+                    "limits": problem.get("limits") or {},
+                    "source_url": f"https://www.luogu.com.cn/problem/{pid_val}",
+                }, source="http")
 
-            # Walk back to find opening brace, then extract full JSON object
-            start = match.start()
-            depth = 0
-            for i in range(start, len(html)):
-                if html[i] == '{':
-                    depth += 1
-                elif html[i] == '}':
-                    depth -= 1
-                    if depth == 0:
-                        json_str = html[start:i + 1]
-                        data = json.loads(json_str)
-                        # Extract full content from contenu
-                        contenu = data.get("contenu") or {}
-                        problem_data = {
-                            "pid": data.get("pid"),
-                            "title": data.get("name") or contenu.get("name"),
-                            "difficulty": data.get("difficulty"),
-                            "tags": data.get("tags"),
-                            "total_submit": data.get("totalSubmit"),
-                            "total_ac": data.get("totalAccepted"),
-                            "background": contenu.get("background", ""),
-                            "description": contenu.get("description", ""),
-                            "input_format": contenu.get("formatI", ""),
-                            "output_format": contenu.get("formatO", ""),
-                            "hint": contenu.get("hint", ""),
-                            "samples": data.get("samples", []),
-                            "limits": data.get("limits", {}),
-                        }
-                        return CrawlResult(
-                            success=True,
-                            data=problem_data,
-                            source="browser",
-                        )
-            return CrawlResult(success=False, error="Failed to parse problem JSON")
-        except Exception as exc:
-            return CrawlResult(success=False, error=str(exc))
+        return CrawlResult(success=False, error=f"Failed to extract problem data for {source_id}")
 
     def fetch_solutions(
         self, source_id: str, max_pages: int = 3
     ) -> CrawlResult:
-        """Fetch solutions for a problem.
+        """Fetch solutions for a problem via HTTP + lentille-context.
 
-        Uses browser mode with saved cookies (login required) to load
-        the solution page and extract embedded solution JSON.
+        Requires login cookies to be present in the session.
+        Uses HTTP instead of browser for speed.
 
         Args:
             source_id: Luogu problem ID (e.g. ``"P1001"``).
@@ -255,67 +287,82 @@ class LuoguCrawler(BaseCrawler):
         """
         all_solutions: list = []
 
-        browser = self._get_browser()
         for page_num in range(1, max_pages + 1):
             url = f"{self.BASE_URL}/problem/solution/{source_id}?page={page_num}"
-            logger.debug("Luogu solutions browser GET: %s", url)
-            self._rate_limiter.wait()
-            try:
-                browser.get(url)
-                browser.wait(3)
-                html = browser.html
+            logger.debug("Luogu solutions HTTP GET: %s", url)
+            result = self.fetch_with_fallback(url)
 
-                # Search for solution data in embedded JSON
+            if not result.success:
+                if page_num == 1:
+                    return CrawlResult(
+                        success=False,
+                        error=result.error or "Solution fetch failed",
+                    )
+                break
+
+            raw = result.data
+            # Extract lentille-context from HTML
+            if isinstance(raw, str):
                 import re as _re
-                match = _re.search(r'{"solutions":\s*\{', html)
-                if not match:
-                    if page_num == 1:
-                        return CrawlResult(
-                            success=False,
-                            error="Solution data not found — login may be required",
-                        )
-                    break
-
-                start = match.start()
-                depth = 0
-                for i in range(start, len(html)):
-                    if html[i] == '{':
-                        depth += 1
-                    elif html[i] == '}':
-                        depth -= 1
-                        if depth == 0:
-                            data = json.loads(html[start:i + 1])
+                match = _re.search(
+                    r'<script\s+id="lentille-context"[^>]*type="application/json"[^>]*>(.*?)</script>',
+                    raw, _re.DOTALL,
+                )
+                if match:
+                    try:
+                        envelope = json.loads(match.group(1))
+                        if envelope.get("status") == 200:
+                            data = envelope.get("data", {})
                             sols = data.get("solutions", {}).get("result", [])
                             if not sols:
                                 break
                             for s in sols:
                                 all_solutions.append({
-                                    "author": s.get("author", {}).get("name", "匿名"),
+                                    "author": (s.get("author") or {}).get("name", "匿名"),
                                     "title": s.get("title", ""),
                                     "content": s.get("content", ""),
                                     "vote_count": s.get("thumbUp", 0),
                                     "reply_count": s.get("replyCount", 0),
                                 })
+                            # Check total pages
+                            total = data.get("solutions", {}).get("count", 0)
+                            if page_num * 20 >= total:
+                                break
+                            continue
+                        elif envelope.get("status") == 401:
+                            if page_num == 1:
+                                return CrawlResult(
+                                    success=False,
+                                    error="Login required — please log in to Luogu first",
+                                )
                             break
-
-                total_pages = (
-                    data.get("solutions", {}).get("count", 0) // 20 + 1
-                    if isinstance(data.get("solutions"), dict)
-                    else 1
-                )
-                if page_num >= total_pages:
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+            elif isinstance(raw, dict):
+                # Direct JSON response
+                data = raw.get("currentData", raw)
+                sols = data.get("solutions", {}).get("result", [])
+                if not sols:
                     break
+                for s in sols:
+                    all_solutions.append({
+                        "author": (s.get("author") or {}).get("name", "匿名"),
+                        "title": s.get("title", ""),
+                        "content": s.get("content", ""),
+                        "vote_count": s.get("thumbUp", 0),
+                        "reply_count": s.get("replyCount", 0),
+                    })
+                total = data.get("solutions", {}).get("count", 0)
+                if page_num * 20 >= total:
+                    break
+                continue
 
-            except Exception as exc:
-                if page_num == 1:
-                    return CrawlResult(success=False, error=str(exc))
-                logger.warning("Solutions page %d failed: %s", page_num, exc)
-                break
+            break  # Unknown format, stop
 
         return CrawlResult(
             success=True,
             data=all_solutions,
-            source="browser",
+            source="http",
         )
 
     def fetch_problems_by_tag(
@@ -375,10 +422,10 @@ def _run_import(platform: str) -> CrawlResult:
     """
     try:
         from prisma import Prisma  # type: ignore[import-untyped]
-    except ImportError:
+    except (ImportError, RuntimeError):
         return CrawlResult(
             success=False,
-            error="Prisma client not installed. Install with: pip install prisma",
+            error="Prisma client not available. Install with: pip install prisma, then run: prisma generate",
         )
 
     async def _import() -> CrawlResult:
@@ -397,6 +444,15 @@ def _run_import(platform: str) -> CrawlResult:
         return CrawlResult(success=False, error=str(exc))
 
 
+def _save_result(crawler: LuoguCrawler, data, sub_dir: str, label: str) -> None:
+    """Save fetched data to a timestamped JSON file under data/raw/{platform}/{sub_dir}/."""
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    safe_label = str(label).replace("/", "_").replace("\\", "_")
+    filename = f"{today}_{safe_label}.json"
+    crawler.save_json(data, filename=filename, sub_dir=f"{crawler.PLATFORM}/{sub_dir}")
+
+
 def main(argv: Optional[list] = None) -> None:
     """CLI entry point for the Luogu crawler.
 
@@ -411,7 +467,7 @@ def main(argv: Optional[list] = None) -> None:
     parser = argparse.ArgumentParser(description="Luogu crawler CLI")
     parser.add_argument(
         "--action",
-        choices=["fetch_problems", "fetch_user", "fetch_records", "fetch_solutions", "import"],
+        choices=["fetch_problems", "fetch_user", "fetch_records", "fetch_solutions", "fetch_detail", "import"],
         default=None,
         help="Crawl action to execute",
     )
@@ -423,10 +479,26 @@ def main(argv: Optional[list] = None) -> None:
         default=None,
         help="JSON input string containing all parameters (NestJS mode)",
     )
+    parser.add_argument(
+        "--input-file",
+        default=None,
+        help="Path to a JSON file containing all parameters (for large payloads)",
+    )
     args = parser.parse_args(argv)
 
     # ── determine parameter source ─────────────────────────────
-    if args.input:
+    if args.input_file:
+        from pathlib import Path as _Path
+        try:
+            params = json.loads(_Path(args.input_file).read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            _emit(
+                success=False,
+                error=f"Failed to read input file: {exc}",
+                platform="luogu",
+            )
+            sys.exit(1)
+    elif args.input:
         try:
             params: dict = json.loads(args.input)
         except json.JSONDecodeError as exc:
@@ -466,23 +538,74 @@ def main(argv: Optional[list] = None) -> None:
             if not uid:
                 raise ValueError("--uid is required for fetch_user")
             result = executor.execute("fetch_user_profile", str(uid))
+            if result.success and result.data:
+                _save_result(crawler, result.data, "profiles", str(uid))
 
         elif action == "fetch_problems":
             tag = params.get("tags", "")
             count = int(params.get("count", 50))
-            result = executor.execute("fetch_problems_by_tag", str(tag), count)
+            skip_ids = set(params.get("skip_ids", []))
+            # Fetch extra to compensate for already-imported problems
+            fetch_count = max(count + len(skip_ids), count * 3)
+            result = executor.execute("fetch_problems_by_tag", str(tag), fetch_count)
+            if result.success and result.data:
+                new_items = [p for p in result.data if p.get('pid') not in skip_ids]
+                new_items = new_items[:count]
+                # Enrich with full content: fetch detail for each problem
+                enriched = []
+                for prob in new_items:
+                    pid = prob.get('pid', '')
+                    if pid:
+                        # Retry up to 3 times for transient HTTP errors
+                        detail = None
+                        for retry in range(3):
+                            detail = executor.execute("fetch_problem", str(pid))
+                            if detail and detail.success and detail.data:
+                                break
+                            if retry < 2:
+                                import time as _time
+                                _time.sleep(1.0 * (retry + 1))
+                        if detail and detail.success and detail.data:
+                            merged = dict(detail.data)
+                            for k in ('totalSubmit', 'totalAccepted', 'total_submit', 'total_ac'):
+                                if merged.get(k) is None:
+                                    merged[k] = prob.get(k)
+                            enriched.append(merged)
+                        else:
+                            enriched.append(prob)
+                    else:
+                        enriched.append(prob)
+                result = CrawlResult(success=True, data=enriched, source=result.source)
+                _save_result(crawler, result.data, "problems", str(tag) or "all")
+                # Also fetch solutions for each new problem
+                for prob in enriched:
+                    pid = prob.get('pid', '')
+                    if pid:
+                        sol_result = executor.execute("fetch_solutions", str(pid))
+                        if sol_result and sol_result.success and sol_result.data:
+                            _save_result(crawler, sol_result.data, "solutions", str(pid))
 
         elif action == "fetch_records":
             uid = params.get("uid", "")
             if not uid:
                 raise ValueError("--uid is required for fetch_records")
             result = executor.execute("fetch_user_records", str(uid))
+            if result.success and result.data:
+                _save_result(crawler, result.data, "records", str(uid))
+
+        elif action == "fetch_detail":
+            uid = params.get("uid", "")
+            if not uid:
+                raise ValueError("--uid is required for fetch_detail")
+            result = executor.execute("fetch_problem", str(uid))
 
         elif action == "fetch_solutions":
             uid = params.get("uid", "")
             if not uid:
                 raise ValueError("--uid is required for fetch_solutions")
             result = executor.execute("fetch_solutions", str(uid))
+            if result.success and result.data:
+                _save_result(crawler, result.data, "solutions", str(uid))
 
         elif action == "import":
             result = _run_import(crawler.PLATFORM)

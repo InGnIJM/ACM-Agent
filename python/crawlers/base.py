@@ -146,16 +146,24 @@ class CookieManager:
         return path
 
     def load(self, platform: str) -> Optional[List[Dict[str, Any]]]:
-        """Load cookie list for *platform*, or None if missing/broken."""
+        """Load cookie list for *platform*, or None if missing/broken.
+
+        Supports both CookieManager format ``{platform, cookies, saved_at}``
+        and raw cookie array ``[{name, value, ...}, ...]``.
+        """
         path = self._path(platform)
         if not path.exists():
             return None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            if "cookies" not in payload:
-                return None
-            return payload["cookies"]
-        except (json.JSONDecodeError, KeyError) as exc:
+            # CookieManager format: { platform, cookies: [...], saved_at }
+            if isinstance(payload, dict) and "cookies" in payload:
+                return payload["cookies"]
+            # Raw array format: [{name, value, ...}, ...]
+            if isinstance(payload, list) and len(payload) > 0:
+                return payload
+            return None
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
             logger.warning("Failed to parse cookie file %s: %s", path, exc)
             return None
 
@@ -166,8 +174,13 @@ class CookieManager:
             return True
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            saved_at: float = payload.get("saved_at", 0.0)
-        except (json.JSONDecodeError, KeyError):
+            if isinstance(payload, dict):
+                saved_at: float = payload.get("saved_at", 0.0)
+            elif isinstance(payload, list):
+                saved_at: float = 0.0  # raw array has no timestamp
+            else:
+                return True
+        except (json.JSONDecodeError, KeyError, TypeError):
             return True
         return (time.time() - saved_at) > (self._EXPIRATION_DAYS * 86400)
 
@@ -195,6 +208,7 @@ class BaseCrawler(ABC):
         self,
         data_dir: str = "data/raw",
         headless: bool = True,
+        qps: Optional[float] = None,
     ) -> None:
         if not self.PLATFORM:
             raise ValueError(
@@ -209,12 +223,26 @@ class BaseCrawler(ABC):
 
         # HTTP session (always available, lightweight).
         self._session: SessionPage = SessionPage()
+        # Set a realistic browser User-Agent to reduce bot-detection blocks
+        try:
+            self._session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+        })
+        except AttributeError:
+            pass  # DrissionPage 4.x uses _headers internally
 
         # Browser instance – created lazily on first use.
         self._browser: Optional[ChromiumPage] = None
 
         # Rate limiter for this crawler instance.
-        qps = self._default_qps()
+        if qps is None:
+            qps = self._default_qps()
         self._rate_limiter = RateLimiter(qps=qps)
 
         # Cookie manager.
@@ -620,6 +648,9 @@ class DataImporter:
 
         pattern = f"{date}_*.json" if date else "*.json"
         for path in sorted(directory.glob(pattern)):
+            # Skip bulk list files and progress snapshots — they don't have full detail
+            if path.name.startswith("bulk_list_") or path.name.startswith("bulk_detail_progress_"):
+                continue
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError) as exc:
@@ -654,6 +685,9 @@ class DataImporter:
         for record in records:
             try:
                 source_id = record.get("source_id") or record.get("id")
+                # Codeforces: construct sourceId from contestId+index (e.g. "2236C")
+                if not source_id and record.get("contestId") and record.get("index"):
+                    source_id = f"{record['contestId']}{record['index']}"
                 if not source_id:
                     logger.warning("Skipping problem record without source_id: %s", record)
                     continue
@@ -678,6 +712,7 @@ class DataImporter:
                             "tags": record.get("tags", []),
                             "content": record.get("content", ""),
                             "raw_data": record,
+                            "deleted_at": None,  # restore soft-deleted records on re-import
                         },
                     },
                 )

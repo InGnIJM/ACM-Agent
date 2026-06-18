@@ -628,3 +628,65 @@ class TestCfExtractAdjacentMath:
         no_spaces = text.replace(" ", "")
         # ^{\\dagger} in its own $ block (not adjacent to $p$ — text " arrays " separates them)
         assert r"$^{\dagger}$" in no_spaces, f"Got: {no_spaces}"
+
+
+# ──────────────────────────────────────────────
+# _cf_extract — display math (6$ fences)
+# ──────────────────────────────────────────────
+
+class TestCfExtractDisplayMath:
+    r"""Tests for $$$$$$...$$$$$$ display math fences.
+
+    CF problem authors sometimes wrap display math in
+    $$$$$$ content $$$$$$ (six dollars).  After the $$$ → $ delimiter
+    conversion, this MUST remain wrapped (as $$...$$ display math),
+    NOT be stripped to bare LaTeX.  Regression: Codeforces 2236G — the
+    ``a_{v_{l}} \oplus ... \geq (...)`` expression lost its $ fences and
+    rendered as raw text.
+    """
+
+    def test_display_math_six_dollar_is_wrapped(self) -> None:
+        r"""$$$$$$ a \oplus b \geq c $$$$$$ must keep $ fences."""
+        html = _wrap_html(
+            '<p>Condition: $$$$$$ a \\oplus b \\geq c $$$$$$ holds.</p>'
+        )
+        text = _extract_description(html)
+        # \oplus must be present and INSIDE a math span (preceded by $)
+        assert r"\oplus" in text, f"Got: {text}"
+        idx = text.find(r"\oplus")
+        # There must be an opening $ before \oplus
+        assert "$" in text[:idx], \
+            f"\\oplus not wrapped in math (no $ before it): {text}"
+        # There must be a closing $ after the expression
+        tail = text[idx:]
+        # Find the \geq and ensure a $ follows it
+        geq_idx = text.find(r"\geq")
+        assert "$" in text[geq_idx:], \
+            f"expression not closed with $: {text}"
+
+    def test_display_math_content_not_bare(self) -> None:
+        r"""The \oplus token must never appear without surrounding $."""
+        html = _wrap_html(
+            '<p>Holds: $$$$$$ a_{v_{l}} \\oplus a_{v_{l+1}} $$$$$$ end.</p>'
+        )
+        text = _extract_description(html)
+        idx = text.find(r"\oplus")
+        # Count $ signs around the expression — must be > 0 before and after
+        before = text[:idx]
+        after = text[idx:]
+        assert before.count("$") >= 1, f"no opening $: {text}"
+        assert after.count("$") >= 1, f"no closing $: {text}"
+
+    def test_inline_three_dollar_unchanged(self) -> None:
+        """$$$x$$$ → $x$ (inline math, must keep working)."""
+        html = _wrap_html('<p>Value $$$x$$$ here.</p>')
+        text = _extract_description(html)
+        assert "$x$" in text, f"Got: {text}"
+
+    def test_two_adjacent_inline_blocks_merged(self) -> None:
+        """$$$A$$$$$$B$$$ → $AB$ (adjacent inline blocks merge so orphaned
+        superscripts reattach to their base — see commit f1700c4)."""
+        html = _wrap_html('<p>$$$A$$$$$$B$$$ end.</p>')
+        text = _extract_description(html)
+        no_spaces = text.replace(" ", "")
+        assert "$AB$" in no_spaces, f"Expected merged $AB$, got: {text}"

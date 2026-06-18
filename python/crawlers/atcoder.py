@@ -1,18 +1,22 @@
 """
 AtCoder platform crawler.
 
-Uses the kenkoooo.com unofficial AtCoder API for submission history
-and problem models.  For user profiles the official AtCoder site is
-scraped via ``fetch_with_fallback`` (the kenkoooo API does not expose
-user metadata).
+Fetches problem statements, solutions, user profiles, and submission
+records from the official AtCoder site (https://atcoder.jp).
+Uses the kenkoooo.com merged-problems.json for tag-based problem listing.
 """
 
 from __future__ import annotations
 
+import argparse
+import asyncio
+import json
 import logging
+import re
+import sys
 from typing import Dict, List, Optional
 
-from crawlers.base import BaseCrawler, CrawlResult
+from crawlers.base import BaseCrawler, CrawlResult, CrawlerExecutor, DataImporter
 
 logger = logging.getLogger(__name__)
 
@@ -24,90 +28,861 @@ logger = logging.getLogger(__name__)
 class AtCoderCrawler(BaseCrawler):
     """Crawler for AtCoder (https://atcoder.jp).
 
-    Submission records and problem metadata come from the
-    `kenkoooo <https://kenkoooo.com/atcoder>`_ API.  User profiles
-    are fetched from the official AtCoder site.
+    Problem statements are scraped from the official site using
+    ``fetch_with_fallback`` (HTTP -> browser fallback).  Problem lists
+    by tag use the kenkoooo merged-problems.json endpoint.  User
+    profiles and submission records are browser-based.
     """
 
     PLATFORM: str = "atcoder"
 
     # ── class constants ─────────────────────────────────────────
 
+    BASE_URL: str = "https://atcoder.jp"
     KENKOO_API: str = "https://kenkoooo.com/atcoder"
-    ATCODER_URL: str = "https://atcoder.jp"
 
     @staticmethod
     def _default_qps() -> float:
-        return 2.0
+        return 3.0
 
-    # ── kenkoooo API helper ─────────────────────────────────────
+    # ── contest_id cache ────────────────────────────────────────
+    # kenkoooo's merged-problems.json has unreliable problem IDs
+    # (e.g. "1202Contest_a" where contest slug is actually "DEGwer2023").
+    # We load contest-problem.json to get the real contest_id for each
+    # problem_id so URLs like /contests/{real_contest}/tasks/{pid} work.
 
-    def _kenkoo_request(self, path: str, **params: str) -> CrawlResult:
-        """GET a kenkoooo API endpoint with query parameters.
+    _contest_map: Optional[dict] = None  # problem_id -> contest_id
 
-        Args:
-            path: API path relative to ``KENKOO_API``
-                  (e.g. ``"/atcoder-api/v3/user/submissions"``).
-            **params: Query-string parameters.
-
-        Returns:
-            CrawlResult.
-        """
-        url = f"{self.KENKOO_API}{path}"
-        if params:
-            qs = "&".join(
-                f"{k}={v}" for k, v in params.items() if v is not None
+    def _load_contest_map(self) -> dict:
+        """Lazily load contest-problem.json mapping problem_id -> contest_id."""
+        if self._contest_map is not None:
+            return self._contest_map
+        try:
+            result = self._http_request(
+                f"{self.KENKOO_API}/resources/contest-problem.json"
             )
-            url += f"?{qs}"
+            if result.success and isinstance(result.data, list):
+                self._contest_map = {}
+                for entry in result.data:
+                    if isinstance(entry, dict):
+                        pid = entry.get("problem_id", "")
+                        cid = entry.get("contest_id", "")
+                        if pid and cid:
+                            self._contest_map[pid] = cid
+                logger.info("Loaded %d contest-problem mappings", len(self._contest_map))
+            else:
+                self._contest_map = {}
+        except Exception as exc:
+            logger.warning("Failed to load contest-problem.json: %s", exc)
+            self._contest_map = {}
+        return self._contest_map
 
-        logger.debug("Kenkoo GET: %s", url)
-        return self._http_request(url)
+    # ── helpers ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_html_text(page_result: CrawlResult) -> str:
+        """Extract HTML string from a CrawlResult (browser or HTTP)."""
+        data = page_result.data
+        if isinstance(data, dict):
+            return data.get("text", data.get("html", ""))
+        if isinstance(data, str):
+            return data
+        return ""
+
+    @staticmethod
+    def _parse_problem_id(source_id: str) -> tuple:
+        """Split ``\"abc400_a\"`` -> ``(\"abc400\", \"a\")``."""
+        m = re.match(r"^([a-zA-Z]+\d+)_([a-z]\d*)$", source_id)
+        if m:
+            return m.group(1), m.group(2)
+        parts = source_id.rsplit("_", 1)
+        if len(parts) == 2 and parts[0] and parts[1]:
+            return parts[0], parts[1]
+        return "", source_id
+
+    def _get_contest_id(self, problem_id: str) -> str:
+        """Get the real AtCoder contest slug for a problem_id.
+
+        Uses the kenkoooo contest-problem.json cache loaded via
+        ``_http_request``. Falls back to parsing the problem_id.
+        """
+        cmap = self._load_contest_map()
+        cid = cmap.get(problem_id, "")
+        if cid:
+            return cid
+        # Fallback: try to parse from problem_id
+        parsed, _ = self._parse_problem_id(problem_id)
+        return parsed
+
+    # ── KaTeX handling ──────────────────────────────────────────
+
+    @staticmethod
+    def _process_katex(soup_element) -> None:
+        """Replace KaTeX elements with ``$...$`` or ``$$...$$`` LaTeX markup.
+
+        Finds ``<annotation encoding="application/x-tex">`` inside
+        KaTeX elements, extracts the LaTeX source, and replaces the
+        outermost ``.katex`` wrapper.  Display math (``.katex-display``)
+        is wrapped with ``$$``; inline math with ``$``.
+        """
+        annotations = soup_element.select(
+            'annotation[encoding="application/x-tex"]'
+        )
+        # Track already-processed wrappers to avoid double-replacement
+        seen_wrappers = set()
+
+        for annotation in annotations:
+            tex = annotation.get_text(strip=False).strip()
+            if not tex:
+                continue
+
+            # Walk up to find the .katex wrapper
+            el = annotation.parent
+            is_display = False
+            katex_wrapper = None
+            while el is not None and el is not soup_element:
+                if not hasattr(el, "get"):
+                    el = el.parent
+                    continue
+                cls_val = el.get("class", "")
+                if isinstance(cls_val, list):
+                    classes = cls_val
+                else:
+                    classes = str(cls_val).split()
+                if "katex-display" in classes:
+                    is_display = True
+                    katex_wrapper = el
+                    break
+                if "katex" in classes:
+                    katex_wrapper = el
+                    break
+                el = el.parent
+
+            if katex_wrapper is None:
+                # No katex wrapper found; just replace the annotation itself
+                try:
+                    annotation.replace_with(f"${tex}$")
+                except Exception:
+                    pass
+                continue
+
+            wrapper_id = id(katex_wrapper)
+            if wrapper_id in seen_wrappers:
+                continue
+            seen_wrappers.add(wrapper_id)
+
+            try:
+                if is_display:
+                    katex_wrapper.replace_with(f"$$\n{tex}\n$$")
+                else:
+                    katex_wrapper.replace_with(f"${tex}$")
+            except Exception:
+                pass
+
+    @staticmethod
+    def _process_images(soup_element) -> None:
+        """Replace ``<img>`` tags with Markdown image syntax ``![](url)``."""
+        for img in soup_element.find_all("img"):
+            src = img.get("src", "")
+            alt = img.get("alt", "image")
+            if src:
+                img.replace_with(f"![{alt}]({src})")
+
+    @staticmethod
+    def _unwind_inline(root_el) -> None:
+        """Replace inline formatting elements (<var>, <b>, <i>, <em>,
+        <strong>, <span>) with their text content so they don't cause
+        spurious line breaks in get_text().  Also unwrap <a> links
+        (keep text, drop href).
+
+        For ``<var>`` tags, the content is wrapped in ``$...$`` first
+        so that LaTeX expressions (e.g. ``N \\ K \\ T``, ``\\ldots``)
+        render as math even when the page uses no KaTeX markup.
+        """
+        from bs4 import NavigableString as _NS
+
+        # Wrap <var> content in $...$ before unwrapping
+        for var_el in root_el.find_all("var"):
+            inner = var_el.get_text("", strip=True)
+            if inner and "$" not in inner:
+                var_el.clear()
+                var_el.append(_NS(f"${inner}$"))
+
+        inline_selectors = ("var", "b", "i", "em", "strong", "span")
+        for sel in inline_selectors:
+            for el in root_el.find_all(sel):
+                el.unwrap()
+        # Unwrap <a> tags (keep link text, drop URL)
+        for a in root_el.find_all("a"):
+            a.unwrap()
+
+    @staticmethod
+    def _merge_adjacent_strings(root_el) -> None:
+        """Merge adjacent NavigableString nodes so get_text("\\n") won't
+        split unwrapped inline content into separate lines."""
+        from bs4 import NavigableString as _NS
+        walked = set()
+        for el in root_el.descendants:
+            if el in walked or not hasattr(el, "contents"):
+                continue
+            i = 0
+            while i < len(el.contents) - 1:
+                a, b = el.contents[i], el.contents[i + 1]
+                if isinstance(a, _NS) and isinstance(b, _NS):
+                    walked.add(a)
+                    walked.add(b)
+                    a.replace_with(_NS(str(a) + str(b)))
+                    b.extract()
+                else:
+                    i += 1
+
+    # ── section extraction ──────────────────────────────────────
+
+    @staticmethod
+    def _extract_sections(html: str) -> dict:
+        """Parse AtCoder problem page into structured sections.
+
+        Finds ``#task-statement > span.lang-en``, then splits content
+        by ``<h3>`` headings to classify into: description, constraints,
+        input_format, output_format, and samples.
+
+        Returns a dict with keys:
+            description, constraints, input_format, output_format, samples
+        """
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            return {}
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Find the English task statement
+        task_statement = soup.select_one("#task-statement")
+        if not task_statement:
+            return {}
+
+        lang_en = task_statement.select_one("span.lang-en")
+        if not lang_en:
+            # Fallback: use the whole task-statement
+            lang_en = task_statement
+
+        # Pre-process: replace KaTeX math and images with Markdown
+        AtCoderCrawler._process_katex(lang_en)
+        AtCoderCrawler._process_images(lang_en)
+
+        # Remove script/style elements
+        for tag in lang_en.find_all(["script", "style"]):
+            tag.decompose()
+
+        # ── Split by <h3> tags ───────────────────────────────────
+        lang_en_html = str(lang_en)
+        parts = re.split(r"<h3[^>]*>", lang_en_html, flags=re.IGNORECASE)
+
+        result: Dict[str, object] = {
+            "description": "",
+            "constraints": "",
+            "input_format": "",
+            "output_format": "",
+            "samples": [],
+        }
+
+        # Section labels -> result key mapping
+        SECTION_MAP: Dict[str, str] = {
+            "problem statement": "description",
+            "problem": "description",
+            "story": "description",
+            "constraints": "constraints",
+            "constraint": "constraints",
+            "input": "input_format",
+            "output": "output_format",
+            "input format": "input_format",
+            "output format": "output_format",
+        }
+
+        SAMPLE_INPUT_RE = re.compile(r"^Sample\s+Input\s+\d+$", re.IGNORECASE)
+        SAMPLE_OUTPUT_RE = re.compile(r"^Sample\s+Output\s+\d+$", re.IGNORECASE)
+        SAMPLE_RE = re.compile(r"^Sample\s+\d+$", re.IGNORECASE)
+
+        sample_inputs: List[str] = []
+        sample_outputs: List[str] = []
+
+        for idx, part in enumerate(parts):
+            if idx == 0:
+                # Content before the first <h3> — often empty or a lead-in
+                continue
+
+            # Split at the first </h3> to get heading text and body
+            m = re.match(r"(.*?)</h3>(.*)", part, re.DOTALL | re.IGNORECASE)
+            if not m:
+                continue
+
+            heading_text = BeautifulSoup(m.group(1), "html.parser").get_text(
+                strip=True
+            )
+            section_html = m.group(2)
+
+            if not heading_text:
+                continue
+
+            # ── Check if this is a sample heading ─────────────────
+            if SAMPLE_INPUT_RE.match(heading_text):
+                section_soup = BeautifulSoup(section_html, "html.parser")
+                pre_texts = [
+                    p.get_text("\n", strip=False)
+                    for p in section_soup.find_all("pre")
+                ]
+                sample_inputs.append(
+                    "\n".join(pre_texts) if pre_texts else section_soup.get_text(
+                        "\n", strip=True
+                    )
+                )
+                continue
+
+            if SAMPLE_OUTPUT_RE.match(heading_text):
+                section_soup = BeautifulSoup(section_html, "html.parser")
+                pre_texts = [
+                    p.get_text("\n", strip=False)
+                    for p in section_soup.find_all("pre")
+                ]
+                sample_outputs.append(
+                    "\n".join(pre_texts) if pre_texts else section_soup.get_text(
+                        "\n", strip=True
+                    )
+                )
+                continue
+
+            if SAMPLE_RE.match(heading_text):
+                # "Sample 1" style — may contain both input and output <pre> blocks
+                section_soup = BeautifulSoup(section_html, "html.parser")
+                pres = section_soup.find_all("pre")
+                if len(pres) >= 2:
+                    sample_inputs.append(
+                        pres[0].get_text("\n", strip=False)
+                    )
+                    sample_outputs.append(
+                        pres[1].get_text("\n", strip=False)
+                    )
+                continue
+
+            # ── Classify regular section ──────────────────────────
+            heading_lower = heading_text.lower().strip()
+            section_key = None
+            for label, key in SECTION_MAP.items():
+                if heading_lower == label or heading_lower.startswith(
+                    label + " "
+                ):
+                    section_key = key
+                    break
+
+            if section_key:
+                section_soup = BeautifulSoup(section_html, "html.parser")
+                AtCoderCrawler._process_katex(section_soup)
+                AtCoderCrawler._process_images(section_soup)
+                # Unwrap inline tags FIRST (wraps <var> content in $...$)
+                # before <pre> replacement extracts text (Root cause M).
+                AtCoderCrawler._unwind_inline(section_soup)
+                # Preserve <pre> formatting: replace each <pre> with
+                # its text wrapped in newlines so get_text() doesn't
+                # flatten pre-formatted content (Root cause L).
+                # Wrap <pre> blocks in markdown code fences so they
+                # render as code blocks.  Merge adjacent text nodes
+                # inside <pre> first so _unwind_inline changes coalesce.
+                for pre in section_soup.find_all("pre"):
+                    AtCoderCrawler._merge_adjacent_strings(pre)
+                    pre_text = pre.get_text()
+                    pre.replace_with(f"\n```\n{pre_text}\n```\n")
+                AtCoderCrawler._merge_adjacent_strings(section_soup)
+                text = section_soup.get_text("\n", strip=True)
+                text = AtCoderCrawler._normalize_text(text)
+                existing = result.get(section_key, "")
+                if isinstance(existing, str) and existing:
+                    result[section_key] = existing + "\n\n" + text
+                else:
+                    result[section_key] = text
+
+        # ── Pair sample inputs and outputs ───────────────────────
+        samples: list = []
+        for inp, out in zip(sample_inputs, sample_outputs):
+            samples.append(
+                [
+                    AtCoderCrawler._normalize_text(inp),
+                    AtCoderCrawler._normalize_text(out),
+                ]
+            )
+
+        # Handle any unmatched inputs or outputs
+        max_len = max(len(sample_inputs), len(sample_outputs))
+        for i in range(len(samples), max_len):
+            inp = (
+                sample_inputs[i]
+                if i < len(sample_inputs)
+                else ""
+            )
+            out = (
+                sample_outputs[i]
+                if i < len(sample_outputs)
+                else ""
+            )
+            samples.append(
+                [
+                    AtCoderCrawler._normalize_text(inp),
+                    AtCoderCrawler._normalize_text(out),
+                ]
+            )
+
+        result["samples"] = samples
+
+        return result
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        """Normalize whitespace in extracted text.
+
+        Applies ``html.unescape``, collapses blank lines, normalizes
+        horizontal whitespace while preserving newlines.
+        """
+        import html as _html
+
+        text = _html.unescape(text)
+        text = re.sub(r"\r\n|\r", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"\n[ \t]+\n", "\n\n", text)
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        text = AtCoderCrawler._wrap_latex(text)
+        return text.strip()
+
+    @staticmethod
+    def _wrap_latex(text: str) -> str:
+        """Wrap bare LaTeX commands / subscripts that escaped <var> handling
+        in ``$...$`` delimiters.  Most cases are handled by ``_unwind_inline``
+        which wraps ``<var>`` content before unwrapping."""
+        # Already has $ delimiters — skip
+        if "$" in text:
+            return text
+        # Wrap \ldots, \dots, \  (backslash-space), and similar bare commands.
+        # The \  (backslash + whitespace) is AtCoder's math spacing — wrap
+        # any backslash followed by one letter or whitespace.
+        text = re.sub(
+            r"(\\[a-zA-Z\s](?:\{[^}]*\})*)",
+            r"$\g<1>$",
+            text,
+        )
+        # Wrap isolated subscripts/superscripts: A_i, x^{2}
+        text = re.sub(
+            r"([A-Za-z0-9]+[_^]\s*(?:\{[^}]*\}|[A-Za-z0-9]+))",
+            r"$\g<1>$",
+            text,
+        )
+        return text
 
     # ── abstract method implementations ─────────────────────────
 
+    def fetch_problem(self, source_id: str) -> CrawlResult:
+        """Fetch problem metadata + full HTML statement.
+
+        Parses *source_id* like ``"abc400_a"`` into contest_id + index,
+        fetches ``/contests/{contest_id}/tasks/{source_id}``, and
+        extracts structured content via :meth:`_extract_sections`.
+
+        Args:
+            source_id: AtCoder problem ID (e.g. ``"abc400_a"``).
+
+        Returns:
+            CrawlResult with problem dict including ``description``,
+            ``constraints``, ``input_format``, ``output_format``,
+            ``samples``, and ``source_url``.
+        """
+        # Use the kenkoooo cache to get the CORRECT contest slug
+        # (e.g. "1202Contest_a" -> contest_id="DEGwer2023", not "1202Contest")
+        contest_id = self._get_contest_id(source_id)
+        if not contest_id:
+            return CrawlResult(
+                success=False,
+                error=f"Cannot determine contest for problem ID: {source_id}",
+                source="http",
+            )
+        # Also extract index for metadata
+        _, index = self._parse_problem_id(source_id)
+
+        problem_url = (
+            f"{self.BASE_URL}/contests/{contest_id}/tasks/{source_id}"
+        )
+        logger.debug("AtCoder fetching problem page: %s", problem_url)
+
+        page_result = self.fetch_with_fallback(problem_url)
+        if not page_result.success:
+            return page_result
+
+        html = self._extract_html_text(page_result)
+        if not html:
+            return CrawlResult(
+                success=False,
+                error="Empty response from AtCoder problem page",
+                source=page_result.source,
+                retry_count=page_result.retry_count,
+            )
+
+        # Extract sections
+        sections = self._extract_sections(html)
+
+        # Try to get a clean title from the page
+        try:
+            from bs4 import BeautifulSoup
+
+            title_soup = BeautifulSoup(html, "html.parser")
+            title_tag = title_soup.find("title")
+            title = title_tag.get_text(strip=True) if title_tag else source_id
+            # Strip "ContestName - " prefix if present
+            if " - " in title:
+                _, _, title = title.partition(" - ")
+            import html as _html
+
+            title = _html.unescape(title)
+        except Exception:
+            title = source_id
+
+        # ── Ensure constraints is extracted ──────────────────────────
+        if not sections.get("constraints"):
+            constraint_match = re.search(
+                r'<h3[^>]*>\s*(?:Constraints|Constraint)\s*</h3>\s*(.*?)(?=<h3[^>]*>|$)',
+                html,
+                re.DOTALL | re.IGNORECASE,
+            )
+            if constraint_match:
+                try:
+                    from bs4 import BeautifulSoup
+
+                    c_soup = BeautifulSoup(
+                        constraint_match.group(1), "html.parser"
+                    )
+                    self._process_katex(c_soup)
+                    self._process_images(c_soup)
+                    c_text = c_soup.get_text("\n", strip=True)
+                    sections["constraints"] = self._normalize_text(c_text)
+                except Exception:
+                    pass
+
+        # ── Build base data dict ────────────────────────────────────
+        data_dict: Dict[str, object] = {
+            "source_id": source_id,
+            "contest_id": contest_id,
+            "index": index,
+            "title": title,
+            "description": sections.get("description", ""),
+            "constraints": sections.get("constraints", ""),
+            "input_format": sections.get("input_format", ""),
+            "output_format": sections.get("output_format", ""),
+            "samples": sections.get("samples", []),
+            "source_url": problem_url,
+        }
+
+        # ── Fetch kenkoooo merged-problems.json for metadata ────────
+        try:
+            merged_url = (
+                f"{self.KENKOO_API}/resources/merged-problems.json"
+            )
+            merged_result = self._http_request(merged_url)
+            if merged_result.success and isinstance(
+                merged_result.data, list
+            ):
+                for p in merged_result.data:
+                    if isinstance(p, dict) and p.get("id") == source_id:
+                        if "point" in p and p["point"] is not None:
+                            data_dict["point"] = p["point"]
+                        if "solver_count" in p:
+                            data_dict["solver_count"] = p["solver_count"]
+                        break
+        except Exception:
+            pass
+
+        # ── Fetch difficulty from problem-models.json ───────────────
+        try:
+            models_url = (
+                f"{self.KENKOO_API}/resources/problem-models.json"
+            )
+            models_result = self._http_request(models_url)
+            if models_result.success and isinstance(
+                models_result.data, dict
+            ):
+                model = models_result.data.get(source_id)
+                if isinstance(model, dict) and "difficulty" in model:
+                    data_dict["difficulty"] = model["difficulty"]
+        except Exception:
+            pass
+
+        # ── Extract tags ────────────────────────────────────────────
+        # NOTE: AtCoder does NOT provide algorithm tags (dp, graph,
+        # greedy, etc.) on its official pages.  Only contest-type prefix
+        # tags are available, derived from the contest_id (e.g.
+        # "abc300" → "abc", "arc180" → "arc", "agc065" → "agc").
+        #
+        # The kenkoooo AtCoder Problems API (merged-problems.json /
+        # problem-models.json) also does NOT expose algorithm tags
+        # (difficulty ratings are available and consumed above).
+        #
+        # If algorithm tags are needed in the future, options include:
+        #  1. LLM-based auto-tagging from problem description
+        #  2. Community-curated tag lists (no stable public endpoint)
+        #  3. Cross-referencing against other problem databases
+        tags: List[str] = []
+        if contest_id:
+            prefix_match = re.match(r"^([a-zA-Z]+)\d", contest_id)
+            if prefix_match:
+                tag = prefix_match.group(1).lower()
+                if tag not in tags:
+                    tags.append(tag)
+        if tags:
+            data_dict["tags"] = tags
+
+        return CrawlResult(
+            success=True,
+            data=data_dict,
+            source=page_result.source,
+            retry_count=page_result.retry_count,
+        )
+
+    def fetch_solutions(
+        self, source_id: str, max_editorials: int = 5
+    ) -> CrawlResult:
+        """Fetch solution / editorial content for an AtCoder problem.
+
+        Visits ``/contests/{contest_id}/editorial`` and extracts
+        solution text with KaTeX math and code blocks.
+
+        Args:
+            source_id: Problem identifier (e.g. ``"abc400_a"``).
+            max_editorials: Maximum editorial pages to try.
+
+        Returns:
+            CrawlResult whose ``data`` is a list of solution dicts
+            with ``author``, ``content``, ``title``, ``vote_count``.
+        """
+        contest_id = self._get_contest_id(source_id)
+        if not contest_id:
+            return CrawlResult(
+                success=False,
+                error=f"Cannot determine contest for problem ID: {source_id}",
+                source="http",
+            )
+
+        editorial_url = f"{self.BASE_URL}/contests/{contest_id}/editorial"
+        logger.debug("AtCoder fetching editorial: %s", editorial_url)
+
+        page_result = self.fetch_with_fallback(editorial_url)
+        if not page_result.success:
+            return page_result
+
+        html = self._extract_html_text(page_result)
+        if not html:
+            return CrawlResult(
+                success=False,
+                error="Empty editorial page",
+                source="http",
+            )
+
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            return CrawlResult(success=True, data=[], source="http")
+
+        import html as _html
+
+        soup = BeautifulSoup(html, "html.parser")
+        solutions: list = []
+
+        # Main content container
+        main_content = soup.select_one(
+            ".editorial-content, .part, #main-container .container, .col-sm-12, .row"
+        )
+        if not main_content:
+            main_content = soup
+
+        # ── Strategy A: Find problem-specific sections by heading ──
+        index_upper = index.upper()
+        prob_heading_re = re.compile(
+            rf"^(?:Task\s*)?{re.escape(index_upper)}[\.\s\-:：]",
+            re.IGNORECASE,
+        )
+
+        sections_found: list = []
+
+        for tag in main_content.find_all(["h2", "h3", "h4"]):
+            tag_text = tag.get_text(strip=True)
+            if not prob_heading_re.match(tag_text):
+                continue
+
+            # Collect content until the next heading
+            content_parts: List[str] = []
+            sibling = tag.next_sibling
+            while sibling is not None:
+                if hasattr(sibling, "name") and sibling.name in (
+                    "h2",
+                    "h3",
+                    "h4",
+                ):
+                    break
+                content_parts.append(str(sibling))
+                sibling = sibling.next_sibling
+
+            section_html = "".join(content_parts)
+            section_soup = BeautifulSoup(section_html, "html.parser")
+            self._process_katex(section_soup)
+            self._process_images(section_soup)
+            text = section_soup.get_text("\n", strip=True)
+            text = _html.unescape(text)
+            text = self._normalize_text(text)
+
+            if len(text) > 50:
+                sections_found.append(
+                    {
+                        "author": "AtCoder Editorial",
+                        "title": tag_text,
+                        "content": text,
+                        "vote_count": 0,
+                    }
+                )
+
+        if sections_found:
+            solutions.extend(sections_found)
+            return CrawlResult(
+                success=True,
+                data=solutions,
+                source=page_result.source,
+            )
+
+        # ── Strategy B: Follow links to detailed editorial pages ──
+        editorial_links: List[str] = []
+        for a in main_content.find_all("a", href=True):
+            href = a.get("href", "")
+            text = a.get_text(strip=True).lower()
+            if any(
+                kw in text
+                for kw in ("editorial", "解説", "solution", "解答", "answer")
+            ):
+                full_url = (
+                    f"{self.BASE_URL}{href}"
+                    if href.startswith("/")
+                    else href
+                )
+                if full_url not in editorial_links:
+                    editorial_links.append(full_url)
+
+        # Also try problem-letter-specific editorial URLs
+        for suffix in [
+            f"/contests/{contest_id}/editorial/{index_upper}",
+            f"/contests/{contest_id}/editorial#{index_upper}",
+        ]:
+            url = f"{self.BASE_URL}{suffix}"
+            if url not in editorial_links:
+                editorial_links.append(url)
+
+        # Fetch linked editorial pages
+        for link in editorial_links[:max_editorials]:
+            logger.debug("AtCoder fetching editorial link: %s", link)
+            ed_result = self.fetch_with_fallback(link)
+            if not ed_result.success:
+                continue
+            ed_html = self._extract_html_text(ed_result)
+            if not ed_html:
+                continue
+
+            ed_soup = BeautifulSoup(ed_html, "html.parser")
+            self._process_katex(ed_soup)
+            self._process_images(ed_soup)
+
+            for sel in ("script", "style", "nav", "footer", "header"):
+                for el in ed_soup.find_all(sel):
+                    el.decompose()
+
+            text = ed_soup.get_text("\n", strip=True)
+            text = _html.unescape(text)
+            text = self._normalize_text(text)
+
+            if len(text) > 100:
+                solutions.append(
+                    {
+                        "author": "AtCoder Editorial",
+                        "title": f"Contest {contest_id} Editorial",
+                        "content": text,
+                        "vote_count": 0,
+                    }
+                )
+
+        if not solutions:
+            # ── Strategy C: Return the full editorial page content ──
+            self._process_katex(main_content)
+            self._process_images(main_content)
+
+            for sel in ("script", "style", "nav", "footer", "header"):
+                for el in main_content.find_all(sel):
+                    el.decompose()
+
+            text = main_content.get_text("\n", strip=True)
+            text = _html.unescape(text)
+            text = self._normalize_text(text)
+
+            if len(text) > 100:
+                solutions.append(
+                    {
+                        "author": "AtCoder Editorial",
+                        "title": f"Contest {contest_id} Editorial",
+                        "content": text,
+                        "vote_count": 0,
+                    }
+                )
+
+        if not solutions:
+            return CrawlResult(
+                success=False,
+                error=f"No editorial content found for problem '{source_id}'",
+                source="http",
+            )
+
+        return CrawlResult(
+            success=True,
+            data=solutions,
+            source=page_result.source,
+        )
+
     def fetch_user_profile(self, uid: str) -> CrawlResult:
-        """Fetch an AtCoder user's profile from the official site.
+        """Fetch an AtCoder user's profile (browser-based).
 
-        GET https://atcoder.jp/users/{uid}
-
-        The kenkoooo API does not expose user metadata (rating history
-        is available but not profile fields).  This method uses
-        ``fetch_with_fallback`` to obtain the user page and extracts
-        structured data from it.
+        Navigates to ``/users/{uid}`` and extracts structured profile
+        data via regex scraping.
 
         Args:
             uid: AtCoder user ID (case-sensitive).
 
         Returns:
-            CrawlResult with profile data.
+            CrawlResult with profile dict.
         """
-        url = f"{self.ATCODER_URL}/users/{uid}"
-        result = self.fetch_with_fallback(url)
+        url = f"{self.BASE_URL}/users/{uid}"
+        logger.debug("AtCoder fetching user profile: %s", url)
 
+        result = self.fetch_with_fallback(url)
         if not result.success:
             return result
 
-        # Extract HTML text from the result.
-        data = result.data
-        if isinstance(data, dict) and "text" in data:
-            html: str = data["text"]
-        elif isinstance(data, str):
-            html = data
-        else:
+        html = self._extract_html_text(result)
+        if not html:
             return CrawlResult(
                 success=False,
-                error="Unexpected response format from AtCoder profile page",
+                error="Empty user profile page",
                 source=result.source,
+                retry_count=result.retry_count,
             )
 
-        import re
+        import html as _html
 
         profile: Dict[str, object] = {"user_id": uid}
 
         # Rating
         rating_match = re.search(
-            r'<span[^>]*class="[^"]*user-red[^"]*"[^>]*>(\d+)</span>', html
-        ) or re.search(r'<span[^>]*class="[^"]*bold[^"]*"[^>]*>(\d+)</span>', html)
+            r'<span[^>]*class="[^"]*user-red[^"]*"[^>]*>(\d+)</span>',
+            html,
+        ) or re.search(
+            r'<span[^>]*class="[^"]*bold[^"]*"[^>]*>(\d+)</span>', html
+        )
         if rating_match:
             profile["rating"] = int(rating_match.group(1))
 
@@ -116,23 +891,42 @@ class AtCoderCrawler(BaseCrawler):
         if highest_match:
             profile["highest_rating"] = int(highest_match.group(1))
 
-        # Affiliation (所属)
-        aff_match = re.search(r'<th[^>]*>Affiliation</th>\s*<td[^>]*>(.*?)</td>', html, re.DOTALL)
+        # Affiliation
+        aff_match = re.search(
+            r'<th[^>]*>Affiliation</th>\s*<td[^>]*>(.*?)</td>',
+            html,
+            re.DOTALL,
+        )
         if aff_match:
-            profile["affiliation"] = aff_match.group(1).strip()
+            profile["affiliation"] = _html.unescape(
+                aff_match.group(1).strip()
+            )
 
         # Country / region
-        country_match = re.search(r'<th[^>]*>Country/Region</th>\s*<td[^>]*>(.*?)</td>', html, re.DOTALL)
+        country_match = re.search(
+            r'<th[^>]*>Country/Region</th>\s*<td[^>]*>(.*?)</td>',
+            html,
+            re.DOTALL,
+        )
         if country_match:
-            profile["country"] = country_match.group(1).strip()
+            profile["country"] = _html.unescape(
+                country_match.group(1).strip()
+            )
 
-        # Rank (class)
-        rank_match = re.search(r'<span[^>]*class="[^"]*user-(blue|orange|red|yellow|cyan|green|brown|gray|unrated)[^"]*"', html)
+        # Rank (colour class)
+        rank_match = re.search(
+            r'<span[^>]*class="[^"]*user-(blue|orange|red|yellow|cyan|green|brown|gray|unrated)[^"]*"',
+            html,
+        )
         if rank_match:
             profile["rank"] = rank_match.group(1)
 
         # Number of contests participated
-        contests_match = re.search(r'<td[^>]*>(\d+)</td>\s*<td[^>]*class="[^"]*text-center[^"]*"[^>]*>\s*Contests', html, re.DOTALL | re.IGNORECASE)
+        contests_match = re.search(
+            r'<td[^>]*>(\d+)</td>\s*<td[^>]*class="[^"]*text-center[^"]*"[^>]*>\s*Contests',
+            html,
+            re.DOTALL | re.IGNORECASE,
+        )
         if contests_match:
             profile["contests_participated"] = int(contests_match.group(1))
 
@@ -146,89 +940,113 @@ class AtCoderCrawler(BaseCrawler):
     def fetch_user_records(
         self, uid: str, since: Optional[str] = None
     ) -> CrawlResult:
-        """Fetch submission history via kenkoooo API.
+        """Fetch submission history for an AtCoder user (browser-based).
 
-        GET /atcoder-api/v3/user/submissions?user={uid}&from_second={since}
+        Navigates to ``/users/{uid}/submissions`` and extracts
+        submission records from the results table.
 
         Args:
             uid: AtCoder user ID.
-            since: Unix timestamp (seconds) to filter submissions from.
-                   If not provided, defaults to 0 (all submissions).
+            since: *Ignored* — kept for interface compatibility.
+                   AtCoder submissions are always newest-first.
 
         Returns:
             CrawlResult whose ``data`` is a list of submission dicts.
         """
-        from_second = since if since else "0"
-        result = self._kenkoo_request(
-            "/atcoder-api/v3/user/submissions",
-            user=uid,
-            from_second=from_second,
-        )
-        return result
+        url = f"{self.BASE_URL}/users/{uid}/submissions"
+        logger.debug("AtCoder fetching user submissions: %s", url)
 
-    def fetch_problem(self, source_id: str) -> CrawlResult:
-        """Fetch a single problem by its AtCoder problem ID.
-
-        GET /atcoder-api/v3/problem/models (full list, filtered client-side).
-
-        The kenkoooo API does not provide a single-problem endpoint,
-        so the full problem list is fetched and filtered.
-
-        Args:
-            source_id: AtCoder problem ID
-                       (e.g. ``"abc174_a"``, ``"arc108_c"``).
-
-        Returns:
-            CrawlResult with the matched problem dict.
-        """
-        result = self._kenkoo_request("/atcoder-api/v3/problem/models")
+        result = self.fetch_with_fallback(url)
         if not result.success:
             return result
 
-        problems = result.data
-        if not isinstance(problems, list):
+        html = self._extract_html_text(result)
+        if not html:
             return CrawlResult(
                 success=False,
-                error="Unexpected problem models response format",
+                error="Empty submissions page",
+                source=result.source,
+                retry_count=result.retry_count,
+            )
+
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            return CrawlResult(
+                success=False,
+                error="BeautifulSoup not available",
                 source="http",
             )
 
-        # The kenkoooo problem "id" is the AtCoder problem ID.
-        for p in problems:
-            if isinstance(p, dict) and p.get("id") == source_id:
-                return CrawlResult(
-                    success=True,
-                    data=p,
-                    source="http",
-                    retry_count=result.retry_count,
-                )
+        soup = BeautifulSoup(html, "html.parser")
+        records: list = []
+
+        # AtCoder submissions table — class "table" is typical
+        table = soup.find("table", class_="table")
+        if table is None:
+            table = soup.find("table")
+
+        if table:
+            rows = table.find_all("tr")[1:]  # skip header
+            for row in rows:
+                cols = row.find_all("td")
+                if len(cols) < 7:
+                    continue
+
+                try:
+                    time_text = cols[0].get_text(strip=True)
+                    problem_link = cols[1].find("a")
+                    problem_id = (
+                        problem_link.get_text(strip=True)
+                        if problem_link
+                        else ""
+                    )
+                    verdict = (
+                        cols[6].get_text(strip=True)
+                        if len(cols) > 6
+                        else ""
+                    )
+
+                    records.append(
+                        {
+                            "uid": uid,
+                            "time": time_text,
+                            "problem_id": problem_id,
+                            "verdict": verdict,
+                        }
+                    )
+                except Exception:
+                    continue
 
         return CrawlResult(
-            success=False,
-            error=f"Problem '{source_id}' not found",
-            source="http",
+            success=True,
+            data=records,
+            source=result.source,
+            retry_count=result.retry_count,
         )
 
     def fetch_problems_by_tag(
         self, tag: str, count: int = 50
     ) -> CrawlResult:
-        """Fetch problems filtered by contest tag.
+        """Fetch problems filtered by contest tag via kenkoooo API.
 
-        GET /atcoder-api/v3/problem/models (full list, filtered client-side).
-
-        The kenkoooo problem model includes a ``contest_id`` field.
-        This method treats *tag* as a contest ID prefix filter.
-        For example, ``tag="abc"`` returns problems from ABC contests.
+        Fetches ``merged-problems.json`` from kenkoooo.com and
+        filters problems whose ``id`` starts with *tag*.
 
         Args:
-            tag: Contest ID prefix to filter by
+            tag: Contest prefix to filter by
                  (e.g. ``"abc"``, ``"arc"``, ``"agc"``).
             count: Maximum problems to return.
 
         Returns:
             CrawlResult with a list of matching problem dicts.
         """
-        result = self._kenkoo_request("/atcoder-api/v3/problem/models")
+        merged_url = (
+            "https://kenkoooo.com/atcoder/resources/merged-problems.json"
+        )
+        logger.debug("AtCoder fetching merged-problems.json")
+
+        result = self._http_request(merged_url)
         if not result.success:
             return result
 
@@ -236,7 +1054,7 @@ class AtCoderCrawler(BaseCrawler):
         if not isinstance(problems, list):
             return CrawlResult(
                 success=False,
-                error="Unexpected problem models response format",
+                error="Unexpected merged-problems response format",
                 source="http",
             )
 
@@ -244,16 +1062,311 @@ class AtCoderCrawler(BaseCrawler):
         for p in problems:
             if not isinstance(p, dict):
                 continue
-            contest_id = p.get("contest_id", "")
-            if isinstance(contest_id, str) and contest_id.lower().startswith(
+            pid = p.get("id", "")
+            if isinstance(pid, str) and pid.lower().startswith(
                 tag.lower()
             ):
+                # Attach source_url if missing
+                if "source_url" not in p:
+                    cid = p.get("contest_id", "")
+                    p["source_url"] = (
+                        f"{self.BASE_URL}/contests/{cid}/tasks/{pid}"
+                    )
                 matching.append(p)
                 if len(matching) >= count:
                     break
+
+        # ── Fetch difficulty from problem-models.json ───────────────
+        try:
+            models_url = (
+                f"{self.KENKOO_API}/resources/problem-models.json"
+            )
+            models_result = self._http_request(models_url)
+            if models_result.success and isinstance(
+                models_result.data, dict
+            ):
+                models_data = models_result.data
+                for p in matching:
+                    pid = p.get("id", "")
+                    if pid and pid in models_data:
+                        model = models_data[pid]
+                        if isinstance(model, dict) and "difficulty" in model:
+                            p["difficulty"] = model["difficulty"]
+        except Exception:
+            pass
 
         return CrawlResult(
             success=True,
             data=matching,
             source="http",
         )
+
+
+# ──────────────────────────────────────────────
+# CLI entry point
+# ──────────────────────────────────────────────
+
+
+def _run_import(platform: str) -> CrawlResult:
+    """Run DataImporter.import_all() for the given platform.
+
+    Returns:
+        CrawlResult wrapping the import results.
+    """
+    try:
+        from prisma import Prisma  # type: ignore[import-untyped]
+    except (ImportError, RuntimeError):
+        return CrawlResult(
+            success=False,
+            error=(
+                "Prisma client not available. "
+                "Install with: pip install prisma, "
+                "then run: prisma generate"
+            ),
+        )
+
+    async def _import() -> CrawlResult:
+        prisma = Prisma()
+        await prisma.connect()
+        try:
+            importer = DataImporter(prisma)
+            results = await importer.import_all()
+            return CrawlResult(success=True, data=results)
+        finally:
+            await prisma.disconnect()
+
+    try:
+        return asyncio.run(_import())
+    except Exception as exc:
+        return CrawlResult(success=False, error=str(exc))
+
+
+def _save_result(
+    crawler: AtCoderCrawler, data, sub_dir: str, label: str
+) -> None:
+    """Save fetched data to a timestamped JSON file under
+    ``data/raw/{platform}/{sub_dir}/``.
+    """
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    safe_label = str(label).replace("/", "_").replace("\\", "_")
+    filename = f"{today}_{safe_label}.json"
+    crawler.save_json(
+        data,
+        filename=filename,
+        sub_dir=f"{crawler.PLATFORM}/{sub_dir}",
+    )
+
+
+def main(argv: Optional[list] = None) -> None:
+    """CLI entry point for the AtCoder crawler.
+
+    Two modes are supported:
+
+    * **NestJS mode** — ``--input`` receives a JSON string with all
+      parameters (``action``, ``uid``, ``tags``, ``count``).
+    * **CLI mode** — each parameter is supplied via its own argparse flag.
+
+    Output is always a single JSON object printed to stdout.
+    """
+    parser = argparse.ArgumentParser(description="AtCoder crawler CLI")
+    parser.add_argument(
+        "--action",
+        choices=[
+            "fetch_problems",
+            "fetch_user",
+            "fetch_records",
+            "fetch_solutions",
+            "fetch_detail",
+            "import",
+        ],
+        default=None,
+        help="Crawl action to execute",
+    )
+    parser.add_argument(
+        "--uid", default=None, help="User ID / handle"
+    )
+    parser.add_argument(
+        "--tags", default=None, help="Tag for filtering problems"
+    )
+    parser.add_argument(
+        "--count", type=int, default=50, help="Max items to fetch"
+    )
+    parser.add_argument(
+        "--input",
+        default=None,
+        help="JSON input string containing all parameters (NestJS mode)",
+    )
+    args = parser.parse_args(argv)
+
+    # ── determine parameter source ─────────────────────────────
+    if args.input:
+        try:
+            params: dict = json.loads(args.input)
+        except json.JSONDecodeError as exc:
+            _emit(
+                success=False,
+                error=f"Invalid JSON input: {exc}",
+                platform="atcoder",
+            )
+            sys.exit(1)
+    else:
+        if not args.action:
+            _emit(
+                success=False,
+                error="Either --action or --input is required",
+                platform="atcoder",
+            )
+            sys.exit(1)
+        params = {
+            "action": args.action,
+            "uid": args.uid,
+            "tags": args.tags,
+            "count": args.count,
+        }
+
+    action: str = params.get("action", "")
+    if not action:
+        _emit(
+            success=False,
+            error="Missing 'action' in parameters",
+            platform="atcoder",
+        )
+        sys.exit(1)
+
+    # ── execute ────────────────────────────────────────────────
+    crawler = AtCoderCrawler()
+    executor = CrawlerExecutor(crawler)
+
+    try:
+        if action == "fetch_user":
+            uid = params.get("uid", "")
+            if not uid:
+                raise ValueError("--uid is required for fetch_user")
+            result = executor.execute("fetch_user_profile", str(uid))
+            if result.success and result.data:
+                _save_result(
+                    crawler, result.data, "profiles", str(uid)
+                )
+
+        elif action == "fetch_problems":
+            tag = params.get("tags", "")
+            count = int(params.get("count", 50))
+            skip_ids = set(params.get("skip_ids", []))
+            fetch_count = max(count + len(skip_ids), count * 3)
+            result = executor.execute(
+                "fetch_problems_by_tag", str(tag), fetch_count
+            )
+            if result.success and result.data:
+                new_items = []
+                for p in result.data:
+                    pid = p.get("id", "")
+                    if pid not in skip_ids:
+                        new_items.append(p)
+                new_items = new_items[:count]
+                # Enrich with full detail
+                enriched = []
+                for prob in new_items:
+                    sid = prob.get("id", "")
+                    if sid:
+                        detail = executor.execute(
+                            "fetch_problem", str(sid)
+                        )
+                        if detail and detail.success and detail.data:
+                            enriched.append(dict(detail.data))
+                        else:
+                            enriched.append(prob)
+                    else:
+                        enriched.append(prob)
+                result = CrawlResult(
+                    success=True,
+                    data=enriched,
+                    source=result.source,
+                )
+                _save_result(
+                    crawler, result.data, "problems", str(tag) or "all"
+                )
+
+        elif action == "fetch_records":
+            uid = params.get("uid", "")
+            if not uid:
+                raise ValueError(
+                    "--uid is required for fetch_records"
+                )
+            result = executor.execute("fetch_user_records", str(uid))
+            if result.success and result.data:
+                _save_result(
+                    crawler, result.data, "records", str(uid)
+                )
+
+        elif action == "fetch_solutions":
+            uid = params.get("uid", "")
+            if not uid:
+                raise ValueError(
+                    "--uid is required for fetch_solutions"
+                )
+            count = int(params.get("count", 5))
+            result = executor.execute(
+                "fetch_solutions", str(uid), count
+            )
+            if result.success and result.data:
+                _save_result(
+                    crawler, result.data, "solutions", str(uid)
+                )
+
+        elif action == "fetch_detail":
+            uid = params.get("uid", "")
+            if not uid:
+                raise ValueError(
+                    "--uid is required for fetch_detail"
+                )
+            result = executor.execute("fetch_problem", str(uid))
+            if result.success and result.data:
+                _save_result(
+                    crawler, result.data, "problems", str(uid)
+                )
+
+        elif action == "import":
+            result = _run_import(crawler.PLATFORM)
+
+        else:
+            result = CrawlResult(
+                success=False, error=f"Unknown action: {action}"
+            )
+
+        _emit(
+            success=result.success,
+            data=result.data,
+            error=result.error,
+            platform=crawler.PLATFORM,
+        )
+    except Exception as exc:
+        _emit(
+            success=False,
+            error=str(exc),
+            platform=crawler.PLATFORM,
+        )
+        sys.exit(1)
+    finally:
+        crawler.close()
+
+
+def _emit(
+    success: bool,
+    platform: str = "atcoder",
+    data: object = None,
+    error: Optional[str] = None,
+) -> None:
+    """Print a JSON result line to stdout."""
+    payload = {
+        "success": success,
+        "data": data,
+        "error": error,
+        "platform": platform,
+    }
+    print(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+if __name__ == "__main__":
+    main()

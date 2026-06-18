@@ -38,11 +38,11 @@ class ProblemPipeline:
     llm:
         A ``ChatOpenAI`` (or compatible) client pointed at DeepSeek for summarization.
     openai_client:
-        An OpenAI / AsyncOpenAI client exposing ``client.embeddings.create`` for
-        ``text-embedding-3-small`` embeddings.
+        An OpenAI / AsyncOpenAI client (only used when ``EMBED_BACKEND=openai``).
+        Can be ``None`` when using the default Ollama backend.
     """
 
-    def __init__(self, db: Any, llm: Any, openai_client: Any) -> None:
+    def __init__(self, db: Any, llm: Any, openai_client: Any = None) -> None:
         self._db = db
         self._tag_normalizer = TagNormalizer()
         self._diff_normalizer = DifficultyNormalizer()
@@ -129,13 +129,25 @@ class ProblemPipeline:
         return {"processed": processed, "errors": errors}
 
     async def _upsert_problem(self, problem: Dict[str, Any]) -> None:
-        """Persist an enriched problem to the database.
+        """Persist an enriched problem by writing it to the enriched JSON directory.
 
-        Placeholder -- in production this delegates to Prisma (or equivalent)
-        for an upsert operation.
+        The TypeScript crawler import flow can then read these files and
+        write the vectors to PostgreSQL via VectorService.
         """
-        # TODO: wire up Prisma upsert
-        pass
+        platform = problem.get("platform", "unknown")
+        source_id = problem.get("source_id", str(id(problem)))
+
+        base_dir = _project_root()
+        date_str = date.today().isoformat()
+        enriched_dir = (
+            base_dir / "data" / "enriched" / platform / date_str / "problems"
+        )
+        enriched_dir.mkdir(parents=True, exist_ok=True)
+
+        output_path = enriched_dir / f"{source_id}.json"
+        with open(output_path, "w", encoding="utf-8") as fh:
+            json.dump(problem, fh, ensure_ascii=False, indent=2)
+        logger.debug("Enriched problem written to %s", output_path)
 
 
 # ======================================================================
@@ -184,7 +196,7 @@ async def _run_process(
     date_str: str,
     db: Any,
     llm: Any,
-    openai_client: Any,
+    openai_client: Any = None,
     base_dir: Optional[Path] = None,
 ) -> Dict[str, int]:
     """Execute the ``process`` action."""
@@ -210,7 +222,7 @@ async def _run_re_embed(
     platform: str,
     count: int,
     date_str: str,
-    openai_client: Any,
+    openai_client: Any = None,
     base_dir: Optional[Path] = None,
 ) -> Dict[str, int]:
     """Execute the ``re-embed`` action."""
@@ -280,16 +292,13 @@ async def main_async(argv: Optional[List[str]] = None) -> None:
     base_dir = _project_root()
 
     if args.action == "process":
-        # These clients must be configured via env vars:
-        #   DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL   for ChatOpenAI
-        #   OPENAI_API_KEY / OPENAI_BASE_URL        for AsyncOpenAI
         llm = ChatOpenAI(
             model="deepseek-chat",
             base_url="https://api.deepseek.com/v1",
             api_key="placeholder",  # resolved from env
         )
-        openai_client = AsyncOpenAI()
-        db = None  # not wired yet
+        openai_client = None  # Ollama is default now
+        db = None
         stats = await _run_process(
             platform=args.platform,
             count=args.count,
@@ -301,7 +310,7 @@ async def main_async(argv: Optional[List[str]] = None) -> None:
         )
         print(json.dumps(stats))
     elif args.action == "re-embed":
-        openai_client = AsyncOpenAI()
+        openai_client = None  # Ollama is default now
         stats = await _run_re_embed(
             platform=args.platform,
             count=args.count,

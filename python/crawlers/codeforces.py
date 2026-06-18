@@ -532,21 +532,43 @@ class CodeforcesCrawler(BaseCrawler):
         # Normalize Windows-style line endings
         text = _re.sub(r'\r\n|\r', '\n', text)
         # Convert CF MathJax delimiter $$$ → $ for KaTeX compatibility.
-        # CF uses $$$ for all math (no inline/display distinction).
-        text = text.replace("$$$", "$")
-        # Merge adjacent $$ from consecutive inline $$$ blocks.
-        #   $$$A$$$$$$B$$$  →  $A$$B$  →  $AB$
-        # The naive .replace("$$", "$") produces $A$B$ which KaTeX parses
-        # as $A$ (complete block) + B$ (orphaned close), leaving B outside
-        # math mode.  Removing the $$ pair merges content correctly.
-        # Applied in a loop to handle chains of adjacent blocks.
+        # CF uses $$$ as its math delimiter.  Split on $$$ and rebuild:
+        # odd-indexed segments are math.  Two cases:
+        #   $$$x$$$           → $x$     (inline; odd seg = "x" non-empty)
+        #   $$$$$$c$$$$$$     → $$c$$   (display; the empty odd segments
+        #                                 on each side of c become the $$
+        #                                 display fences)
+        #   $$$A$$$$$$B$$$    → $A$$B$  (two adjacent inline blocks, merged
+        #                                 to $AB$ by the step below so that
+        #                                 orphaned superscripts like $^{\ast}$
+        #                                 reattach to their base)
+        # Regression: 2236G's ``a_{v_{l}} \oplus ... \geq (...)`` was wrapped
+        # in $$$$$$...$$$$$$; the old $$$→$ + $$-merge approach treated the
+        # display $$ fence as an adjacent-inline merge point and stripped it,
+        # leaving bare LaTeX with no $ wrapping.
+        _parts = text.split("$$$")
+        _FENCE = "\x00MATHFENCE\x00"  # placeholder so display fences survive the merge regex
+        _rebuilt = _parts[0]
+        for _pi in range(1, len(_parts)):
+            if _pi % 2 == 1:  # math segment
+                _seg = _parts[_pi]
+                if _seg.strip() == "":
+                    _rebuilt += _FENCE  # empty math → display fence
+                else:
+                    _rebuilt += "$" + _seg + "$"
+            else:  # text segment
+                _rebuilt += _parts[_pi]
+        text = _rebuilt
+        # Merge adjacent inline blocks ($A$$B$ → $AB$).  The display-fence
+        # placeholders contain no '$', so they never participate in this
+        # pattern and stay intact.
         for _ in range(10):  # bounded; realistic max depth is ~5
             new_text = _re.sub(r'\$([^$]+?)\$\$([^$]+?)\$', r'$\1\2$', text)
             if new_text == text:
                 break
             text = new_text
-        # Convert remaining $$ (from display math $$$$$$ → $$) to $
-        text = text.replace("$$", "$")
+        # Restore display fences → $$ (KaTeX display math)
+        text = text.replace(_FENCE, "$$")
         # Collapse 2+ consecutive newlines → max 1
         text = _re.sub(r'\n{2,}', '\n', text)
         # Collapse whitespace-only lines into the surrounding newline
