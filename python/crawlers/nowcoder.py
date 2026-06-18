@@ -497,6 +497,9 @@ class NowCoderCrawler(BaseCrawler):
         text = re.sub(r"\\!", "", text)   # negative thin space
         text = re.sub(r"\\;", "", text)   # thick space
         text = re.sub(r"\\:", "", text)   # medium space
+        # Clean up empty math delimiters left after stripping (e.g. $\bullet\,$ → $$)
+        text = re.sub(r"\$\$", "", text)
+        text = re.sub(r"\$ \$", "", text)
 
         # Deduplicate consecutive repeated lines (MathJax triplication)
         lines = text.split("\n")
@@ -563,6 +566,9 @@ class NowCoderCrawler(BaseCrawler):
         text = re.sub(r"\\!", "", text)
         text = re.sub(r"\\;", "", text)
         text = re.sub(r"\\:", "", text)
+        # Clean up empty math delimiters
+        text = re.sub(r"\$\$", "", text)
+        text = re.sub(r"\$ \$", "", text)
         # Deduplicate consecutive identical lines only (no merging)
         lines = text.split("\n")
         deduped = []

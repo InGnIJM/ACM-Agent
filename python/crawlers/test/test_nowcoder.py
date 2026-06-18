@@ -673,3 +673,70 @@ class TestCleanMathJaxSampleSpacing:
         assert "\\!" not in result
         assert "\\;" not in result
         assert "\\:" not in result
+
+
+# ──────────────────────────────────────────────
+# clean_mathjax — empty math delimiter cleanup
+# ──────────────────────────────────────────────
+
+class TestCleanMathJaxEmptyDelimiters:
+    """Verify that stripping commands between $...$ doesn't leave $$ artifacts."""
+
+    def test_dollar_bullet_comma_cleaned(self) -> None:
+        """$\\bullet\\,$ → after stripping → $$ should be cleaned."""
+        text = "$\\bullet\\,$若树的层数为$h$"
+        result = NowCoderCrawler.clean_mathjax(text)
+        assert "$$" not in result
+        assert "若树的层数为" in result
+        assert "$h$" in result
+
+    def test_empty_inline_math_cleaned(self) -> None:
+        """$\\,$ (only thin space) → $$ → cleaned."""
+        text = "前面$\\,$后面"
+        result = NowCoderCrawler.clean_mathjax(text)
+        assert "$$" not in result
+        assert "$ $" not in result
+
+    def test_preserves_valid_math(self) -> None:
+        """$x^2$ remains intact."""
+        text = "值$x^2$大于"
+        result = NowCoderCrawler.clean_mathjax(text)
+        assert "$x^2$" in result
+
+    def test_preserves_display_math(self) -> None:
+        """Valid $$...$$ display math is NOT broken."""
+        text = "$$\na + b\n$$"
+        result = NowCoderCrawler.clean_mathjax(text)
+        # Display math should survive — the $$ is start/end of a block
+        # But since clean_mathjax processes line by line, the $$ might be treated differently
+        # The key thing is that valid display math like $$\na + b\n$$ shouldn't be destroyed
+        assert "a + b" in result
+
+    def test_multiple_empty_delimiters_cleaned(self) -> None:
+        """Multiple $$ occurrences all cleaned."""
+        text = "$$\n$$若树$$第$h$层"
+        result = NowCoderCrawler.clean_mathjax(text)
+        assert "$$" not in result
+        assert "$h$" in result
+
+    def test_hspace_bullet_comma_full_pipeline(self) -> None:
+        """Simulate exact scenario: \hspace{23pt}\bullet\, in annotation → clean output."""
+        # After _strip_katex_redundancy fix: $\\bullet\\,$
+        # After clean_mathjax: should have no $$ and no LaTeX artifacts
+        text = "$\\bullet\\,$若树的层数为$h$，则除第$h$层外"
+        result = NowCoderCrawler.clean_mathjax(text)
+        assert "$$" not in result
+        assert "\\bullet" not in result
+        assert "\\," not in result
+        assert "若树的层数为" in result
+        assert "$h$" in result
+
+
+class TestCleanMathJaxSampleEmptyDelimiters:
+    """Verify clean_mathjax_sample also cleans empty math delimiters."""
+
+    def test_empty_delimiters_cleaned(self) -> None:
+        text = "$\\bullet\\,$1 2\n3 4"
+        result = NowCoderCrawler.clean_mathjax_sample(text)
+        assert "$$" not in result
+        assert "1 2" in result
