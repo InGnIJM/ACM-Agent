@@ -274,9 +274,11 @@ describe("preprocessSections", () => {
     expect(preprocessSections(input)).toBe(expected);
   });
 
-  it("does not convert 【名词解释】 (full-width brackets)", () => {
-    const input = "【名词解释】";
-    expect(preprocessSections(input)).toBe("【名词解释】");
+  it("elevates sample I/O labels to ### sub-headings", () => {
+    expect(preprocessSections("输入 #1")).toBe("\n### 输入 #1\n");
+    expect(preprocessSections("输出 #1")).toBe("\n### 输出 #1\n");
+    expect(preprocessSections("解释 #1")).toBe("\n### 解释 #1\n");
+    expect(preprocessSections("输入 #2")).toBe("\n### 输入 #2\n");
   });
 });
 
@@ -342,6 +344,79 @@ describe("preprocessNowcoder", () => {
     const output = preprocessNowcoder(input);
     expect(output).toContain("古代遗迹");
     expect(output).toContain("被视为两种不同的方案");
+  });
+
+  // Regression: NowCoder 318732 — sample I/O destroyed by backtick→apostrophe
+  // conversion that turned ``` code fences into ''', which dedupMathJax then
+  // misclassified as MathJax triplication clusters and collapsed, losing the
+  // input data entirely.
+  it("preserves ``` code fences in sample I/O blocks (318732 regression)", () => {
+    // This is the exact format the backend produces via crawler.controller.ts
+    // (输入/输出 in code fences; 解释 as plain Markdown for KaTeX rendering)
+    const input = [
+      "[描述]",
+      "题目描述内容…",
+      "[样例]",
+      "输入 #1",
+      "```",
+      "1 2",
+      "```",
+      "输出 #1",
+      "```",
+      "3",
+      "1 3 2",
+      "```",
+      "解释 #1",
+      "路径经过的两条边权分别为 $1 \\operatorname{xor} 3=2$ 和 $3 \\operatorname{xor} 2=1$",
+    ].join("\n");
+
+    const output = preprocessNowcoder(input);
+
+    // Code fences must survive as ``` (not '''), only for 输入/输出:
+    const fenceCount = (output.match(/```/g) || []).length;
+    expect(fenceCount).toBe(4); // 2 pairs: 输入 + 输出, 解释 has NO fences
+
+    // Input data must be present:
+    expect(output).toContain("1 2");
+
+    // Output data must be present:
+    expect(output).toContain("1 3 2");
+
+    // Explanation text must be present (as plain paragraph, not code block):
+    expect(output).toContain("路径经过的两条边权分别为");
+
+    // KaTeX formulas must be preserved for rendering:
+    expect(output).toContain("$1 \\operatorname{xor} 3=2$");
+
+    // No apostrophe-only fences:
+    expect(output).not.toMatch(/'''/);
+  });
+
+  it("preserves ``` code fences with single-number sample data (318732 variant)", () => {
+    // Short numeric sample lines are especially vulnerable to dedupMathJax
+    const input = [
+      "[样例]",
+      "输入 #1",
+      "```",
+      "5",
+      "2",
+      "```",
+      "输出 #1",
+      "```",
+      "10",
+      "```",
+    ].join("\n");
+
+    const output = preprocessNowcoder(input);
+
+    // All 4 fences preserved
+    expect((output.match(/```/g) || []).length).toBe(4);
+    // Data preserved
+    expect(output).toContain("5");
+    expect(output).toContain("2");
+    expect(output).toContain("10");
+    // No apostrophe fences
+    expect(output).not.toMatch(/'''/);
   });
 });
 

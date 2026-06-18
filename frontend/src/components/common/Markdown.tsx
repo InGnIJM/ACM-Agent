@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
+import rehypeRaw from "rehype-raw";
 import "katex/dist/katex.min.css";
 import "./markdown.css";
 import Typography from "@mui/material/Typography";
@@ -437,7 +438,7 @@ function preprocessSections(content: string): string {
     .replace(/^\[注\]/gm, "## 注\n")
     .replace(/^\[数据范围\]/gm, "## 数据范围\n")
     // Elevate sample I/O labels to ### sub-headings with icon + hierarchy
-    .replace(/^(输入|输出)\s+(#\d+)\s*$/gm, "\n### $1 $2\n");
+    .replace(/^(输入|输出|解释)\s+(#\d+)\s*$/gm, "\n### $1 $2\n");
 }
 
 /**
@@ -581,7 +582,11 @@ function preprocessNowcoder(content: string): string {
   // Normalise smart quotes and font glyph artifacts to ASCII — these
   // are KaTeX triplication remnants that confuse dedup and rendering.
   c = c.replace(/['']/g, "'");
-  c = c.replace(/`/g, "'");
+  // NOTE: do NOT replace backtick (`) with apostrophe — the backend
+  // wraps sample I/O in ``` code fences whose backticks would be
+  // destroyed, and dedupMathJax would then misclassify the resulting
+  // '''…data…''' clusters as MathJax triplication islands, collapsing
+  // them and losing the input data entirely (regression: NowCoder 318732).
   c = c.replace(/′/g, "'");
   c = dedupMathJax(c);
   // Strip leftover LaTeX formatting artifacts (anywhere in text, not just line-start)
@@ -648,7 +653,7 @@ export function Markdown({ content, sourcePlatform }: MarkdownProps) {
   const processed = preprocessContent(content, sourcePlatform);
   return (
     <Box sx={{ minWidth: 0, overflow: "hidden", wordBreak: "break-word", fontSize: "1rem" }} className="markdown-body">
-      <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={components}>
+      <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeRaw, rehypeKatex]} components={components}>
         {processed}
       </ReactMarkdown>
     </Box>
