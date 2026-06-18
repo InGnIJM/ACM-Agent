@@ -1,0 +1,273 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+
+export interface VectorSearchFilters {
+  platform?: string;
+  tags?: string[];
+  difficultyMin?: number;
+  difficultyMax?: number;
+}
+
+export interface ProblemSearchResult {
+  id: string;
+  title: string;
+  sourcePlatform: string;
+  sourceId: string;
+  difficultyNormalized: number;
+  tagsNormalized: string[];
+  solutionSummary: string | null;
+  fullContent: string | null;
+  similarity: number;
+}
+
+export interface SolutionSearchResult {
+  id: string;
+  problemId: string;
+  content: string;
+  author: string | null;
+  solutionIndex: number;
+  similarity: number;
+}
+
+@Injectable()
+export class VectorService {
+  private readonly logger = new Logger(VectorService.name);
+  private readonly ollamaUrl: string;
+  private readonly model: string;
+
+  constructor(private readonly prisma: PrismaService) {
+    this.ollamaUrl =
+      (process.env.OLLAMA_URL || 'http://localhost:11434').replace(/\/$/, '');
+    this.model = process.env.EMBED_MODEL || 'qwen3-embedding:0.6b';
+  }
+
+  // ------------------------------------------------------------------
+  // Embedding
+  // ------------------------------------------------------------------
+
+  /** Embed a single text and return a 1024-dim float vector. */
+  async embedText(text: string): Promise<number[]> {
+    const results = await this.embedTexts([text]);
+    return results[0];
+  }
+
+  /** Embed multiple texts in one call. Returns one vector per input text. */
+  async embedTexts(texts: string[]): Promise<number[][]> {
+    if (!texts.length) return [];
+
+    const url = `${this.ollamaUrl}/api/embed`;
+    const payload = { model: this.model, input: texts };
+
+    let lastErr: Error | null = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+          const body = await response.text().catch(() => '');
+          throw new Error(
+            `Ollama returned ${response.status}: ${body.slice(0, 500)}`,
+          );
+        }
+
+        const data: any = await response.json();
+        if (!data.embeddings || !Array.isArray(data.embeddings)) {
+          throw new Error(
+            `Unexpected Ollama response shape: ${JSON.stringify(data).slice(0, 300)}`,
+          );
+        }
+
+        return data.embeddings as number[][];
+      } catch (err) {
+        lastErr = err instanceof Error ? err : new Error(String(err));
+        if (attempt < 3) {
+          const delay = 2 ** (attempt + 1) * 1000;
+          this.logger.warn(
+            `Ollama embedding attempt ${attempt + 1} failed, retrying in ${delay}ms: ${lastErr.message}`,
+          );
+          await new Promise((r) => setTimeout(r, delay));
+        }
+      }
+    }
+
+    throw new Error(
+      `Ollama embedding failed after 4 attempts: ${lastErr?.message}`,
+    );
+  }
+
+  // ------------------------------------------------------------------
+  // Vector writes (raw SQL — Prisma Unsupported type)
+  // ------------------------------------------------------------------
+
+  /** Write parent + content vectors for a problem. */
+  async setProblemVectors(
+    problemId: string,
+    parentVec: number[],
+    contentVec: number[],
+  ): Promise<void> {
+    if (!parentVec.length || !contentVec.length) return;
+
+    await this.prisma.$executeRaw`
+      UPDATE problems
+      SET vector_embedding = ${this._toVec(parentVec)}::vector,
+          content_vector   = ${this._toVec(contentVec)}::vector,
+          updated_at       = NOW()
+      WHERE id = ${problemId}::uuid
+    `;
+    this.logger.debug(`Vectors written for problem ${problemId}`);
+  }
+
+  /** Write embedding vector for a problem solution. */
+  async setSolutionVector(
+    solutionId: string,
+    vec: number[],
+  ): Promise<void> {
+    if (!vec.length) return;
+
+    await this.prisma.$executeRaw`
+      UPDATE problem_solutions
+      SET vector_embedding = ${this._toVec(vec)}::vector,
+          updated_at       = NOW()
+      WHERE id = ${solutionId}::uuid
+    `;
+    this.logger.debug(`Vector written for solution ${solutionId}`);
+  }
+
+  // ------------------------------------------------------------------
+  // Vector search (raw SQL — pgvector ANN)
+  // ------------------------------------------------------------------
+
+  /**
+   * Parent-vector ANN search on problems.
+   * Spec: 父向量 ANN Top-K → returns problems with cosine similarity.
+   */
+  async searchProblems(
+    queryVec: number[],
+    topK: number = 20,
+    filters?: VectorSearchFilters,
+  ): Promise<ProblemSearchResult[]> {
+    const conditions: string[] = [
+      'p.deleted_at IS NULL',
+      'p.vector_embedding IS NOT NULL',
+    ];
+    const params: string[] = [this._toVec(queryVec)];
+
+    let paramIdx = 2;
+
+    if (filters?.platform) {
+      conditions.push(`p.source_platform::text = $${paramIdx++}::text`);
+      params.push(filters.platform);
+    }
+    if (filters?.difficultyMin != null) {
+      conditions.push(
+        `p.difficulty_normalized >= $${paramIdx++}::float`,
+      );
+      params.push(String(filters.difficultyMin));
+    }
+    if (filters?.difficultyMax != null) {
+      conditions.push(
+        `p.difficulty_normalized <= $${paramIdx++}::float`,
+      );
+      params.push(String(filters.difficultyMax));
+    }
+    if (filters?.tags && filters.tags.length > 0) {
+      conditions.push(`p.tags_normalized && $${paramIdx++}::text[]`);
+      params.push(`{${filters.tags.join(',')}}`);
+    }
+
+    const where = conditions.map((c) => `  AND ${c}`).join('\n');
+
+    const sql = `
+      SELECT p.id,
+             p.title,
+             p.source_platform::text  AS "sourcePlatform",
+             p.source_id              AS "sourceId",
+             p.difficulty_normalized  AS "difficultyNormalized",
+             p.tags_normalized        AS "tagsNormalized",
+             p.solution_summary       AS "solutionSummary",
+             p.full_content           AS "fullContent",
+             1 - (p.vector_embedding <=> $1::vector) AS similarity
+      FROM problems p
+      WHERE 1=1
+      ${where}
+      ORDER BY p.vector_embedding <=> $1::vector
+      LIMIT $${paramIdx++}::bigint
+    `;
+    params.push(String(topK));
+
+    // Wrap SET + SELECT in a transaction so they share the same connection
+    // (Prisma connection pool may otherwise route them to different connections)
+    const rows: any[] = await this.prisma.$transaction([
+      this.prisma.$executeRawUnsafe('SET LOCAL ivfflat.probes = 10'),
+      this.prisma.$queryRawUnsafe(sql, ...params),
+    ]).then(([, selectResult]) => selectResult as any[]);
+    return rows.map(this._mapProblemRow);
+  }
+
+  /**
+   * Fetch child-solution vectors associated with the parent problems
+   * returned by `searchProblems`.  Spec: 子2 关联返回.
+   */
+  async getSolutionsForProblems(
+    problemIds: string[],
+    queryVec: number[],
+  ): Promise<SolutionSearchResult[]> {
+    if (!problemIds.length) return [];
+
+    const sql = `
+      SELECT ps.id,
+             ps.problem_id::text       AS "problemId",
+             ps.content,
+             ps.author,
+             ps.solution_index         AS "solutionIndex",
+             1 - (ps.vector_embedding <=> $1::vector) AS similarity
+      FROM problem_solutions ps
+      WHERE ps.deleted_at IS NULL
+        AND ps.vector_embedding IS NOT NULL
+        AND ps.problem_id = ANY($2::uuid[])
+      ORDER BY ps.vector_embedding <=> $1::vector
+      LIMIT 50
+    `;
+
+    const rows: any[] = await this.prisma.$queryRawUnsafe(
+      sql,
+      this._toVec(queryVec),
+      problemIds,
+    );
+    return rows.map((r) => ({
+      id: r.id,
+      problemId: r.problemId,
+      content: r.content,
+      author: r.author,
+      solutionIndex: r.solutionIndex,
+      similarity: Number(r.similarity),
+    }));
+  }
+
+  // ------------------------------------------------------------------
+  // Helpers
+  // ------------------------------------------------------------------
+
+  /** Convert a number[] to pgvector literal `'[0.1,0.2,...]'`. */
+  private _toVec(v: number[]): string {
+    return `[${v.join(',')}]`;
+  }
+
+  private _mapProblemRow(r: any): ProblemSearchResult {
+    return {
+      id: r.id,
+      title: r.title,
+      sourcePlatform: r.sourcePlatform,
+      sourceId: r.sourceId,
+      difficultyNormalized: Number(r.difficultyNormalized),
+      tagsNormalized: r.tagsNormalized || [],
+      solutionSummary: r.solutionSummary,
+      fullContent: r.fullContent,
+      similarity: Number(r.similarity),
+    };
+  }
+}
