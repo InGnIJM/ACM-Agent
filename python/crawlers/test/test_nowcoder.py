@@ -619,11 +619,12 @@ class TestCleanMathJaxSpacing:
         assert "\\," not in result
 
     def test_strips_thinspace_inside_math(self) -> None:
-        """\, inside $...$ → stripped (consistent with \bullet stripping)."""
+        """\, inside $...$ → stripped; \bullet → Unicode ∙."""
         text = "$\\bullet\\,$ rest"
         result = NowCoderCrawler.clean_mathjax(text)
         assert "\\," not in result
         assert "\\bullet" not in result
+        assert "∙" in result  # bullet preserved as Unicode
 
     def test_strips_negthinspace(self) -> None:
         """\! → stripped."""
@@ -683,10 +684,11 @@ class TestCleanMathJaxEmptyDelimiters:
     """Verify that stripping commands between $...$ doesn't leave $$ artifacts."""
 
     def test_dollar_bullet_comma_cleaned(self) -> None:
-        """$\\bullet\\,$ → after stripping → $$ should be cleaned."""
+        """$\\bullet\\,$ → bullet preserved as ∙, no $$ artifact."""
         text = "$\\bullet\\,$若树的层数为$h$"
         result = NowCoderCrawler.clean_mathjax(text)
         assert "$$" not in result
+        assert "∙" in result  # bullet preserved
         assert "若树的层数为" in result
         assert "$h$" in result
 
@@ -728,6 +730,7 @@ class TestCleanMathJaxEmptyDelimiters:
         assert "$$" not in result
         assert "\\bullet" not in result
         assert "\\," not in result
+        assert "∙" in result  # bullet preserved
         assert "若树的层数为" in result
         assert "$h$" in result
 

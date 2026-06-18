@@ -591,7 +591,7 @@ function preprocessNowcoder(content: string): string {
   c = dedupMathJax(c);
   // Strip leftover LaTeX formatting artifacts (anywhere in text, not just line-start)
   c = c.replace(/\\[hv]space\{[^}]*\}/g, "");
-  c = c.replace(/\\bullet/g, "");
+  c = c.replace(/\\bullet/g, "∙");
   // Strip LaTeX spacing commands that may leak outside $…$ delimiters
   c = c.replace(/\\,/g, "");
   c = c.replace(/\\!/g, "");

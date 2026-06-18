@@ -490,7 +490,7 @@ class NowCoderCrawler(BaseCrawler):
         text = re.sub(r"\\hspace\{[^}]*\}", "", text)
         text = re.sub(r"\\texttt\{([^}]*)\}", r"\1", text)
         text = re.sub(r"\^\{\\texttt\{[^}]*\}\}", "", text)
-        text = re.sub(r"\\bullet", "", text)
+        text = re.sub(r"\\bullet", "∙", text)
         text = re.sub(r"\\leqq", "<=", text)
         # Strip LaTeX spacing commands that leak outside $…$ delimiters
         text = re.sub(r"\\,", "", text)   # thin space
@@ -560,7 +560,7 @@ class NowCoderCrawler(BaseCrawler):
         text = re.sub(r"\\hspace\{[^}]*\}", "", text)
         text = re.sub(r"\\texttt\{([^}]*)\}", r"\1", text)
         text = re.sub(r"\^\{\\texttt\{[^}]*\}\}", "", text)
-        text = re.sub(r"\\bullet", "", text)
+        text = re.sub(r"\\bullet", "∙", text)
         text = re.sub(r"\\leqq", "<=", text)
         text = re.sub(r"\\,", "", text)
         text = re.sub(r"\\!", "", text)
