@@ -952,19 +952,32 @@ export class CrawlerController {
    *
    * This parser extracts those pairs BEFORE the HTML is stripped.
    */
-  private parseLeetCodeSamples(html: string): Array<[string, string]> | null {
+  private parseLeetCodeSamples(html: string): Array<[string, string, string?]> | null {
     if (!html) return null;
-    const pairs: Array<[string, string]> = [];
+    const pairs: Array<[string, string, string?]> = [];
 
     // ── Pass 1: old <pre> format ────────────────────────────────
-    const preRegex = /<pre>(?:<strong>)?\s*(?:Input|输入)\s*:?\s*(?:<\/strong>)?\s*([\s\S]*?)\s*(?:<strong>)?\s*(?:Output|输出)\s*:?\s*(?:<\/strong>)?\s*([\s\S]*?)\s*<\/pre>/gi;
+    // LeetCode CN HTML is: <pre>\n<strong>输入：</strong>…\n<strong>输出：</strong>…
+    //   — note the NEWLINE right after <pre>, and Chinese full-width "：".
+    // So \s* MUST come before the optional <strong>, and the colon class
+    // accepts both ASCII ":" and full-width "：".
+    const preRegex = /<pre>\s*(?:<strong>)?\s*(?:Input|输入)\s*[：:]?\s*(?:<\/strong>)?\s*([\s\S]*?)\s*(?:<strong>)?\s*(?:Output|输出)\s*[：:]?\s*(?:<\/strong>)?\s*([\s\S]*?)\s*<\/pre>/gi;
     let match: RegExpExecArray | null;
     while ((match = preRegex.exec(html)) !== null) {
       let input = (match[1] || '').replace(/<[^>]+>/g, '').trim();
       let output = (match[2] || '').replace(/<[^>]+>/g, '').trim();
-      output = output.replace(/\n\s*(?:<strong>)?\s*(?:Explanation|解释)\s*:?[\s\S]*$/i, '').trim();
-      output = output.replace(/\n\s*(?:<strong>)?\s*(?:Note|提示)\s*:?[\s\S]*$/i, '').trim();
-      if (input || output) pairs.push([input, output]);
+      // Extract the explanation (Explanation/解释) as the optional 3rd
+      // element before discarding it from the output.
+      let note: string | undefined;
+      const noteIdx = output.search(/(?:Explanation|解释)/i);
+      if (noteIdx >= 0) {
+        note = output
+          .slice(noteIdx)
+          .replace(/^(?:Explanation|解释)\s*[：:]?\s*/, '')
+          .trim();
+        output = output.slice(0, noteIdx).trim();
+      }
+      if (input || output) pairs.push([input, output, note]);
     }
 
     // ── Pass 2: new <div class="example-block"> format (LeetCode CN current) ──
@@ -1212,9 +1225,17 @@ export class CrawlerController {
           '',
         );
       }
-      // ── Step 1: convert <sup> to ^ notation BEFORE tag stripping ──
-      // e.g. "10<sup>5</sup>" → "10^5", "x<sup>2</sup>" → "x^2"
-      description = description.replace(/<sup>([^<]*)<\/sup>/gi, '^$1');
+      // ── Step 1: convert <sup>/<sub> to inline LaTeX math BEFORE tag stripping ──
+      // Wrap "prefix token + exponent/index" in $…$ so KaTeX renders it.
+      //   10<sup>4</sup>   → $10^{4}$
+      //   -10<sup>9</sup>  → $-10^{9}$   (minus captured into the math span)
+      //   O(n<sup>2</sup>) → O($n^{2}$) (local wrap; O() stays as text)
+      //   a<sub>i</sub>    → $a_{i}$
+      // Function-replacement avoids JS `$`-escaping pitfalls in the
+      // replacement string. `<=` / `>=` are left as literal text.
+      description = description
+        .replace(/([A-Za-z0-9.\-]+)<sup>([^<]+)<\/sup>/gi, (_m: string, p: string, x: string) => `$${p}^{${x}}$`)
+        .replace(/([A-Za-z0-9.\-]+)<sub>([^<]+)<\/sub>/gi, (_m: string, p: string, x: string) => `$${p}_{${x}}$`);
       // ── Step 2: block-level tags → paragraph breaks ──────
       // CRITICAL: strip tags BEFORE entity decoding to prevent
       // decoded '<' chars (from &lt;) being parsed as HTML tag openers.
@@ -1265,10 +1286,18 @@ export class CrawlerController {
         }
         const sampleLines = parsedSamples.map((s: any, i: number) => {
           if (Array.isArray(s)) {
-            return (
-              `输入 #${i + 1}\n\`\`\`\n${s[0] || ''}\n\`\`\`\n\n` +
-              `输出 #${i + 1}\n\`\`\`\n${s[1] || ''}\n\`\`\``
-            );
+            // ### headers (not bare "输入 #N") so the frontend's
+            // preprocessSections regex (which matches lines starting with
+            // "输入") won't double-convert these.
+            let block =
+              `### 输入 #${i + 1}\n\`\`\`\n${s[0] || ''}\n\`\`\`\n\n` +
+              `### 输出 #${i + 1}\n\`\`\`\n${s[1] || ''}\n\`\`\`\n`;
+            // Explanation block only when the 3rd element is non-empty.
+            const note = s[2];
+            if (note && String(note).trim()) {
+              block += `\n### 解释 #${i + 1}\n\`\`\`\n${String(note).trim()}\n\`\`\`\n`;
+            }
+            return block;
           }
           return String(s);
         });
