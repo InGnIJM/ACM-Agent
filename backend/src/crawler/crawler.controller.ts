@@ -1113,6 +1113,10 @@ export class CrawlerController {
 
     // ── Final whitespace normalisation ────────────────────────
     text = text
+      .replace(/\\,/g, '')   // thin space
+      .replace(/\\!/g, '')   // negative thin space
+      .replace(/\\;/g, '')   // thick space
+      .replace(/\\:/g, '')   // medium space
       .replace(/\n{3,}/g, '\n\n')
       .trim();
 
