@@ -65,6 +65,21 @@ enum PushStatus {
   failed
 }
 
+enum CrawlJobStatus {
+  pending
+  running
+  completed
+  failed
+  cancelled
+}
+
+enum CrawlPhase {
+  list
+  detail
+  solutions
+  import_
+}
+
 // ─── 1. Users ───────────────────────────────────────────────────────────────────────
 
 model User {
@@ -173,8 +188,8 @@ model Problem {
   rawDetail            Json?                              @map("raw_detail")
   fullContent          String?                            @map("full_content") @db.Text
   solutionSummary      String?                            @map("solution_summary") @db.Text
-  vectorEmbedding      Unsupported("vector(1536)")?       @map("vector_embedding")
-  contentVector        Unsupported("vector(1536)")?       @map("content_vector")
+  vectorEmbedding      Unsupported("vector(1024)")?       @map("vector_embedding")
+  contentVector        Unsupported("vector(1024)")?       @map("content_vector")
 
   createdAt            DateTime                           @default(now()) @map("created_at")
   updatedAt            DateTime                           @updatedAt @map("updated_at")
@@ -198,7 +213,7 @@ model ProblemSolution {
   content         String                        @db.Text
   author          String?                       @db.VarChar(100)
   sourceUrl       String?                       @map("source_url") @db.VarChar(500)
-  vectorEmbedding Unsupported("vector(1536)")?  @map("vector_embedding")
+  vectorEmbedding Unsupported("vector(1024)")?  @map("vector_embedding")
 
   createdAt       DateTime                      @default(now()) @map("created_at")
   updatedAt       DateTime                      @updatedAt @map("updated_at")
@@ -382,4 +397,28 @@ model PushLog {
   @@index([channel, sentAt], map: "idx_push_logs_channel_time")
   @@index([status], map: "idx_push_logs_status")
   @@map("push_logs")
+}
+
+// ─── 13. Crawl Jobs ──────────────────────────────────────────────────────────────────
+
+model CrawlJob {
+  id         String          @id @default(uuid()) @db.Uuid
+  platform   Platform
+  status     CrawlJobStatus  @default(pending)
+  phase      CrawlPhase?
+  config     Json            @default("{}")
+  progress   Json?
+  errors     Json?
+  summary    Json?
+  stateFile  String?         @map("state_file") @db.VarChar(500)
+  embedTotal Int?            @map("embed_total")
+  embedDone  Int             @default(0) @map("embed_done")
+  startedAt  DateTime?       @map("started_at")
+  finishedAt DateTime?       @map("finished_at")
+  createdAt  DateTime        @default(now()) @map("created_at")
+  updatedAt  DateTime        @updatedAt @map("updated_at")
+
+  @@index([status], map: "idx_crawl_jobs_status")
+  @@index([platform, createdAt(sort: Desc)], map: "idx_crawl_jobs_platform_time")
+  @@map("crawl_jobs")
 }

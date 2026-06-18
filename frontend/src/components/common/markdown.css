@@ -10,7 +10,7 @@
  */
 
 /* CSS Variables for dark mode theming */
-.markdown-container {
+.markdown-body {
   --md-inline-bg: transparent;
   --md-inline-text: #1e293b;
   --md-inline-padding: 1px 4px;
@@ -20,13 +20,13 @@
 
 /* Dark mode variables */
 @media (prefers-color-scheme: dark) {
-  .markdown-container {
+  .markdown-body {
     --md-inline-text: #e2e8f0;
   }
 }
 
 /* Block code: no inline padding — the <pre> wrapper handles padding/bg. */
-.markdown-container pre code {
+.markdown-body pre code {
   padding: 0;
   background: none;
   background-color: transparent;
@@ -34,7 +34,7 @@
 
 /* Inline code: transparent background (same as page), dark monospace text.
    Selected only when NOT a direct child of <pre>. */
-.markdown-container :not(pre) > code {
+.markdown-body :not(pre) > code {
   background-color: var(--md-inline-bg);
   color: var(--md-inline-text);
   padding: var(--md-inline-padding);
