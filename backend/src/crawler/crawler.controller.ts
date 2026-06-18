@@ -1158,10 +1158,13 @@ export class CrawlerController {
       if (Array.isArray(record.samples) && record.samples.length > 0) {
         const sampleLines = record.samples.map((s: any, i: number) => {
           if (Array.isArray(s)) {
-            return (
-              `输入 #${i + 1}\n\`\`\`\n${s[0] || ''}\n\`\`\`\n\n` +
-              `输出 #${i + 1}\n\`\`\`\n${s[1] || ''}\n\`\`\``
-            );
+            const inputBlock = `输入 #${i + 1}\n\`\`\`\n${s[0] || ''}\n\`\`\``;
+            const outputBlock = `输出 #${i + 1}\n\`\`\`\n${s[1] || ''}\n\`\`\``;
+            if (s[2] && String(s[2]).trim()) {
+              return inputBlock + '\n\n' + outputBlock + '\n\n' +
+                `解释 #${i + 1}\n\n${String(s[2]).trim()}`;
+            }
+            return inputBlock + '\n\n' + outputBlock;
           }
           return String(s);
         });
@@ -1172,10 +1175,13 @@ export class CrawlerController {
         if (parsed && parsed.length > 0) {
           const sampleLines = parsed.map((s: any, i: number) => {
             if (Array.isArray(s)) {
-              return (
-                `输入 #${i + 1}\n\`\`\`\n${s[0] || ''}\n\`\`\`\n\n` +
-                `输出 #${i + 1}\n\`\`\`\n${s[1] || ''}\n\`\`\``
-              );
+              const inputBlock = `输入 #${i + 1}\n\`\`\`\n${s[0] || ''}\n\`\`\``;
+              const outputBlock = `输出 #${i + 1}\n\`\`\`\n${s[1] || ''}\n\`\`\``;
+              if (s[2] && String(s[2]).trim()) {
+                return inputBlock + '\n\n' + outputBlock + '\n\n' +
+                  `解释 #${i + 1}\n\n${String(s[2]).trim()}`;
+              }
+              return inputBlock + '\n\n' + outputBlock;
             }
             return String(s);
           });
