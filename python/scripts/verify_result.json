@@ -1,0 +1,93 @@
+{
+  "timestamp": "2026-06-15T00:00:00+08:00",
+  "database": {
+    "host": "localhost:5432",
+    "database": "acm_agent",
+    "user": "postgres",
+    "connected": true
+  },
+  "problemsByPlatform": {
+    "luogu": {
+      "total": 7197,
+      "with_parent_vector": 10,
+      "with_content_vector": 10,
+      "vectorDimension": 1536
+    },
+    "leetcode": {
+      "total": 10,
+      "with_parent_vector": 10,
+      "with_content_vector": 10,
+      "vectorDimension": 1536
+    },
+    "codeforces": {
+      "total": 10,
+      "with_parent_vector": 10,
+      "with_content_vector": 10,
+      "vectorDimension": 1536
+    }
+  },
+  "totalProblemsWithVectors": 30,
+  "totalProblems": 7217,
+  "vectorCoveragePercent": 0.42,
+  "solutionsWithVectors": 52,
+  "embeddingModels": {
+    "databaseVectors": {
+      "dimension": 1536,
+      "likelySource": "OpenAI text-embedding-3-small",
+      "note": "All existing vectors in DB are 1536-dimensional"
+    },
+    "currentBackendConfig": {
+      "service": "Ollama qwen3-embedding:0.6b",
+      "dimension": 1024,
+      "configuredIn": "backend/src/common/vector/vector.service.ts (line 41)",
+      "note": "VectorService.embedText() produces 1024d vectors"
+    },
+    "pythonEmbedder": {
+      "service": "Ollama qwen3-embedding:0.6b",
+      "dimension": 1024,
+      "configuredIn": "python/llm/embedder.py (line 47)",
+      "note": "Supports OpenAI backend fallback via EMBED_BACKEND env var"
+    },
+    "localEmbeddingServer": {
+      "service": "BAAI/bge-m3 via FlagEmbedding",
+      "dimension": 1024,
+      "port": 8765,
+      "running": false,
+      "configuredIn": "python/embedding_server.py"
+    }
+  },
+  "vectorSearchTest": {
+    "queryText": "动态规划背包问题",
+    "embeddingMethod": "Ollama qwen3-embedding:0.6b",
+    "queryDimension": 1024,
+    "searchStatus": "FAILED",
+    "error": "different vector dimensions 1536 and 1024",
+    "rootCause": "Database vectors are 1536d (OpenAI) but current embedder produces 1024d (Ollama Qwen). pgvector requires matching dimensions for the <=> cosine distance operator.",
+    "severity": "BLOCKING"
+  },
+  "selfSimilarityTest": {
+    "status": "PASSED",
+    "method": "Pick an existing 1536d vector from DB and search for nearest neighbors using pgvector <=> operator",
+    "sampleQuery": "codeforces problem 'Seating Arrangement (Easy Version)'",
+    "results": [
+      {"title": "Seating Arrangement (Easy Version)", "platform": "codeforces", "similarity": 1.0000},
+      {"title": "Seating Arrangement (Hard Version)", "platform": "codeforces", "similarity": 0.9665},
+      {"title": "Vessels, Heights and Two Versions (Easy Version)", "platform": "codeforces", "similarity": 0.6270},
+      {"title": "Cost of a Bracket Sequence", "platform": "codeforces", "similarity": 0.6046},
+      {"title": "Vessels, Heights and Two Versions (Hard Version)", "platform": "codeforces", "similarity": 0.5935}
+    ],
+    "note": "pgvector ANN search works correctly. Seating Arrangement Easy/Hard versions cluster together (0.9665 similarity) as expected."
+  },
+  "errors": [
+    "CRITICAL: Vector dimension mismatch — DB has 1536d vectors (OpenAI), but backend VectorService and python/llm/embedder.py are configured to use qwen3-embedding:0.6b which produces 1024d vectors. Any vector search via the NestJS backend will fail with 'different vector dimensions 1536 and 1024'.",
+    "WARNING: Only 30 out of 7217 problems (0.42%) have vector embeddings. 7187 luogu problems have no vectors.",
+    "WARNING: The local embedding server (python/embedding_server.py, BAAI/bge-m3, 1024d) is not running on port 8765.",
+    "INFO: OpenAI API key in backend/.env is 'sk-placeholder' — not a real key. Cannot use OpenAI backend for 1536d embeddings."
+  ],
+  "recommendations": [
+    "Option A (preferred): Re-embed all problems and solutions with qwen3-embedding:0.6b (1024d) using the Python seed scripts, then restart backend. This aligns the DB with the current codebase config.",
+    "Option B: Set EMBED_BACKEND=openai and a valid OPENAI_API_KEY, then re-embed with text-embedding-3-small (1536d) to match existing vectors.",
+    "Option C: Start the local embedding server (python/embedding_server.py) and set EMBED_BACKEND to point to it — but this still produces 1024d vectors, so re-embedding is still required.",
+    "Run the seed scripts (python/scripts/seed_vectors_luogu.py, seed_vectors_leetcode.py, seed_vectors_codeforces.py) with the chosen embedding backend to populate vectors for all problems."
+  ]
+}

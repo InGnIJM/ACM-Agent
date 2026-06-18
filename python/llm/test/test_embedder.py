@@ -46,7 +46,7 @@ def _make_mock_client(embedding_dim: int = 1536, fail_count: int = 0) -> MagicMo
 async def test_embed_batch_returns_correct_number_of_vectors():
     """embed_batch returns one vector per input text."""
     client = _make_mock_client()
-    embedder = ProblemEmbedder(client, batch_size=10)
+    embedder = ProblemEmbedder(client, batch_size=10, backend="openai")
     texts = ["alpha", "beta", "gamma", "delta"]
     vectors = await embedder.embed_batch(texts)
     assert len(vectors) == 4
@@ -58,7 +58,7 @@ async def test_embed_batch_splits_into_correct_batch_sizes():
     """embed_batch respects batch_size and calls the API the expected number of times."""
     client = _make_mock_client()
     batch_size = 3
-    embedder = ProblemEmbedder(client, batch_size=batch_size)
+    embedder = ProblemEmbedder(client, batch_size=batch_size, backend="openai")
     texts = ["a", "b", "c", "d", "e"]  # 5 texts → ceil(5/3) = 2 batches
     _ = await embedder.embed_batch(texts)
 
@@ -82,7 +82,7 @@ async def test_embed_batch_splits_into_correct_batch_sizes():
 async def test_embed_batch_retries_on_failure():
     """embed_batch retries transient failures (up to 3 retries) and still succeeds."""
     client = _make_mock_client(fail_count=2)  # fails twice, then succeeds
-    embedder = ProblemEmbedder(client, batch_size=10)
+    embedder = ProblemEmbedder(client, batch_size=10, backend="openai")
     texts = ["x", "y"]
     vectors = await embedder.embed_batch(texts)
     assert len(vectors) == 2
@@ -92,7 +92,7 @@ async def test_embed_batch_retries_on_failure():
 async def test_embed_batch_exhausts_retries():
     """embed_batch raises RuntimeError after 4 total attempts (1 initial + 3 retries)."""
     client = _make_mock_client(fail_count=99)  # always fails
-    embedder = ProblemEmbedder(client, batch_size=10)
+    embedder = ProblemEmbedder(client, batch_size=10, backend="openai")
     with pytest.raises(RuntimeError, match="4 attempts"):
         await embedder.embed_batch(["test"])
 
@@ -101,7 +101,7 @@ async def test_embed_batch_exhausts_retries():
 async def test_embed_batch_empty_list():
     """embed_batch returns an empty list immediately for empty input."""
     client = _make_mock_client()
-    embedder = ProblemEmbedder(client)
+    embedder = ProblemEmbedder(client, backend="openai")
     vectors = await embedder.embed_batch([])
     assert vectors == []
 
@@ -114,7 +114,7 @@ async def test_embed_batch_empty_list():
 async def test_embed_problems_creates_both_parent_and_content_vectors():
     """embed_problems attaches vector_embedding and content_vector to each problem."""
     client = _make_mock_client()
-    embedder = ProblemEmbedder(client, batch_size=10)
+    embedder = ProblemEmbedder(client, batch_size=10, backend="openai")
     problems = [
         {"id": "p1", "solution_summary": "sum1", "full_content": "cont1"},
         {"id": "p2", "solution_summary": "sum2", "full_content": "cont2"},
@@ -133,7 +133,7 @@ async def test_embed_problems_creates_both_parent_and_content_vectors():
 async def test_embed_problems_empty_list():
     """embed_problems returns the list unchanged for empty input."""
     client = _make_mock_client()
-    embedder = ProblemEmbedder(client)
+    embedder = ProblemEmbedder(client, backend="openai")
     result = await embedder.embed_problems([])
     assert result == []
 
@@ -142,7 +142,7 @@ async def test_embed_problems_empty_list():
 async def test_embed_problems_handles_missing_keys():
     """embed_problems treats missing solution_summary / full_content as empty string."""
     client = _make_mock_client()
-    embedder = ProblemEmbedder(client, batch_size=10)
+    embedder = ProblemEmbedder(client, batch_size=10, backend="openai")
     problems = [{"id": "p1"}]  # no summary or content
     result = await embedder.embed_problems(problems)
     assert len(result) == 1
@@ -170,7 +170,7 @@ async def test_embed_solutions_truncates_long_content():
 
     client.embeddings.create = _capture_create
 
-    embedder = ProblemEmbedder(client, batch_size=10)
+    embedder = ProblemEmbedder(client, batch_size=10, backend="openai")
     long_text = "x" * 3000
     solutions = [{"id": "s1", "content": long_text}]
     result = await embedder.embed_solutions(solutions)
@@ -198,7 +198,7 @@ async def test_embed_solutions_shorter_than_2000_chars():
 
     client.embeddings.create = _capture_create
 
-    embedder = ProblemEmbedder(client, batch_size=10)
+    embedder = ProblemEmbedder(client, batch_size=10, backend="openai")
     short_text = "hello world"
     solutions = [{"id": "s1", "content": short_text}]
     result = await embedder.embed_solutions(solutions)
@@ -212,6 +212,6 @@ async def test_embed_solutions_shorter_than_2000_chars():
 async def test_embed_solutions_empty_list():
     """embed_solutions returns the list unchanged for empty input."""
     client = _make_mock_client()
-    embedder = ProblemEmbedder(client)
+    embedder = ProblemEmbedder(client, backend="openai")
     result = await embedder.embed_solutions([])
     assert result == []
