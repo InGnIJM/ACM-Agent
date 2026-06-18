@@ -1,0 +1,46 @@
+/*
+ * Markdown code styling with CSS variables for theming and scoping.
+ * Block code lives inside <pre> (rendered by CodeBlock).  Inline code is a
+ * bare <code> not wrapped in <pre>.  We distinguish them by tag layering
+ * (`:not(pre) > code`) rather than by `className`: language-less fenced code
+ * blocks have no className, so an `if (className)` check misclassifies them
+ * as inline code.  Inline <code> padding only applies to the first line of a
+ * multi-line element, which produced a phantom first-line indent on sample
+ * I/O blocks.  Regression: Codeforces 2236F2 sample input.
+ */
+
+/* CSS Variables for dark mode theming */
+.markdown-container {
+  --md-inline-bg: transparent;
+  --md-inline-text: #1e293b;
+  --md-inline-padding: 1px 4px;
+  --md-inline-radius: 3px;
+  --md-inline-size: 0.875em;
+}
+
+/* Dark mode variables */
+@media (prefers-color-scheme: dark) {
+  .markdown-container {
+    --md-inline-text: #e2e8f0;
+  }
+}
+
+/* Block code: no inline padding — the <pre> wrapper handles padding/bg. */
+.markdown-container pre code {
+  padding: 0;
+  background: none;
+  background-color: transparent;
+}
+
+/* Inline code: transparent background (same as page), dark monospace text.
+   Selected only when NOT a direct child of <pre>. */
+.markdown-container :not(pre) > code {
+  background-color: var(--md-inline-bg);
+  color: var(--md-inline-text);
+  padding: var(--md-inline-padding);
+  border-radius: var(--md-inline-radius);
+  font-size: var(--md-inline-size);
+  font-family: "Fira Code", "Consolas", "Monaco", monospace;
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
