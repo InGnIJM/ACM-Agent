@@ -155,9 +155,7 @@ export default function ProblemDetail() {
       {/* Tab: Description */}
       {tab === 0 && (
         <Paper sx={{ p: 3, overflow: "hidden" }}>
-          <Box className="markdown-body">
           <Markdown content={problem.fullContent ?? "暂无题面数据"} sourcePlatform={problem.sourcePlatform} />
-        </Box>
         </Paper>
       )}
 
@@ -166,9 +164,7 @@ export default function ProblemDetail() {
         <Paper sx={{ p: 3, overflow: "hidden" }}>
           {/* Solution Summary */}
           <Typography variant="h6" gutterBottom>题解总结</Typography>
-          <Box className="markdown-body">
           <Markdown content={problem.solutionSummary ?? "暂无题解总结（配置 DeepSeek API Key 后可获得 AI 生成的题解总结）"} sourcePlatform={problem.sourcePlatform} />
-        </Box>
 
           <Divider sx={{ my: 3 }} />
 
@@ -183,9 +179,7 @@ export default function ProblemDetail() {
                   </Typography>
                 </AccordionSummary>
                 <AccordionDetails sx={{ overflow: "hidden" }}>
-                  <Box className="markdown-body">
-                    <Markdown content={sol.content} sourcePlatform={problem.sourcePlatform} />
-                  </Box>
+                  <Markdown content={sol.content} sourcePlatform={problem.sourcePlatform} />
                 </AccordionDetails>
               </Accordion>
             ))
