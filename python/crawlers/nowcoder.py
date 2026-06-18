@@ -299,12 +299,17 @@ class NowCoderCrawler(BaseCrawler):
                 ann = mathml.select_one("annotation")
                 if ann:
                     plain = ann.get_text("", strip=True)
-                    # Skip purely spacing commands — layout noise
                     import re as _re_nck
-                    if plain and not _re_nck.match(r'^\\[hv]space', plain):
-                        plain = f" ${plain}$ "
+                    # Strip leading \hspace{...} / \vspace{...} (layout noise)
+                    # but KEEP any remaining LaTeX content (e.g. \bullet\,).
+                    # The old logic discarded the entire annotation when it
+                    # started with \hspace, which leaked raw annotation text
+                    # into the output when the .katex element was left intact.
+                    stripped = _re_nck.sub(r'^\\[hv]space\{[^}]*\}', '', plain).strip()
+                    if stripped:
+                        plain = f" ${stripped}$ "
                     else:
-                        plain = ""  # decomposing spacing
+                        plain = ""  # purely spacing — decomposing
                 else:
                     # Fallback: extract plain MathML text (Unicode math)
                     for ann in mathml.select("annotation"):
@@ -314,6 +319,8 @@ class NowCoderCrawler(BaseCrawler):
                 plain = katex_el.get_text("", strip=True)
             if plain:
                 katex_el.replace_with(plain)
+            else:
+                katex_el.decompose()  # pure spacing — remove entirely
 
     @staticmethod
     def _nowcoder_convert_equation_images(soup) -> None:
@@ -485,6 +492,11 @@ class NowCoderCrawler(BaseCrawler):
         text = re.sub(r"\^\{\\texttt\{[^}]*\}\}", "", text)
         text = re.sub(r"\\bullet", "", text)
         text = re.sub(r"\\leqq", "<=", text)
+        # Strip LaTeX spacing commands that leak outside $…$ delimiters
+        text = re.sub(r"\\,", "", text)   # thin space
+        text = re.sub(r"\\!", "", text)   # negative thin space
+        text = re.sub(r"\\;", "", text)   # thick space
+        text = re.sub(r"\\:", "", text)   # medium space
 
         # Deduplicate consecutive repeated lines (MathJax triplication)
         lines = text.split("\n")
@@ -547,6 +559,10 @@ class NowCoderCrawler(BaseCrawler):
         text = re.sub(r"\^\{\\texttt\{[^}]*\}\}", "", text)
         text = re.sub(r"\\bullet", "", text)
         text = re.sub(r"\\leqq", "<=", text)
+        text = re.sub(r"\\,", "", text)
+        text = re.sub(r"\\!", "", text)
+        text = re.sub(r"\\;", "", text)
+        text = re.sub(r"\\:", "", text)
         # Deduplicate consecutive identical lines only (no merging)
         lines = text.split("\n")
         deduped = []

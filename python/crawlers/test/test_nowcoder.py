@@ -510,3 +510,166 @@ class TestParseSamplesFromHtml:
         assert "$1+2$" in note
         # Normal image → Markdown
         assert "![image](https://ex.com/photo.png)" in note
+
+
+# ──────────────────────────────────────────────
+# _strip_katex_redundancy — annotation handling
+# ──────────────────────────────────────────────
+
+class TestStripKatexRedundancy:
+    """Verify that _strip_katex_redundancy correctly handles \hspace-prefixed annotations."""
+
+    def test_hspace_plus_bullet_extracts_bullet(self) -> None:
+        """Annotation "\hspace{23pt}\bullet\," should extract $\bullet\,$ not discard."""
+        from bs4 import BeautifulSoup
+        html = (
+            '<span class="katex">'
+            '<span class="katex-mathml">'
+            '<math><semantics><mrow>'
+            '<mspace width="1.5em"/>'
+            '<mo>∙</mo>'
+            '<mtext> </mtext>'
+            '</mrow>'
+            '<annotation encoding="application/x-tex">\\hspace{23pt}\\bullet\\,</annotation>'
+            '</semantics></math>'
+            '</span>'
+            '<span class="katex-html" aria-hidden="true">'
+            '<span class="base">'
+            '<span class="mspace" style="margin-right:23pt;"></span>'
+            '<span class="mord">∙</span>'
+            '<span class="mspace" style="margin-right:0.1667em;"></span>'
+            '</span>'
+            '</span>'
+            '</span>'
+        )
+        soup = BeautifulSoup(html, "html.parser")
+        NowCoderCrawler._strip_katex_redundancy(soup)
+        result = soup.get_text("", strip=True)
+        # Should contain the LaTeX $\bullet\,$ from annotation, NOT raw HTML artifacts
+        assert "$\\bullet\\,$" in result or "$\\bullet$" in result
+        # Should NOT contain raw \hspace (was stripped as prefix)
+        assert "\\hspace" not in result
+        # Should NOT contain duplicate Unicode bullets from MathML/visual layer
+        # (the .katex element should have been replaced)
+        assert result.count("∙") < 2  # at most 1 if the $ delimiter is counted
+
+    def test_pure_hspace_annotation_discarded(self) -> None:
+        """Annotation "\hspace{15pt}" only → should be discarded (pure spacing)."""
+        from bs4 import BeautifulSoup
+        html = (
+            '<span class="katex">'
+            '<span class="katex-mathml">'
+            '<math><semantics><mrow>'
+            '<mspace width="1.5em"/>'
+            '</mrow>'
+            '<annotation encoding="application/x-tex">\\hspace{15pt}</annotation>'
+            '</semantics></math>'
+            '</span>'
+            '</span>'
+        )
+        soup = BeautifulSoup(html, "html.parser")
+        NowCoderCrawler._strip_katex_redundancy(soup)
+        result = soup.get_text("", strip=True)
+        assert result == "" or result.isspace()
+
+    def test_annotation_without_hspace_preserved(self) -> None:
+        """Regular annotation "n" should be wrapped in $...$."""
+        from bs4 import BeautifulSoup
+        html = (
+            '<span class="katex">'
+            '<span class="katex-mathml">'
+            '<math><semantics><mrow><mi>n</mi></mrow>'
+            '<annotation encoding="application/x-tex">n</annotation>'
+            '</semantics></math>'
+            '</span>'
+            '</span>'
+        )
+        soup = BeautifulSoup(html, "html.parser")
+        NowCoderCrawler._strip_katex_redundancy(soup)
+        result = soup.get_text("", strip=True)
+        assert "$n$" in result
+
+    def test_no_annotation_falls_back_to_mathml_text(self) -> None:
+        """KaTeX element without annotation → extract MathML plain text."""
+        from bs4 import BeautifulSoup
+        html = (
+            '<span class="katex">'
+            '<span class="katex-mathml">'
+            '<math><semantics><mrow><mo>∙</mo></mrow></semantics></math>'
+            '</span>'
+            '</span>'
+        )
+        soup = BeautifulSoup(html, "html.parser")
+        NowCoderCrawler._strip_katex_redundancy(soup)
+        result = soup.get_text("", strip=True)
+        assert "∙" in result  # Unicode bullet from MathML
+
+
+# ──────────────────────────────────────────────
+# clean_mathjax — LaTeX spacing command stripping
+# ──────────────────────────────────────────────
+
+class TestCleanMathJaxSpacing:
+    """Verify that clean_mathjax strips LaTeX spacing commands."""
+
+    def test_strips_thinspace_outside_math(self) -> None:
+        """\, outside $...$ → stripped."""
+        text = "bullet\\,text"
+        result = NowCoderCrawler.clean_mathjax(text)
+        assert "\\," not in result
+
+    def test_strips_thinspace_inside_math(self) -> None:
+        """\, inside $...$ → stripped (consistent with \bullet stripping)."""
+        text = "$\\bullet\\,$ rest"
+        result = NowCoderCrawler.clean_mathjax(text)
+        assert "\\," not in result
+        assert "\\bullet" not in result
+
+    def test_strips_negthinspace(self) -> None:
+        """\! → stripped."""
+        text = "a\\!b"
+        result = NowCoderCrawler.clean_mathjax(text)
+        assert "\\!" not in result
+
+    def test_strips_thickspace(self) -> None:
+        """\; → stripped."""
+        text = "a\\;b"
+        result = NowCoderCrawler.clean_mathjax(text)
+        assert "\\;" not in result
+
+    def test_strips_mediumspace(self) -> None:
+        """\: → stripped."""
+        text = "a\\:b"
+        result = NowCoderCrawler.clean_mathjax(text)
+        assert "\\:" not in result
+
+    def test_hspace_plus_bullet_combo_cleaned(self) -> None:
+        """Simulate the exact scenario: annotation leaked \hspace{23pt}\bullet\, into text."""
+        text = "∙ \\,∙若树的层数为$h$"
+        # That's: ∙ \,∙若树的层数为$h$
+        result = NowCoderCrawler.clean_mathjax(text)
+        assert "\\," not in result
+        # After cleaning, should have bullets with Chinese text
+        assert "∙" in result
+        assert "若树的层数为" in result  # 若树的层数为
+
+
+# ──────────────────────────────────────────────
+# clean_mathjax_sample — LaTeX spacing command stripping
+# ──────────────────────────────────────────────
+
+class TestCleanMathJaxSampleSpacing:
+    """Verify that clean_mathjax_sample also strips LaTeX spacing commands."""
+
+    def test_strips_thinspace(self) -> None:
+        text = "1\\,2"
+        result = NowCoderCrawler.clean_mathjax_sample(text)
+        assert "\\," not in result
+
+    def test_strips_multi_spacing(self) -> None:
+        text = "a\\,b\\!c\\;d\\:e"
+        result = NowCoderCrawler.clean_mathjax_sample(text)
+        assert "\\," not in result
+        assert "\\!" not in result
+        assert "\\;" not in result
+        assert "\\:" not in result
