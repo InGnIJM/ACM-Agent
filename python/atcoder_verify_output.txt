@@ -1,0 +1,12 @@
+=== DESCRIPTION ===
+DEGwer's doctoral dissertation consists of $N$ pages. Currently, there are $K$ typos in this doctoral dissertation, and the $i$-th typo $(i = 1, \ldots, K)$ is on page $A_i$.
+To submit the doctoral dissertation, it is necessary to correct the typos so that no consecutive $T$ pages contain multiple typos.
+Please help busy DEGwer, who is preparing this contest, by determining the minimum number of typos that need to be corrected in order to submit the doctoral dissertation.
+
+=== INPUT ===
+The input is given from Standard Input in the following format:
+N \ K \ T 
+$A_1$ \ $A_2$ \ $\dots$ \ $A_K$
+
+=== OUTPUT ===
+Output the minimum number of typos that need to be corrected to submit the doctoral dissertation.

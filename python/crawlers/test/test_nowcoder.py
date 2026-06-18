@@ -458,3 +458,55 @@ class TestParseSamplesFromHtml:
         # Falls through to text parser which may extract partial
         # For single <pre> without input/output labels, should be empty
         assert result == [] or all(isinstance(p, list) for p in result)
+
+    def test_image_in_explanation_preserved(self) -> None:
+        """普通 <img> 在说明/解释中应转为 Markdown ![](url)。"""
+        el = self._make_soup("""
+        <div class="question-oi">
+          <div class="question-oi-bd">
+            <div class="question-oi-mod">
+              <h2>输入</h2>
+              <pre>1 2</pre>
+            </div>
+            <div class="question-oi-mod">
+              <h2>输出</h2>
+              <pre>3</pre>
+            </div>
+            <div class="question-oi-mod">
+              <h2>说明</h2>
+              <pre><div><img src="https://uploadfiles.nowcoder.com/images/graph.png" alt=""></div><div>文本</div></pre>
+            </div>
+          </div>
+        </div>""")
+        result = NowCoderCrawler._parse_samples_from_html(el)
+        assert len(result) == 1
+        assert len(result[0]) == 3  # input, output, note
+        note = result[0][2]
+        assert "![image](https://uploadfiles.nowcoder.com/images/graph.png)" in note
+        assert "文本" in note
+
+    def test_normal_img_not_affected_by_equation_converter(self) -> None:
+        """equation 图片转 LaTeX，普通图片转 Markdown，互不干扰。"""
+        el = self._make_soup("""
+        <div class="question-oi">
+          <div class="question-oi-bd">
+            <div class="question-oi-mod">
+              <h2>输入</h2>
+              <pre>1</pre>
+            </div>
+            <div class="question-oi-mod">
+              <h2>输出</h2>
+              <pre>2</pre>
+            </div>
+            <div class="question-oi-mod">
+              <h2>说明</h2>
+              <pre><div><img src="/equation?tex=1%2B2" alt="1+2"></div><div><img src="https://ex.com/photo.png" alt=""></div></pre>
+            </div>
+          </div>
+        </div>""")
+        result = NowCoderCrawler._parse_samples_from_html(el)
+        note = result[0][2]
+        # Equation image → LaTeX
+        assert "$1+2$" in note
+        # Normal image → Markdown
+        assert "![image](https://ex.com/photo.png)" in note

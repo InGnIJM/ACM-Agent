@@ -81,97 +81,145 @@ class NowCoderCrawler(BaseCrawler):
     def _parse_samples_from_html(sample_el) -> list:
         """Parse sample input/output pairs from the .question-oi element.
 
-        Returns a list of ``[input_str, output_str]`` pairs. Tries
-        multiple strategies for different NowCoder HTML structures.
-
-        Strategy 1: structured ``.question-oi-mod`` blocks, each
-        containing paired ``<pre>`` tags (input then output).
-
-        Strategy 2: all ``<pre>`` tags within ``.question-oi``, paired
-        sequentially (even-index = input, odd-index = output).
-
-        Strategy 3: flat text fallback via ``_parse_samples_from_text``.
-
-        Strategy 4: search raw HTML for 示例/样例/输入/输出 markers.
+        Returns a list of ``[input_str, output_str, note_str?]`` triples.
+        The third element (note/explanation) is present only when the sample
+        includes an "explanation" section.
         """
         pairs: list = []
 
-        # ── Strategy 1: .question-oi-mod blocks ──────────────────
-        sample_blocks = sample_el.select(".question-oi-mod")
-        if sample_blocks:
-            for block in sample_blocks:
-                pres = block.select("pre")
-                if len(pres) >= 2:
-                    inp = pres[0].get_text("\n", strip=True)
-                    out = pres[1].get_text("\n", strip=True)
-                    # Clean "复制" copy-button labels
-                    inp = re.sub(r"\s*复制\s*", "", inp).strip()
-                    out = re.sub(r"\s*复制\s*", "", out).strip()
-                    if inp:
-                        pairs.append([inp, out])
+        # Convert equation images to LaTeX first
+        NowCoderCrawler._nowcoder_convert_equation_images(sample_el)
+        # Convert ordinary <img> (screenshots etc.) to Markdown ![](url)
+        NowCoderCrawler._nowcoder_convert_images_to_markdown(sample_el)
+
+        # Strategy 1: .question-oi-bd blocks (modern layout)
+        # Each sample has its own .question-oi-bd containing multiple
+        # .question-oi-mod blocks (input/output/explanation).
+        bd_blocks = sample_el.select('.question-oi-bd')
+        if bd_blocks:
+            for bd in bd_blocks:
+                mods = bd.select('.question-oi-mod')
+                inp = ''
+                out = ''
+                note = ''
+                for mod in mods:
+                    h2 = mod.select_one('h2')
+                    label = h2.get_text(strip=True) if h2 else ''
+                    pre = mod.select_one('pre')
+                    textarea = mod.select_one('textarea')
+                    if pre:
+                        text = pre.get_text('\n', strip=True)
+                    elif textarea:
+                        text = textarea.get_text('\n', strip=True)
+                    else:
+                        text = ''
+                    text = re.sub(r'\s*复制\s*', '', text).strip()
+                    if '输入' in label and not inp:
+                        inp = text
+                    elif '输出' in label and not out:
+                        out = text
+                    elif ('说明' in label or '解释' in label) and text:
+                        note = text
+                if inp or out:
+                    entry = [inp, out]
+                    if note:
+                        entry.append(note)
+                    pairs.append(entry)
             if pairs:
                 return pairs
 
-        # ── Strategy 2: sequential <pre> pairs ────────────────────
-        all_pres = sample_el.select("pre")
+        # Strategy 2: .question-oi-mod blocks (legacy flat layout)
+        sample_blocks = sample_el.select('.question-oi-mod')
+        if sample_blocks:
+            inp = ''
+            out = ''
+            note = ''
+            for block in sample_blocks:
+                h2 = block.select_one('h2')
+                label = h2.get_text(strip=True) if h2 else ''
+                pre = block.select_one('pre')
+                textarea = block.select_one('textarea')
+                if pre:
+                    text = pre.get_text('\n', strip=True)
+                elif textarea:
+                    text = textarea.get_text('\n', strip=True)
+                else:
+                    text = ''
+                text = re.sub(r'\s*复制\s*', '', text).strip()
+                if '输入' in label:
+                    # Start new sample if we already have data
+                    if inp or out:
+                        entry = [inp, out]
+                        if note:
+                            entry.append(note)
+                        pairs.append(entry)
+                    inp = text
+                    out = ''
+                    note = ''
+                elif '输出' in label:
+                    out = text
+                elif ('说明' in label or '解释' in label) and text:
+                    note = text
+            # Don't forget the last one
+            if inp or out:
+                entry = [inp, out]
+                if note:
+                    entry.append(note)
+                pairs.append(entry)
+            if pairs:
+                return pairs
+
+        # Strategy 3: sequential <pre> pairs
+        all_pres = sample_el.select('pre')
         meaningful = [
-            p
-            for p in all_pres
-            if p.get_text(strip=True).replace("复制", "").strip()
+            p for p in all_pres
+            if p.get_text(strip=True).replace('复制', '').strip()
         ]
         if len(meaningful) >= 2:
             for i in range(0, len(meaningful) - 1, 2):
-                inp = (
-                    meaningful[i]
-                    .get_text("\n", strip=True)
-                    .replace("复制", "")
-                    .strip()
-                )
-                out = (
-                    meaningful[i + 1]
-                    .get_text("\n", strip=True)
-                    .replace("复制", "")
-                    .strip()
-                )
+                inp = meaningful[i].get_text('\n', strip=True).replace('复制', '').strip()
+                out = meaningful[i + 1].get_text('\n', strip=True).replace('复制', '').strip()
                 if inp:
                     pairs.append([inp, out])
+            if len(meaningful) % 2 == 1 and pairs:
+                extra = meaningful[-1].get_text('\n', strip=True).replace('复制', '').strip()
+                if extra:
+                    pairs[-1].append(extra)
             if pairs:
                 return pairs
 
-        # ── Strategy 3: text fallback ─────────────────────────────
-        raw = sample_el.get_text("\n", strip=True)
-        raw = raw.replace("复制", "")
+        # Strategy 4: text fallback
+        raw = sample_el.get_text('\n', strip=True)
+        raw = raw.replace('复制', '')
         pairs = NowCoderCrawler._parse_samples_from_text(raw)
         if pairs:
-            # If text has more example markers than parsed pairs,
-            # the split regex likely failed — fall through to Strategy 4.
             raw_html = str(sample_el)
-            marker_count = len(re.findall(r"(?:示例|样例)\s*\d", raw_html))
+            marker_count = len(re.findall(r'(?:示例|样例)\s*\d', raw_html))
             if len(pairs) >= marker_count:
                 return pairs
-            # else: fall through to Strategy 4
 
-        # ── Strategy 4: search raw HTML for 示例/样例/输入/输出 markers ──
+        # Strategy 5: search raw HTML for markers
         raw_html = str(sample_el)
-        # Strip HTML tags but preserve line breaks between blocks
-        clean = re.sub(r"<br\s*/?>", "\n", raw_html, flags=re.IGNORECASE)
-        clean = re.sub(r"<[^>]+>", "", clean)
-        clean = clean.replace("复制", "")
-        # Split by sample markers
-        sections = re.split(r"(?:示例|样例)\d*\s*", clean)
+        clean = re.sub(r'<br\s*/?>', '\n', raw_html, flags=re.IGNORECASE)
+        clean = re.sub(r'<[^>]+>', '', clean)
+        clean = clean.replace('复制', '')
+        sections = re.split(r'(?:示例|样例)\d*\s*', clean)
         if len(sections) > 1:
             for section in sections[1:]:
                 section = section.strip()
                 if not section:
                     continue
-                inp_m = re.search(
-                    r"输入\s*\n(.*?)(?=\n\s*输出)", section, re.DOTALL
-                )
-                inp_text = inp_m.group(1).strip() if inp_m else ""
-                out_m = re.search(r"输出\s*\n(.*)", section, re.DOTALL)
-                out_text = out_m.group(1).strip() if out_m else ""
+                inp_m = re.search(r'输入\s*\n(.*?)(?=\n\s*(?:输出|说明))', section, re.DOTALL)
+                inp_text = inp_m.group(1).strip() if inp_m else ''
+                out_m = re.search(r'输出\s*\n(.*?)(?=\n\s*说明|$)', section, re.DOTALL)
+                out_text = out_m.group(1).strip() if out_m else ''
+                note_m = re.search(r'说明\s*\n(.*)', section, re.DOTALL)
+                note_text = note_m.group(1).strip() if note_m else ''
                 if inp_text or out_text:
-                    pairs.append([inp_text, out_text])
+                    entry = [inp_text, out_text]
+                    if note_text:
+                        entry.append(note_text)
+                    pairs.append(entry)
         return pairs
 
     @staticmethod
@@ -245,26 +293,172 @@ class NowCoderCrawler(BaseCrawler):
         for katex_el in soup.select(".katex"):
             mathml = katex_el.select_one(".katex-mathml")
             if mathml:
-                # Remove <annotation> (raw LaTeX source) before extracting
-                for ann in mathml.select("annotation"):
-                    ann.decompose()
-                plain = mathml.get_text("", strip=True)
+                # Prefer the <annotation> element which contains the raw
+                # LaTeX source (e.g. "100^{100}").  Wrap in $...$ so the
+                # downstream Markdown+KaTeX pipeline renders it correctly.
+                ann = mathml.select_one("annotation")
+                if ann:
+                    plain = ann.get_text("", strip=True)
+                    # Skip purely spacing commands — layout noise
+                    import re as _re_nck
+                    if plain and not _re_nck.match(r'^\\[hv]space', plain):
+                        plain = f" ${plain}$ "
+                    else:
+                        plain = ""  # decomposing spacing
+                else:
+                    # Fallback: extract plain MathML text (Unicode math)
+                    for ann in mathml.select("annotation"):
+                        ann.decompose()
+                    plain = mathml.get_text("", strip=True)
             else:
                 plain = katex_el.get_text("", strip=True)
             if plain:
-                katex_el.replace_with(soup.new_string(plain))
+                katex_el.replace_with(plain)
 
-        # Remove bare LaTeX source text (``$...$``, ``$$...$$``) that
-        # lives outside ``.katex`` wrappers as plain text — these are
-        # the raw problem source and would duplicate the MathML text.
-        import re as _re_nc
-        _latex_pattern = _re_nc.compile(r'\${1,2}[^$]+\${1,2}')
-        for text_node in list(soup.find_all(string=True)):
-            if not text_node.parent or text_node.parent.name == 'pre':
+    @staticmethod
+    def _nowcoder_convert_equation_images(soup) -> None:
+        """Convert NowCoder equation <img> tags to LaTeX $...$ text.
+
+        NowCoder renders math via server-side equation images:
+            <img alt="100^{100}" src=".../equation?tex=100%5E%7B100%7D"/>
+
+        This method replaces each such <img> with a text node containing
+        the LaTeX source wrapped in $...$, using the alt attribute as
+        the LaTeX source (it's already unescaped).
+        """
+        import re as _re_nci
+        for img in soup.select('img[src*="equation"]'):
+            alt = (img.get('alt') or '').strip()
+            if not alt:
+                img.decompose()
                 continue
-            s = text_node.string or ''
-            if s and _latex_pattern.search(s):
-                text_node.replace_with(_latex_pattern.sub('', s))
+            # Skip purely spacing commands — they're layout noise
+            if _re_nci.match(r'^\\[hv]space', alt):
+                img.decompose()
+                continue
+            img.replace_with(f' ${alt}$ ')
+
+    @staticmethod
+    def _nowcoder_convert_images_to_markdown(soup) -> None:
+        """Convert non-equation <img> tags to Markdown ``![](url)`` syntax.
+
+        Equation images (src contains "equation") are handled separately
+        by :meth:`_nowcoder_convert_equation_images`.  This method only
+        processes ordinary content images (e.g. screenshots in explanations)
+        and replaces each with a Markdown image node so downstream rendering
+        displays them correctly.
+
+        Reference: AtCoder crawler ``_process_images``.
+        """
+        for img in soup.select('img'):
+            src = (img.get('src') or '').strip()
+            if not src:
+                img.decompose()
+                continue
+            # Skip equation images — those are handled by
+            # _nowcoder_convert_equation_images (called earlier).
+            if 'equation' in src:
+                continue
+            alt = (img.get('alt') or '').strip() or 'image'
+            img.replace_with(f'![{alt}]({src})')
+
+    @staticmethod
+    def _nowcoder_html_to_markdown(container) -> str:
+        """Convert a BeautifulSoup HTML element to Markdown text.
+
+        Preserves: <br>->newline, <u>-><u>text</u>, <strong>->**text**,
+        <a>->[text](href), <div>->paragraph break, <img>->$...$.
+
+        Call _nowcoder_convert_equation_images FIRST on the soup before
+        passing the element to this method.
+        """
+        from bs4 import NavigableString, Tag
+        import re as _re_nhm
+
+        result = []
+
+        def _walk(el):
+            if isinstance(el, NavigableString):
+                result.append(str(el))
+                return
+            if not isinstance(el, Tag):
+                return
+
+            tag = el.name.lower()
+
+            if tag == 'br':
+                result.append('\n')
+                return
+
+            if tag == 'img':
+                alt = (el.get('alt') or '').strip()
+                src = el.get('src', '')
+                if 'equation' in src and alt:
+                    if not _re_nhm.match(r'^\\[hv]space', alt):
+                        result.append(f' ${alt}$ ')
+                elif src:
+                    # Ordinary image (screenshot, diagram, etc.) → Markdown
+                    label = alt or 'image'
+                    result.append(f'\n\n![{label}]({src})\n\n')
+                return
+
+            if tag == 'u':
+                result.append('<u>')
+                for child in el.children:
+                    _walk(child)
+                result.append('</u>')
+                return
+
+            if tag in ('strong', 'b'):
+                result.append('**')
+                for child in el.children:
+                    _walk(child)
+                result.append('**')
+                return
+
+            if tag in ('em', 'i'):
+                result.append('*')
+                for child in el.children:
+                    _walk(child)
+                result.append('*')
+                return
+
+            if tag == 'a':
+                href = el.get('href', '')
+                result.append('[')
+                for child in el.children:
+                    _walk(child)
+                result.append(f']({href})')
+                return
+
+            if tag in ('div', 'p'):
+                if result and not result[-1].endswith('\n\n'):
+                    result.append('\n\n')
+                for child in el.children:
+                    _walk(child)
+                if result and not result[-1].endswith('\n\n'):
+                    result.append('\n\n')
+                return
+
+            if tag in ('pre', 'code'):
+                text = el.get_text('', strip=False)
+                result.append(f'\n```\n{text}\n```\n')
+                return
+
+            for child in el.children:
+                _walk(child)
+
+        _walk(container)
+
+        text = ''.join(result)
+        # Collapse 3+ consecutive blank lines to at most one
+        import re as _re_nhm2
+        text = _re_nhm2.sub('\n{3,}', '\n\n', text)
+        text = text.replace('  ', ' ')
+        text = text.strip()
+        text = text.replace('$ ', '$').replace(' $', '$')
+
+        return text
 
     @staticmethod
     def clean_mathjax(text: str) -> str:
@@ -589,19 +783,27 @@ class NowCoderCrawler(BaseCrawler):
 
         try:
             from bs4 import BeautifulSoup as _BS
-            soup = _BS(html, "html.parser")
+            # Fix malformed HTML: NowCoder uses </br> (invalid closing tags
+            # for the void <br> element) which confuses html.parser into
+            # wrapping all subsequent content inside a <br> container.
+            html = html.replace('</br>', '')
+            try:
+                soup = _BS(html, "lxml")
+            except Exception:
+                soup = _BS(html, "html.parser")
 
             # Title
             title_el = soup.select_one(".question-title")
             if title_el:
                 title = title_el.get_text(strip=True)
 
-            # Description
+            # Description — convert equation images first, then HTML→Markdown
             desc_el = soup.select_one(".subject-question")
             if desc_el:
                 NowCoderCrawler._strip_katex_redundancy(soup)
+                NowCoderCrawler._nowcoder_convert_equation_images(soup)
                 description = NowCoderCrawler.clean_mathjax(
-                    desc_el.get_text("\n", strip=True)
+                    NowCoderCrawler._nowcoder_html_to_markdown(desc_el)
                 )
 
             # Input / Output format — find h2 elements and their following pre.
@@ -623,10 +825,7 @@ class NowCoderCrawler(BaseCrawler):
                 # Clean MathJax artifacts lightly — preserve multi-line
                 # structure (no aggressive line merging).
                 samples = [
-                    [
-                        NowCoderCrawler.clean_mathjax_sample(s[0]),
-                        NowCoderCrawler.clean_mathjax_sample(s[1]),
-                    ]
+                    [NowCoderCrawler.clean_mathjax_sample(x) for x in s]
                     for s in samples
                 ]
 
