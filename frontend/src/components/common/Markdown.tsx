@@ -597,6 +597,9 @@ function preprocessNowcoder(content: string): string {
   c = c.replace(/\\!/g, "");
   c = c.replace(/\\;/g, "");
   c = c.replace(/\\:/g, "");
+  // Clean up empty math delimiters (leftover from stripping commands between $...$)
+  c = c.replace(/\$\$/g, "");
+  c = c.replace(/\$ \$/g, "");
   // Replace common LaTeX commands with Unicode (defence-in-depth)
   c = c.replace(/\\leqq?\b/g, "≤");
   c = c.replace(/\\geqq?\b/g, "≥");

@@ -1117,6 +1117,8 @@ export class CrawlerController {
       .replace(/\\!/g, '')   // negative thin space
       .replace(/\\;/g, '')   // thick space
       .replace(/\\:/g, '')   // medium space
+      .replace(/\$\$/g, '')  // empty display math delimiters
+      .replace(/\$ \$/g, '') // empty inline math delimiters
       .replace(/\n{3,}/g, '\n\n')
       .trim();
 
