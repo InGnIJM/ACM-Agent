@@ -4,7 +4,7 @@
 
 import api from "./api";
 import type { PaginatedResponse } from "../types/api";
-import type { Problem, ProblemListQuery } from "../types/problem";
+import type { Problem, ProblemListQuery, ProblemSearchResult, VectorSearchRequest, VectorSearchResponse } from "../types/problem";
 
 const PROBLEMS = "/problems";
 
@@ -13,14 +13,9 @@ export async function getProblems(query: ProblemListQuery = {}): Promise<Paginat
   return resp.data;
 }
 
-export async function getProblem(id: number): Promise<Problem> {
+export async function getProblem(id: string): Promise<Problem> {
   const resp = await api.get<Problem>(`${PROBLEMS}/${id}`);
   return resp.data;
-}
-
-export interface ProblemSearchResult {
-  problem: Problem;
-  score: number;
 }
 
 export async function searchProblems(q: string): Promise<ProblemSearchResult[]> {
@@ -30,7 +25,22 @@ export async function searchProblems(q: string): Promise<ProblemSearchResult[]> 
   return resp.data;
 }
 
-export async function getSimilarProblems(id: number): Promise<Problem[]> {
+export async function getSimilarProblems(id: string): Promise<Problem[]> {
   const resp = await api.get<Problem[]>(`${PROBLEMS}/${id}/similar`);
+  return resp.data;
+}
+
+/** Semantic vector search — POST /api/problems/search/vector */
+export async function searchByVector(dto: VectorSearchRequest): Promise<VectorSearchResponse> {
+  const resp = await api.post<VectorSearchResponse>(`${PROBLEMS}/search/vector`, dto);
+  return resp.data;
+}
+
+export async function deleteProblem(id: string): Promise<void> {
+  await api.delete(`${PROBLEMS}/${id}`);
+}
+
+export async function batchDeleteProblems(ids: string[]): Promise<{ deleted: boolean; count: number }> {
+  const resp = await api.post<{ deleted: boolean; count: number }>(`${PROBLEMS}/batch-delete`, { ids });
   return resp.data;
 }
