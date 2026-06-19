@@ -190,14 +190,21 @@ class AtCoderCrawler(BaseCrawler):
 
     @staticmethod
     def _unwind_inline(root_el) -> None:
-        """Replace inline formatting elements (<var>, <b>, <i>, <em>,
-        <strong>, <span>) with their text content so they don't cause
+        """Replace inline formatting elements (<var>, <code>, <b>, <i>,
+        <em>, <strong>, <span>) with their text content so they don't cause
         spurious line breaks in get_text().  Also unwrap <a> links
         (keep text, drop href).
 
         For ``<var>`` tags, the content is wrapped in ``$...$`` first
         so that LaTeX expressions (e.g. ``N \\ K \\ T``, ``\\ldots``)
         render as math even when the page uses no KaTeX markup.
+
+        For ``<code>`` tags, the content is wrapped in backticks first
+        so it survives the later get_text() flattening as Markdown inline
+        code (`` `x` ``). Without this, get_text("\\n") isolates the inner
+        text on its own line — e.g. ``Yes`` / ``First`` / a bare ``-`` —
+        which shatters sentences and lets a lone ``-`` trigger a Setext
+        heading on the frontend. (Root cause A.)
         """
         from bs4 import NavigableString as _NS
 
@@ -208,13 +215,108 @@ class AtCoderCrawler(BaseCrawler):
                 var_el.clear()
                 var_el.append(_NS(f"${inner}$"))
 
-        inline_selectors = ("var", "b", "i", "em", "strong", "span")
+        # Wrap <code> content in backticks before unwrapping
+        for code_el in root_el.find_all("code"):
+            inner = code_el.get_text("", strip=True)
+            if inner and "`" not in inner:
+                code_el.clear()
+                code_el.append(_NS(f"`{inner}`"))
+
+        inline_selectors = ("var", "code", "b", "i", "em", "strong", "span", "font")
         for sel in inline_selectors:
             for el in root_el.find_all(sel):
                 el.unwrap()
         # Unwrap <a> tags (keep link text, drop URL)
         for a in root_el.find_all("a"):
             a.unwrap()
+
+    @staticmethod
+    def _process_lists(root_el) -> None:
+        """Convert ``<ul>`` / ``<ol>`` lists into Markdown list items.
+
+        get_text("\\n") flattens ``<li>`` into bare newline-separated
+        lines (losing the ``- `` markers), so the frontend renders a list
+        as one paragraph. Replacing the list with Markdown bullet text
+        preserves the structure. Runs AFTER ``_unwind_inline`` so each
+        ``<li>``'s inline ``<var>`` / ``<code>`` are already ``$…$`` /
+        backtick text nodes. (Root cause B.)
+        """
+        from bs4 import NavigableString as _NS
+
+        def _serialize(list_el, marker_fn) -> str:
+            items = list_el.find_all("li", recursive=False)
+            lines: List[str] = []
+            for li in items:
+                # get_text(strip=True) would strip EACH NavigableString's
+                # leading/trailing whitespace — collapsing the space
+                # between "$move$" and "is either `First`". Use separator=""
+                # (no inter-node delimiter) + strip=False (preserve inner
+                # spaces), then strip the whole assembled line once.
+                # (Root cause A regression — inline spaces around <code>.)
+                txt = li.get_text("", strip=False).strip()
+                if txt:
+                    lines.append(f"{marker_fn(len(lines) + 1)} {txt}")
+            return "\n".join(lines)
+
+        # Snapshot with list() because we mutate the tree while iterating.
+        # Ordered lists first so a nested <ol> inside <ul> isn't skipped.
+        for ol in list(root_el.find_all("ol")):
+            body = _serialize(ol, lambda i: f"{i}.")
+            ol.replace_with(_NS(f"\n{body}\n"))
+        for ul in list(root_el.find_all("ul")):
+            body = _serialize(ul, lambda _: "-")
+            ul.replace_with(_NS(f"\n{body}\n"))
+
+    @staticmethod
+    def _process_tables(root_el) -> None:
+        """Convert ``<table>`` into a Markdown pipe-table so interactive
+        example tables survive ``get_text`` instead of being flattened to
+        a content soup. Runs AFTER ``_unwind_inline`` so cell ``<code>`` /
+        ``<var>`` are already backtick / ``$…$`` text. Cell-internal
+        newlines collapse to spaces (a Markdown table cell can't wrap),
+        and literal ``|`` is escaped so it doesn't break column parsing.
+        """
+        from bs4 import NavigableString as _NS
+
+        for table in list(root_el.find_all("table")):
+            md_rows: List[List[str]] = []
+            for tr in table.find_all("tr"):
+                cells = tr.find_all(["th", "td"])
+                row: List[str] = []
+                for c in cells:
+                    AtCoderCrawler._merge_adjacent_strings(c)
+                    txt = c.get_text("", strip=False).strip()
+                    txt = re.sub(r"\s+", " ", txt).replace("|", "\\|")
+                    row.append(txt)
+                if row:
+                    md_rows.append(row)
+            if not md_rows:
+                table.replace_with(_NS(""))
+                continue
+            ncol = max(len(r) for r in md_rows)
+            for r in md_rows:
+                while len(r) < ncol:
+                    r.append("")
+            lines = ["| " + " | ".join(md_rows[0]) + " |"]
+            lines.append("| " + " | ".join("---" for _ in range(ncol)) + " |")
+            for r in md_rows[1:]:
+                lines.append("| " + " | ".join(r) + " |")
+            table.replace_with(_NS("\n\n" + "\n".join(lines) + "\n\n"))
+
+    @staticmethod
+    def _process_paragraphs(root_el) -> None:
+        """Insert newline boundaries around block-level ``<p>`` elements.
+
+        BeautifulSoup's get_text("\\n") joins adjacent <p> tags with only a
+        single newline, which Markdown treats as a soft wrap — collapsing
+        distinct paragraphs into one blob. Padding each block element with
+        newline text nodes lets a blank line form between paragraphs.
+        """
+        from bs4 import NavigableString as _NS
+
+        for block in list(root_el.find_all(["p", "blockquote"])):
+            block.insert_before(_NS("\n"))
+            block.insert_after(_NS("\n"))
 
     @staticmethod
     def _merge_adjacent_strings(root_el) -> None:
@@ -305,6 +407,29 @@ class AtCoderCrawler(BaseCrawler):
 
         sample_inputs: List[str] = []
         sample_outputs: List[str] = []
+        # Parallel to sample_outputs: the explanation that follows the
+        # answer <pre> in a Sample Output section (paragraphs / ASCII-art
+        # diagrams / tables). Rendered by the frontend under "解释 #N".
+        sample_notes: List[str] = []
+
+        # Reusable HTML→markdown pipeline for a section's EXPLANATION body
+        # (everything after the answer <pre> has been removed). Mirrors the
+        # regular-section pipeline: inline tags unwrapped, lists/paragraphs
+        # structured, <pre> split by math-bearing vs plain.
+        def _section_to_markdown(soup) -> str:
+            AtCoderCrawler._unwind_inline(soup)
+            AtCoderCrawler._process_lists(soup)
+            AtCoderCrawler._process_tables(soup)
+            AtCoderCrawler._process_paragraphs(soup)
+            for pre in soup.find_all("pre"):
+                AtCoderCrawler._merge_adjacent_strings(pre)
+                pre_text = pre.get_text()
+                if "$" in pre_text:
+                    pre.replace_with(f"\n{pre_text.strip()}\n")
+                else:
+                    pre.replace_with(f"\n```\n{pre_text}\n```\n")
+            AtCoderCrawler._merge_adjacent_strings(soup)
+            return AtCoderCrawler._normalize_text(soup.get_text("\n", strip=True))
 
         for idx, part in enumerate(parts):
             if idx == 0:
@@ -327,28 +452,35 @@ class AtCoderCrawler(BaseCrawler):
             # ── Check if this is a sample heading ─────────────────
             if SAMPLE_INPUT_RE.match(heading_text):
                 section_soup = BeautifulSoup(section_html, "html.parser")
-                pre_texts = [
-                    p.get_text("\n", strip=False)
-                    for p in section_soup.find_all("pre")
-                ]
-                sample_inputs.append(
-                    "\n".join(pre_texts) if pre_texts else section_soup.get_text(
-                        "\n", strip=True
-                    )
-                )
+                # Only the FIRST <pre> is the sample input; later <pre>
+                # blocks belong to explanation paragraphs (e.g. ASCII-art
+                # diagrams) and must NOT be merged into the answer.
+                first_pre = section_soup.find("pre")
+                if first_pre is not None:
+                    sample_inputs.append(first_pre.get_text("\n", strip=False))
+                else:
+                    sample_inputs.append(section_soup.get_text("\n", strip=True))
+                # notes come only from the Sample Output section (where the
+                # explanation lives) and are index-aligned with outputs.
                 continue
 
             if SAMPLE_OUTPUT_RE.match(heading_text):
                 section_soup = BeautifulSoup(section_html, "html.parser")
-                pre_texts = [
-                    p.get_text("\n", strip=False)
-                    for p in section_soup.find_all("pre")
-                ]
-                sample_outputs.append(
-                    "\n".join(pre_texts) if pre_texts else section_soup.get_text(
-                        "\n", strip=True
-                    )
-                )
+                # See SAMPLE_INPUT_RE branch: only the first <pre>.
+                first_pre = section_soup.find("pre")
+                if first_pre is not None:
+                    sample_outputs.append(first_pre.get_text("\n", strip=False))
+                    # Root cause D: the explanation that follows the answer
+                    # <pre> (paragraphs / ASCII-art <pre> / tables) was
+                    # being thrown away. Extract it as the sample NOTE so
+                    # the frontend can render it under "解释 #N". Remove
+                    # the answer <pre> first, then run the same pipeline.
+                    first_pre.extract()
+                    note = _section_to_markdown(section_soup)
+                else:
+                    sample_outputs.append(section_soup.get_text("\n", strip=True))
+                    note = ""
+                sample_notes.append(note)
                 continue
 
             if SAMPLE_RE.match(heading_text):
@@ -362,6 +494,7 @@ class AtCoderCrawler(BaseCrawler):
                     sample_outputs.append(
                         pres[1].get_text("\n", strip=False)
                     )
+                    sample_notes.append("")
                 continue
 
             # ── Classify regular section ──────────────────────────
@@ -378,19 +511,29 @@ class AtCoderCrawler(BaseCrawler):
                 section_soup = BeautifulSoup(section_html, "html.parser")
                 AtCoderCrawler._process_katex(section_soup)
                 AtCoderCrawler._process_images(section_soup)
-                # Unwrap inline tags FIRST (wraps <var> content in $...$)
-                # before <pre> replacement extracts text (Root cause M).
+                # Unwrap inline tags FIRST (wraps <var> in $…$ and <code>
+                # in backticks) before <pre> replacement extracts text.
                 AtCoderCrawler._unwind_inline(section_soup)
-                # Preserve <pre> formatting: replace each <pre> with
-                # its text wrapped in newlines so get_text() doesn't
-                # flatten pre-formatted content (Root cause L).
-                # Wrap <pre> blocks in markdown code fences so they
-                # render as code blocks.  Merge adjacent text nodes
-                # inside <pre> first so _unwind_inline changes coalesce.
+                # Lists → Markdown bullets, paragraphs → blank-line
+                # separated, tables → pipe-tables, so get_text()
+                # preserves structure.
+                AtCoderCrawler._process_lists(section_soup)
+                AtCoderCrawler._process_tables(section_soup)
+                AtCoderCrawler._process_paragraphs(section_soup)
+                # Preserve <pre> formatting: replace each <pre> with its
+                # text. Root cause C — AtCoder input/output-format <pre>
+                # blocks contain <var> math (already turned into $…$ by
+                # _unwind_inline). A ``` fence would hide that LaTeX (code
+                # blocks don't run math), so keep math-bearing <pre> as a
+                # plain text block; only plain-text <pre> (sample preview /
+                # ASCII art) stays fenced.
                 for pre in section_soup.find_all("pre"):
                     AtCoderCrawler._merge_adjacent_strings(pre)
                     pre_text = pre.get_text()
-                    pre.replace_with(f"\n```\n{pre_text}\n```\n")
+                    if "$" in pre_text:
+                        pre.replace_with(f"\n{pre_text.strip()}\n")
+                    else:
+                        pre.replace_with(f"\n```\n{pre_text}\n```\n")
                 AtCoderCrawler._merge_adjacent_strings(section_soup)
                 text = section_soup.get_text("\n", strip=True)
                 text = AtCoderCrawler._normalize_text(text)
@@ -400,33 +543,23 @@ class AtCoderCrawler(BaseCrawler):
                 else:
                     result[section_key] = text
 
-        # ── Pair sample inputs and outputs ───────────────────────
+        # ── Pair sample inputs / outputs / notes ────────────────
+        # notes align with sample_outputs (explanations live in the
+        # Sample Output section). If input/output counts diverge, the
+        # shorter side gets an empty slot.
         samples: list = []
-        for inp, out in zip(sample_inputs, sample_outputs):
+        max_len = max(
+            len(sample_inputs), len(sample_outputs), len(sample_notes)
+        )
+        for i in range(max_len):
+            inp = sample_inputs[i] if i < len(sample_inputs) else ""
+            out = sample_outputs[i] if i < len(sample_outputs) else ""
+            note = sample_notes[i] if i < len(sample_notes) else ""
             samples.append(
                 [
                     AtCoderCrawler._normalize_text(inp),
                     AtCoderCrawler._normalize_text(out),
-                ]
-            )
-
-        # Handle any unmatched inputs or outputs
-        max_len = max(len(sample_inputs), len(sample_outputs))
-        for i in range(len(samples), max_len):
-            inp = (
-                sample_inputs[i]
-                if i < len(sample_inputs)
-                else ""
-            )
-            out = (
-                sample_outputs[i]
-                if i < len(sample_outputs)
-                else ""
-            )
-            samples.append(
-                [
-                    AtCoderCrawler._normalize_text(inp),
-                    AtCoderCrawler._normalize_text(out),
+                    note,
                 ]
             )
 
@@ -557,6 +690,9 @@ class AtCoderCrawler(BaseCrawler):
                     )
                     self._process_katex(c_soup)
                     self._process_images(c_soup)
+                    self._unwind_inline(c_soup)
+                    self._process_lists(c_soup)
+                    self._process_paragraphs(c_soup)
                     c_text = c_soup.get_text("\n", strip=True)
                     sections["constraints"] = self._normalize_text(c_text)
                 except Exception:

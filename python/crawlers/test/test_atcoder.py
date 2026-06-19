@@ -7,6 +7,7 @@ Focuses on fetch_problem and fetch_problems_by_tag methods.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -601,9 +602,294 @@ class TestExtractSections:
         assert len(sections["samples"]) >= 1
         sample = sections["samples"][0]
         assert isinstance(sample, list)
-        assert len(sample) == 2  # [input, output]
+        assert len(sample) == 3  # [input, output, note]
         assert "5" in sample[0]
         assert "6" in sample[1]
+        assert sample[2] == ""  # _HTML_TEMPLATE Sample Output has no explanation
+
+    def test_sample_output_extracts_explanation_as_note(self) -> None:
+        """Sample Output section's explanation (paragraphs / ASCII-art <pre>
+        that come AFTER the answer <pre>) must be captured as the sample
+        NOTE (third element) so the frontend renders it under '解释 #N',
+        instead of being thrown away. (1202Contest_b Sample Output 2 lost
+        its 'In this case...' text + dungeon diagram + interactive table.)
+        """
+        html = (
+            """<!DOCTYPE html><html><head><title>T</title></head><body>
+<div id="task-statement"><span class="lang-en">
+<h3>Problem Statement</h3><p>Do X.</p>
+<h3>Input</h3><p>x</p>
+<h3>Output</h3><p>y</p>
+<h3>Sample Input 1</h3>
+<pre>2 1 First</pre>
+<h3>Sample Output 1</h3>
+<pre>Yes
+...</pre>
+<p>In this case, the dungeon is as below:</p>
+<pre>| |
+ -
+| |</pre>
+<p>You use the magic first.</p>
+</span></div></body></html>"""
+        )
+        sections = AtCoderCrawler._extract_sections(html)
+        samples = sections["samples"]
+        assert len(samples) == 1
+        sample = samples[0]
+        assert len(sample) == 3, f"expected [input, output, note], got {sample!r}"
+        # Output stays clean (only the answer)
+        assert sample[1].strip() == "Yes\n..."
+        note = sample[2]
+        assert "In this case" in note, f"explanation paragraph missing: {note!r}"
+        assert "You use the magic first" in note
+        # ASCII-art <pre> preserved inside a code fence in the note
+        assert "```" in note
+        assert "| |" in note
+
+    def test_preserves_multiline_dollar_constraints_verbatim(self) -> None:
+        """Multi-line $...$ constraints (one per <li>) are preserved verbatim.
+
+        Regression armour for root cause: AtCoder constraint lists use
+        ``<var>`` elements rendered as ``$...$`` math; each ``<li>`` must
+        remain on its own line and the LaTeX must NOT be mangled by
+        ``_wrap_latex`` (which early-returns when ``$`` is already present).
+        """
+        html = (
+            r"""<!DOCTYPE html><html><head><title>T</title></head><body>
+<div id="task-statement"><span class="lang-en">
+<h3>Problem Statement</h3><p>Do X.</p>
+<h3>Constraints</h3>
+<ul>
+<li><var>1 \le N \le 10^5</var></li>
+<li><var>1 \le M \le 10^5</var></li>
+<li><var>N + M \le 2 \times 10^5</var></li>
+</ul>
+<h3>Input</h3><p>x</p>
+</span></div></body></html>"""
+        )
+        sections = AtCoderCrawler._extract_sections(html)
+        constraints = sections["constraints"]
+
+        # Each constraint wrapped in $...$, LaTeX preserved verbatim
+        assert r"$1 \le N \le 10^5$" in constraints
+        assert r"$1 \le M \le 10^5$" in constraints
+        assert r"$N + M \le 2 \times 10^5$" in constraints
+
+        # Multi-line structure: each constraint on its own non-empty line
+        lines = [ln for ln in constraints.split("\n") if ln.strip()]
+        assert len(lines) == 3, (
+            f"expected 3 constraint lines, got {lines!r}"
+        )
+
+    # ── Realistic AtCoder fixture mirroring 1202Contest_b (input/output ──
+    # format <pre> with <var> math, <ul><li> constraints, inline <code>).
+    _HTML_1202 = (
+        r"""<!DOCTYPE html><html><head><title>B - vs. DEGwer</title></head><body>
+<div id="task-statement"><span class="lang-en">
+<h3>Problem Statement</h3><p>This is an interactive problem.</p>
+<h3>Constraints</h3>
+<ul>
+<li><var>1 \leq H \leq 20</var></li>
+<li><var>1 \leq W \leq 20</var></li>
+<li><var>\textrm{move}</var> is either <code>First</code> or <code>Second</code>, where <code>First</code> means you use the magic first.</li>
+</ul>
+<h3>Input</h3>
+<p>The input is given in the following format:</p>
+<pre><var>H</var> <var>W</var> <var>\textrm{move}</var></pre>
+<h3>Output</h3>
+<p>Print <code>Yes</code> or <code>No</code>.</p>
+<pre><var>t</var> <var>i</var> <var>j</var></pre>
+<ul><li><var>t</var> is either <code>|</code> or <code>-</code>.</li></ul>
+<h3>Sample Input 1</h3>
+<pre>1 1 First</pre>
+<h3>Sample Output 1</h3>
+<pre>No</pre>
+</span></div></body></html>"""
+    )
+
+    def test_input_format_pre_with_var_keeps_latex_unfenced(self) -> None:
+        """Input-format ``<pre>`` that contains ``<var>`` math must NOT be
+        wrapped in a fenced code block — otherwise the LaTeX (``$H$ $W$
+        $\\textrm{move}$``) won't render (code fences don't run math).
+
+        Root cause C: AtCoder I/O-format blocks are "format with math
+        variables", not code. Keep them as a plain text block so KaTeX
+        renders H / W / move.
+        """
+        html = (
+            r"""<!DOCTYPE html><html><head><title>T</title></head><body>
+<div id="task-statement"><span class="lang-en">
+<h3>Problem Statement</h3><p>Do X.</p>
+<h3>Input</h3>
+<pre><var>H</var> <var>W</var> <var>\textrm{move}</var></pre>
+<h3>Output</h3><p>y</p>
+</span></div></body></html>"""
+        )
+        sections = AtCoderCrawler._extract_sections(html)
+        input_fmt = sections["input_format"]
+
+        # NOT wrapped in a code fence
+        assert "```" not in input_fmt, (
+            f"input-format pre must stay unfenced, got {input_fmt!r}"
+        )
+        # LaTeX tokens survive so KaTeX can render them
+        assert r"$H$ $W$ $\textrm{move}$" in input_fmt
+
+    def test_plain_pre_still_wrapped_in_fenced_code_block(self) -> None:
+        """Plain-text ``<pre>`` (no math) — e.g. sample ASCII art / output
+        preview — MUST still be wrapped in a fenced code block (regression
+        guard for root cause C fix: only ``<var>``-bearing pre stays unfenced).
+        """
+        html = (
+            """<!DOCTYPE html><html><head><title>T</title></head><body>
+<div id="task-statement"><span class="lang-en">
+<h3>Problem Statement</h3>
+<p>Do X.</p>
+<pre>| |
+ -
+| |</pre>
+</span></div></body></html>"""
+        )
+        sections = AtCoderCrawler._extract_sections(html)
+        assert "```" in sections["description"]
+
+    def test_inline_code_becomes_backticks(self) -> None:
+        """``<code>x</code>`` → Markdown inline `` `x` ``.
+
+        Root cause A: without backticks, get_text("\\n") isolates the
+        inner text on its own line (e.g. ``First`` / ``Yes``), shattering
+        the sentence and, for ``-`` / ``|`` tokens, triggering Setext
+        headings on the frontend.
+        """
+        sections = AtCoderCrawler._extract_sections(self._HTML_1202)
+        constraints = sections["constraints"]
+        # Each inline <code> survives as a backtick-wrapped inline-code span
+        assert "`First`" in constraints
+        assert "`Second`" in constraints
+        # And they must NOT be isolated on their own line — verify the
+        # third <li> stays a single line containing both tokens
+        third = [ln for ln in constraints.split("\n") if "is either" in ln]
+        assert len(third) == 1, f"expected single line, got {third!r}"
+        assert "`First`" in third[0] and "`Second`" in third[0]
+
+    def test_unordered_list_becomes_markdown_list(self) -> None:
+        """``<ul><li>`` → Markdown ``- item`` list.
+
+        Root cause B: get_text("\\n") flattens list items into bare
+        newline-separated lines, losing the list structure (no ``- ``
+        markers) so the frontend renders them as one paragraph.
+        """
+        sections = AtCoderCrawler._extract_sections(self._HTML_1202)
+        constraints = sections["constraints"]
+        # Three constraint lines, each a markdown bullet
+        bullets = [ln for ln in constraints.split("\n") if ln.startswith("- ")]
+        assert len(bullets) == 3, (
+            f"expected 3 markdown bullets, got {bullets!r}"
+        )
+        assert r"$1 \leq H \leq 20$" in bullets[0]
+        assert r"$1 \leq W \leq 20$" in bullets[1]
+        assert "move" in bullets[2] and "`First`" in bullets[2]
+
+    def test_sample_output_excludes_explanatory_pre(self) -> None:
+        """Sample Output section's FIRST ``<pre>`` is the answer; any
+        subsequent ``<pre>`` (ASCII-art diagram / illustration inside the
+        explanation paragraph) must NOT be merged into the sample output.
+
+        Root cause: ``find_all("pre")`` + ``"\\n".join`` concatenated
+        every ``<pre>`` in the section, so the dungeon diagram
+        ``| |\\n -\\n| |`` leaked into Sample Output 2 of 1202Contest_b
+        (rendered as part of the answer code block).
+        """
+        html = (
+            """<!DOCTYPE html><html><head><title>T</title></head><body>
+<div id="task-statement"><span class="lang-en">
+<h3>Problem Statement</h3><p>Do X.</p>
+<h3>Input</h3><p>x</p>
+<h3>Output</h3><p>y</p>
+<h3>Sample Input 1</h3>
+<pre>2 1 First</pre>
+<h3>Sample Output 1</h3>
+<pre>Yes
+...</pre>
+<p>The dungeon looks like:</p>
+<pre>| |
+ -
+| |</pre>
+</span></div></body></html>"""
+        )
+        sections = AtCoderCrawler._extract_sections(html)
+        samples = sections["samples"]
+        assert len(samples) == 1, f"expected 1 sample, got {samples!r}"
+        out = samples[0][1]
+        # The answer (first pre) is preserved...
+        assert "Yes" in out and "..." in out
+        # ...but the ASCII-art diagram from the explanation paragraph is excluded
+        assert "| |" not in out, f"diagram leaked into output: {out!r}"
+
+    def test_sample_table_becomes_markdown_table(self) -> None:
+        """A ``<table>`` inside a sample explanation becomes a Markdown
+        pipe-table (header row + ``---`` separator + body rows), not a
+        flattened content soup."""
+        html = (
+            """<!DOCTYPE html><html><head><title>T</title></head><body>
+<div id="task-statement"><span class="lang-en">
+<h3>Problem Statement</h3><p>Do X.</p>
+<h3>Input</h3><p>x</p>
+<h3>Output</h3><p>y</p>
+<h3>Sample Input 1</h3><pre>2 1</pre>
+<h3>Sample Output 1</h3>
+<pre>Yes</pre>
+<table class="table table-bordered"><thead><tr>
+<th>Input</th><th>Output</th><th>Explanation</th>
+</tr></thead><tbody>
+<tr><td><code>2 1</code></td><td></td><td>An input is given.</td></tr>
+<tr><td></td><td><code>Yes</code></td><td>You print Yes.</td></tr>
+</tbody></table>
+</span></div></body></html>"""
+        )
+        sections = AtCoderCrawler._extract_sections(html)
+        note = sections["samples"][0][2]
+        # Header row + separator (exact)
+        assert "| Input | Output | Explanation |" in note
+        assert re.search(r"\|\s*-{3,}\s*\|\s*-{3,}\s*\|\s*-{3,}\s*\|", note), note
+        # Body cells survive with inline code + math, column order preserved
+        # even with empty cells (don't assert exact spacing around pipes).
+        assert "`2 1`" in note and "An input is given." in note
+        assert "`Yes`" in note and "You print Yes." in note
+
+    def test_ordered_list_becomes_markdown_ordered_list(self) -> None:
+        """``<ol><li>`` → Markdown ``1.`` / ``2.`` numbered list."""
+        html = (
+            """<!DOCTYPE html><html><head><title>T</title></head><body>
+<div id="task-statement"><span class="lang-en">
+<h3>Problem Statement</h3><p>Steps:</p>
+<ol><li>Do A.</li><li>Do B.</li><li>Do C.</li></ol>
+</span></div></body></html>"""
+        )
+        sections = AtCoderCrawler._extract_sections(html)
+        desc = sections["description"]
+        assert "1. Do A." in desc
+        assert "2. Do B." in desc
+        assert "3. Do C." in desc
+
+    def test_output_format_avoids_setext_heading_trap(self) -> None:
+        """The ``-`` / ``|`` tokens inside output-format ``<code>`` must
+        remain backtick-escaped so they never sit on their own line and
+        trigger a Setext heading (frontend rendered stray ``<h5>``).
+        """
+        sections = AtCoderCrawler._extract_sections(self._HTML_1202)
+        output_fmt = sections["output_format"]
+        # Code tokens wrapped, never bare-on-their-own-line
+        assert "`|`" in output_fmt
+        assert "`-`" in output_fmt
+        assert "`Yes`" in output_fmt
+        # The input/output format <pre> with <var> stays unfenced
+        assert r"$t$ $i$ $j$" in output_fmt
+        # No Setext trap: no line that is a bare '-' or '|'
+        for ln in output_fmt.split("\n"):
+            assert ln.strip() not in ("-", "|", "=", "a", "w"), (
+                f"bare token on its own line → Setext/fragmentation: {ln!r}"
+            )
 
 
 # ──────────────────────────────────────────────
