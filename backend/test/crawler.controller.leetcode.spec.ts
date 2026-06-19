@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import * as fs from 'fs';
 import * as path from 'path';
 import { CrawlerController } from '../src/crawler/crawler.controller';
+import { parseLeetCodeSamples } from '../src/crawler/fullcontent.util';
 import { PythonService } from '../src/crawler/python.service';
 import { PrismaService } from '../src/common/prisma/prisma.service';
 import { VectorService } from '../src/common/vector/vector.service';
@@ -68,9 +69,10 @@ describe('CrawlerController — LeetCode rendering (sup/sub LaTeX + sample split
     jest.clearAllMocks();
   });
 
-  // Helpers: reach private methods on the instance
-  const parse = (html: string) =>
-    (controller as any).parseLeetCodeSamples(html);
+  // Helpers: buildFullContent stays on the controller instance; the sample
+  // parser was extracted to the shared pure util (fullcontent.util.ts) and
+  // is now imported directly.
+  const parse = (html: string) => parseLeetCodeSamples(html);
   const build = (record: any) =>
     (controller as any).buildFullContent('leetcode', record);
 
