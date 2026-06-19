@@ -53,6 +53,9 @@ function htmlToPlainText(html: string): string {
     .replace(/<\/(?:p|div|li|h[1-6]|pre|blockquote|section|article|main|aside|header|footer|nav|figure|figcaption|details|summary|fieldset|form|table|tr|ul|ol|dl)>/gi, '\n')
     .replace(/<(?:br|hr)\b[^>]*\/?>/gi, '\n')
     .replace(/<\/?(?:p|div|h[1-6]|pre|blockquote|li|tr|ul|ol|dl|table|section|article|main|aside|header|footer|nav)\b[^>]*>/gi, '\n')
+    // Encode standalone < that is not part of a tag before stripping
+    // (e.g. "<= x" in code blocks — literal <, not a tag opener)
+    .replace(/<(?![a-zA-Z\/])/g, '&lt;')
     .replace(/<[^>]+>/g, '')
     .replace(/&#39;/g, "'").replace(/&#x27;/g, "'").replace(/&apos;/g, "'")
     .replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
@@ -138,6 +141,7 @@ function buildFullContent(platform: string, record: any): string {
 
   // HTML content → plain text (LeetCode)
   let description = record.content || '';
+  let extractedHintsHtml: string | null = null;
   if (description && description.trim().startsWith('<')) {
     if (platform === 'leetcode') {
       // Remove old-format <pre> example blocks
@@ -156,15 +160,34 @@ function buildFullContent(platform: string, record: any): string {
         '',
       );
       // Remove orphaned example/tip label elements outside example-block
-      // e.g. <strong class="example">示例 1：</strong>
+      // e.g. <strong class="example">示例 1：</strong> (old format)
       description = description.replace(
         /<(?:strong|b)\s[^>]*class="example"[^>]*>.*?<\/(?:strong|b)>/gi,
         '',
       );
+      // Also catch plain <strong>/<b> example headers without class (new format)
+      // e.g. <strong>示例 1：</strong>, <strong>示例&nbsp;3：</strong>,
+      //      <strong>Example 1:</strong>
       description = description.replace(
-        /<(?:strong|b)>(?:提示|Note|Constraints)\s*:?\s*<\/(?:strong|b)>/gi,
+        /<(?:strong|b)>\s*(?:示例(?:\s*&nbsp;\s*)?\s*\d*\s*[：:]|Example\s*\d*\s*:)\s*<\/(?:strong|b)>/gi,
         '',
       );
+      // Extract hints <ul> block from HTML before stripping the label
+      // (LeetCode GraphQL hints is often empty, hints are embedded in HTML)
+      const hintSectionRe = /<(?:strong|b)>\s*(?:提示|Hint|Note|Constraints)\s*[：:]?\s*<\/(?:strong|b)>\s*<\/p>\s*(<ul\b[\s\S]*?<\/ul>)/i;
+      const hintMatch = description.match(hintSectionRe);
+      if (hintMatch) {
+        extractedHintsHtml = hintMatch[1];
+        description = description.replace(
+          /<(?:strong|b)>\s*(?:提示|Hint|Note|Constraints)\s*[：:]?\s*<\/(?:strong|b)>\s*<\/p>\s*<ul\b[\s\S]*?<\/ul>/i,
+          '',
+        );
+      } else {
+        description = description.replace(
+          /<(?:strong|b)>(?:提示|Note|Constraints|Hint)\s*[：:]?\s*<\/(?:strong|b)>/gi,
+          '',
+        );
+      }
     }
     description = htmlToPlainText(description);
   }
@@ -199,6 +222,11 @@ function buildFullContent(platform: string, record: any): string {
     parts.push(`[提示]\n${record.hints.map((h: string, i: number) => `${i + 1}. ${h}`).join('\n')}`);
   } else if (record.hint) {
     parts.push(`[提示]\n${record.hint}`);
+  } else if (extractedHintsHtml) {
+    const hintsText = htmlToPlainText(extractedHintsHtml);
+    if (hintsText) {
+      parts.push(`[提示]\n${hintsText}`);
+    }
   }
   if (record.note) parts.push(`[注]\n${record.note}`);
 

@@ -102,6 +102,41 @@ export function parseLeetCodeSamples(html: string): Array<[string, string, strin
 }
 
 /**
+ * Convert HTML to plain text using the same pipeline as buildFullContent.
+ * Includes <sup>/<sub> → LaTeX conversion, tag stripping, entity decoding,
+ * and whitespace normalisation.
+ */
+export function htmlToPlainText(html: string): string {
+  if (!html) return '';
+  return html
+    // sup/sub → LaTeX math
+    .replace(/([A-Za-z0-9.\-]+)<sup>([^<]+)<\/sup>/gi, (_m: string, p: string, x: string) => `$${p}^{${x}}$`)
+    .replace(/([A-Za-z0-9.\-]+)<sub>([^<]+)<\/sub>/gi, (_m: string, p: string, x: string) => `$${p}_{${x}}$`)
+    // block-level closing tags → newlines
+    .replace(/<\/(?:p|div|li|h[1-6]|pre|blockquote|section|article|main|aside|header|footer|nav|figure|figcaption|details|summary|fieldset|form|table|tr|ul|ol|dl)>/gi, '\n')
+    .replace(/<(?:br|hr)\b[^>]*\/?>/gi, '\n')
+    // block-level opening tags → newlines
+    .replace(/<\/?(?:p|div|h[1-6]|pre|blockquote|li|tr|ul|ol|dl|table|section|article|main|aside|header|footer|nav)\b[^>]*>/gi, '\n')
+    // strip remaining inline tags
+    // CRITICAL: encode standalone < that is not part of a tag first
+    // (e.g. "<= x" in code blocks — the < is literal text, not a tag opener).
+    // Without this, /<[^>]+>/g greedily matches from <= to the next >,
+    // destroying all the text in between.
+    .replace(/<(?![a-zA-Z\/])/g, '&lt;')
+    .replace(/<[^>]+>/g, '')
+    // decode entities
+    .replace(/&#39;/g, "'").replace(/&#x27;/g, "'").replace(/&apos;/g, "'")
+    .replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&').replace(/&nbsp;/g, ' ')
+    .replace(/&#8217;/g, "'").replace(/&#8216;/g, "'")
+    .replace(/&#8220;/g, '"').replace(/&#8221;/g, '"')
+    .replace(/&#8230;/g, '...').replace(/&#xA0;/g, ' ')
+    // whitespace normalisation
+    .replace(/[ \t]+\n/g, '\n').replace(/\n[ \t]+/g, '\n')
+    .replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/**
  * Clean MathJax triplication artifacts from scraped CF/NowCoder text.
  *
  * OJ pages render each math expression 3 ways (plain-text preview, LaTeX
@@ -376,6 +411,8 @@ export function buildFullContent(platform: string, record: any): string {
   if (record.note) parts.push(`[注]\n${record.note}`);
   // Decode HTML content (LeetCode returns HTML in content field)
   let description = record.content || record.description || '';
+  // Hints extracted from HTML content (used when GraphQL hints is empty)
+  let extractedHintsHtml: string | null = null;
   if (description && description.trim().startsWith('<')) {
     // ── Step 0: remove example blocks (parsed separately by
     // parseLeetCodeSamples) so they don't leak into [描述] ──
@@ -396,15 +433,37 @@ export function buildFullContent(platform: string, record: any): string {
         '',
       );
       // Remove orphaned example/tip label elements outside example-block
-      // e.g. <strong class="example">示例 1：</strong>
+      // e.g. <strong class="example">示例 1：</strong> (old format)
       description = description.replace(
         /<(?:strong|b)\s[^>]*class="example"[^>]*>.*?<\/(?:strong|b)>/gi,
         '',
       );
+      // Also catch plain <strong>/<b> example headers without class (new format)
+      // e.g. <strong>示例 1：</strong>, <strong>示例&nbsp;3：</strong>,
+      //      <strong>Example 1:</strong>
       description = description.replace(
-        /<(?:strong|b)>(?:提示|Note|Constraints)\s*:?\s*<\/(?:strong|b)>/gi,
+        /<(?:strong|b)>\s*(?:示例(?:\s*&nbsp;\s*)?\s*\d*\s*[：:]|Example\s*\d*\s*:)\s*<\/(?:strong|b)>/gi,
         '',
       );
+      // ── Extract hints <ul> block from HTML (LeetCode GraphQL hints
+      // is often empty, but the hints are embedded in the HTML content).
+      // MUST run before the label-stripping fallback below. ──
+      const hintSectionRe = /<(?:strong|b)>\s*(?:提示|Hint|Note|Constraints)\s*[：:]?\s*<\/(?:strong|b)>\s*<\/p>\s*(<ul\b[\s\S]*?<\/ul>)/i;
+      const hintMatch = description.match(hintSectionRe);
+      if (hintMatch) {
+        extractedHintsHtml = hintMatch[1];
+        // Remove the entire hints section (label + <ul> block) from description
+        description = description.replace(
+          /<(?:strong|b)>\s*(?:提示|Hint|Note|Constraints)\s*[：:]?\s*<\/(?:strong|b)>\s*<\/p>\s*<ul\b[\s\S]*?<\/ul>/i,
+          '',
+        );
+      } else {
+        // No <ul> block — just strip the label (legacy, e.g. hints in plain text)
+        description = description.replace(
+          /<(?:strong|b)>(?:提示|Note|Constraints|Hint)\s*[：:]?\s*<\/(?:strong|b)>/gi,
+          '',
+        );
+      }
     }
     // ── Step 1: convert <sup>/<sub> to inline LaTeX math BEFORE tag stripping ──
     // Wrap "prefix token + exponent/index" in $…$ so KaTeX renders it.
@@ -427,6 +486,8 @@ export function buildFullContent(platform: string, record: any): string {
       .replace(/<(?:br|hr)\b[^>]*\/?>/gi, '\n')
       .replace(/<\/?(?:p|div|h[1-6]|pre|blockquote|li|tr|ul|ol|dl|table|section|article|main|aside|header|footer|nav)\b[^>]*>/gi, '\n');
     // ── Step 3: remove remaining tags (inline elements) ──
+    // Encode standalone < first (see htmlToPlainText for rationale)
+    description = description.replace(/<(?![a-zA-Z\/])/g, '&lt;');
     description = description.replace(/<[^>]+>/g, '');
     // ── Step 4: decode numeric & named entities ──────────
     // Now safe: any '<' in the text was originally &lt; and
@@ -488,6 +549,16 @@ export function buildFullContent(platform: string, record: any): string {
       const sampleTestCase = record.sampleTestCase || '';
       if (sampleTestCase) {
         parts.push(`[样例]\n输入 #1\n\`\`\`\n${sampleTestCase}\n\`\`\``);
+      }
+    }
+  }
+  // ── If GraphQL hints was empty, use hints extracted from HTML content ──
+  if (extractedHintsHtml) {
+    const hasRecordHints = record.hints && Array.isArray(record.hints) && record.hints.length > 0;
+    if (!hasRecordHints && !record.hint) {
+      const hintsText = htmlToPlainText(extractedHintsHtml);
+      if (hintsText) {
+        parts.push(`[提示]\n${hintsText}`);
       }
     }
   }

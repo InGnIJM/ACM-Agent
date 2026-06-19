@@ -220,7 +220,12 @@ function buildFullContent(platform: string, record: any): string {
       description = description.replace(/<div[^>]*class="example-block"[^>]*>[\s\S]*?<\/div>/gi, '');
       description = description.replace(/<pre>[\s\S]*?<\/pre>/gi, '');
       description = description.replace(/<(?:strong|b)\s[^>]*class="example"[^>]*>.*?<\/(?:strong|b)>/gi, '');
-      description = description.replace(/<(?:strong|b)>(?:提示|Note|Constraints)\s*:?\s*<\/(?:strong|b)>/gi, '');
+      // Also catch plain <strong>/<b> example headers without class (new format)
+      description = description.replace(
+        /<(?:strong|b)>\s*(?:示例(?:\s*&nbsp;\s*)?\s*\d*\s*[：:]|Example\s*\d*\s*:)\s*<\/(?:strong|b)>/gi,
+        '',
+      );
+      description = description.replace(/<(?:strong|b)>(?:提示|Note|Constraints|Hint)\s*[：:]?\s*<\/(?:strong|b)>/gi, '');
     }
     // ── Step 1: <sup>/<sub> → inline LaTeX math ──
     description = description
