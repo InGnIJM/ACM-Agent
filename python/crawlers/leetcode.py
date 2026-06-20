@@ -117,19 +117,24 @@ query problemsetQuestionList($categorySlug: String, $limit: Int, $skip: Int, $fi
 """
 
 _SOLUTIONS_QUERY = """
-query questionSolutions($questionSlug: String!, $skip: Int!, $first: Int!) {
-  questionSolutions(questionSlug: $questionSlug, skip: $skip, first: $first) {
+query communitySolutions($questionSlug: String!, $skip: Int!, $first: Int!) {
+  questionSolutionArticles(questionSlug: $questionSlug, skip: $skip, first: $first) {
     totalNum
-    solutions {
-      id
-      title
-      content
-      post {
+    edges {
+      node {
+        title
+        slug
+        content
+        summary
         author {
           username
+          profile {
+            userAvatar
+          }
         }
-        voteCount
-        creationDate
+        createdAt
+        upvoteCount
+        hitCount
       }
     }
   }
@@ -475,17 +480,17 @@ class LeetCodeCrawler(BaseCrawler):
         )
 
     def fetch_solutions(
-        self, source_id: str, first: int = 20
+        self, source_id: str, first: int = 10
     ) -> CrawlResult:
         """Fetch community solutions and official solution for a problem.
 
         Queries two GraphQL endpoints:
-        * ``questionSolutions(questionSlug, skip, first)`` for community solutions.
+        * ``questionSolutionArticles(questionSlug, skip, first)`` for community solutions.
         * ``question(titleSlug){solution{content title}}`` for the official solution.
 
         Args:
             source_id: LeetCode problem title-slug (e.g. ``"two-sum"``).
-            first: Maximum number of community solutions to fetch.
+            first: Maximum number of community solutions to fetch (default 10).
 
         Returns:
             CrawlResult with a list of solution dicts, each containing
@@ -506,20 +511,23 @@ class LeetCodeCrawler(BaseCrawler):
         if comm_result.success and comm_result.data:
             data = comm_result.data
             if isinstance(data, dict):
-                qs = data.get("questionSolutions") or {}
-                sol_list = qs.get("solutions", []) if isinstance(qs, dict) else []
-                for s in sol_list:
-                    if not isinstance(s, dict):
+                qs = data.get("questionSolutionArticles") or {}
+                edges = qs.get("edges", []) if isinstance(qs, dict) else []
+                for edge in edges:
+                    if not isinstance(edge, dict):
                         continue
-                    post = s.get("post") or {}
-                    author_info = (post.get("author") or {}) if isinstance(post, dict) else {}
+                    node = edge.get("node") or {}
+                    if not isinstance(node, dict):
+                        continue
+                    author_info = node.get("author") or {}
                     solutions.append({
-                        "author": author_info.get("username", "匿名"),
-                        "title": s.get("title", ""),
-                        "content": s.get("content", ""),
-                        "vote_count": post.get("voteCount", 0) if isinstance(post, dict) else 0,
+                        "author": (author_info.get("username", "匿名")
+                                   if isinstance(author_info, dict) else "匿名"),
+                        "title": node.get("title", ""),
+                        "content": node.get("content", ""),
+                        "vote_count": node.get("upvoteCount", 0),
                         "is_official": False,
-                        "solution_id": s.get("id", ""),
+                        "solution_id": node.get("slug", ""),
                     })
 
         # ── Fetch official solution ────────────────────────────
@@ -543,6 +551,19 @@ class LeetCodeCrawler(BaseCrawler):
                     })
 
         if not solutions:
+            # Distinguish between "API returned no data" (not retryable)
+            # and "API call failed" (retryable — propagate the actual error).
+            errors: list[str] = []
+            if not comm_result.success:
+                errors.append(f"community: {comm_result.error}")
+            if not off_result.success:
+                errors.append(f"official: {off_result.error}")
+            if errors:
+                return CrawlResult(
+                    success=False,
+                    error=f"fetch_solutions failed for '{source_id}': {'; '.join(errors)}",
+                    source="http",
+                )
             return CrawlResult(
                 success=False,
                 error=f"No solutions found for problem '{source_id}'",
@@ -591,13 +612,19 @@ def _run_import(platform: str) -> CrawlResult:
         return CrawlResult(success=False, error=str(exc))
 
 
-def _save_result(crawler: LeetCodeCrawler, data, sub_dir: str, label: str) -> None:
+def _log(msg: str) -> None:
+    """Print a diagnostic message to stderr (stdout is reserved for JSON output)."""
+    import sys as _sys
+    print(msg, file=_sys.stderr, flush=True)
+
+
+def _save_result(crawler: LeetCodeCrawler, data, sub_dir: str, label: str) -> Path:
     """Save fetched data to a timestamped JSON file under data/raw/{platform}/{sub_dir}/."""
     from datetime import datetime, timezone
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     safe_label = str(label).replace("/", "_").replace("\\", "_")
     filename = f"{today}_{safe_label}.json"
-    crawler.save_json(data, filename=filename, sub_dir=f"{crawler.PLATFORM}/{sub_dir}")
+    return crawler.save_json(data, filename=filename, sub_dir=f"{crawler.PLATFORM}/{sub_dir}")
 
 
 def main(argv: Optional[list] = None) -> None:
@@ -677,24 +704,65 @@ def main(argv: Optional[list] = None) -> None:
             count = int(params.get("count", 50))
             skip_ids = set(params.get("skip_ids", []))
             fetch_count = max(count + len(skip_ids), count * 3)
+
+            _log(f"[CRAWL] tag={tag!r} count={count} skip_ids_count={len(skip_ids)} fetch_count={fetch_count}")
+            _log(f"[CRAWL] skip_ids sample: {list(skip_ids)[:5]}...")
+
             result = executor.execute("fetch_problems_by_tag", str(tag), fetch_count)
-            if result.success and result.data:
-                new_items = [p for p in result.data if p.get('id') not in skip_ids and p.get('pid') not in skip_ids]
+
+            if not result.success:
+                _log(f"[CRAWL] fetch_problems_by_tag FAILED: {result.error}")
+            elif not result.data:
+                _log(f"[CRAWL] fetch_problems_by_tag returned empty data")
+            else:
+                raw_count = len(result.data)
+                _log(f"[CRAWL] API returned {raw_count} problems")
+                if raw_count > 0:
+                    _log(f"[CRAWL] First 5 API slugs: {[p.get('titleSlug') for p in result.data[:5]]}")
+
+                new_items = [p for p in result.data if p.get('titleSlug') not in skip_ids and str(p.get('frontendQuestionId', '')) not in skip_ids]
+                _log(f"[CRAWL] After skip_ids filter: {len(new_items)} problems")
                 new_items = new_items[:count]
+                _log(f"[CRAWL] After count limit: {len(new_items)} problems")
+                if new_items:
+                    _log(f"[CRAWL] Final slugs: {[p.get('titleSlug') for p in new_items]}")
+
                 # Enrich with full detail (GraphQL query per problem)
                 enriched = []
-                for prob in new_items:
+                for i, prob in enumerate(new_items):
                     slug = prob.get('titleSlug') or prob.get('slug') or ''
                     if slug:
+                        _log(f"[CRAWL] Enriching [{i+1}/{len(new_items)}] {slug}...")
                         detail = executor.execute("fetch_problem", str(slug))
                         if detail and detail.success and detail.data:
-                            enriched.append(dict(detail.data))
+                            d = dict(detail.data)
+                            enriched.append(d)
+                            _log(f"[CRAWL]   -> enriched OK, title={d.get('title','?')[:30]}, has_content={bool(d.get('content'))}")
                         else:
                             enriched.append(prob)
+                            _log(f"[CRAWL]   -> enrichment FAILED, using list data. error={detail.error if detail else 'None'}")
                     else:
                         enriched.append(prob)
+                        _log(f"[CRAWL]   -> SKIP: no slug in prob data")
+
+                _log(f"[CRAWL] Enriched: {len(enriched)} problems total")
+
                 result = CrawlResult(success=True, data=enriched, source=result.source)
-                _save_result(crawler, result.data, "problems", str(tag) or "all")
+                saved_path = _save_result(crawler, result.data, "problems", str(tag) or "all")
+                _log(f"[CRAWL] Saved problems to: {saved_path}")
+
+                # Fetch solutions for each problem
+                for i, prob in enumerate(enriched):
+                    slug = prob.get('titleSlug') or prob.get('slug') or ''
+                    if slug:
+                        _log(f"[CRAWL] Fetching solutions [{i+1}/{len(enriched)}] {slug}...")
+                        sol_result = executor.execute("fetch_solutions", str(slug), 10)
+                        if sol_result and sol_result.success and sol_result.data:
+                            sol_count = len(sol_result.data) if isinstance(sol_result.data, list) else '?'
+                            saved_sol_path = _save_result(crawler, sol_result.data, "solutions", str(slug))
+                            _log(f"[CRAWL]   -> {sol_count} solutions saved to {saved_sol_path}")
+                        else:
+                            _log(f"[CRAWL]   -> solutions fetch FAILED: {sol_result.error if sol_result else 'None'}")
 
         elif action == "fetch_records":
             uid = params.get("uid", "")
@@ -716,7 +784,7 @@ def main(argv: Optional[list] = None) -> None:
             uid = params.get("uid", "")
             if not uid:
                 raise ValueError("--uid is required for fetch_solutions")
-            count = int(params.get("count", 20))
+            count = int(params.get("count", 10))
             result = executor.execute("fetch_solutions", str(uid), count)
             if result.success and result.data:
                 _save_result(crawler, result.data, "solutions", str(uid))
@@ -746,14 +814,21 @@ def _emit(
     data: object = None,
     error: Optional[str] = None,
 ) -> None:
-    """Print a JSON result line to stdout."""
+    """Print a JSON result line to stdout (UTF-8, bypassing console encoding)."""
+    import sys as _sys
     payload = {
         "success": success,
         "data": data,
         "error": error,
         "platform": platform,
     }
-    print(json.dumps(payload, ensure_ascii=False, default=str))
+    json_str = json.dumps(payload, ensure_ascii=False, default=str)
+    # Write raw UTF-8 bytes to avoid Windows GBK console encoding errors.
+    # NestJS reads stdout as UTF-8 via execFile.  When run from a terminal
+    # without PYTHONIOENCODING=utf-8, the default print() would crash on
+    # characters like U+00A0 (non-breaking space, common in LeetCode HTML).
+    _sys.stdout.buffer.write((json_str + "\n").encode("utf-8"))
+    _sys.stdout.buffer.flush()
 
 
 if __name__ == "__main__":

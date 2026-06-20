@@ -639,7 +639,9 @@ def _emit(
         "error": error,
         "platform": platform,
     }
-    print(json.dumps(payload, ensure_ascii=False, default=str))
+    json_str = json.dumps(payload, ensure_ascii=False, default=str)
+    sys.stdout.buffer.write((json_str + "\n").encode("utf-8"))
+    sys.stdout.buffer.flush()
 
 
 if __name__ == "__main__":
