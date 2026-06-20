@@ -64,6 +64,7 @@ export default function CrawlerManagement() {
   // Vector embedding task result (本次爬取任务的嵌入状态)
   const [taskEmbed, setTaskEmbed] = useState<{
     platform: string; action: string; crawled: number; imported: number; time: string;
+    importedDetail?: { problems: number; solutions: number; records: number } | null;
   } | null>(null);
   const [vectorSummaryPending, setVectorSummaryPending] = useState(false);
 
@@ -168,7 +169,12 @@ export default function CrawlerManagement() {
       if (d.success === false) {
         addLog(`[${platform}] 失败: ${d.platform} 未知平台`, "error");
       } else {
-        const importedMsg = d.imported > 0 ? `, 入库 ${d.imported} 条` : '';
+        const detail = d.importedDetail || {};
+        const problemPart = detail.problems > 0 ? `题目 ${detail.problems} 题` : '';
+        const solutionPart = detail.solutions > 0 ? `题解 ${detail.solutions} 条` : '';
+        const recordPart = detail.records > 0 ? `提交记录 ${detail.records} 条` : '';
+        const importedParts = [problemPart, solutionPart, recordPart].filter(Boolean).join('，');
+        const importedMsg = importedParts ? ` | 入库: ${importedParts}` : '';
         addLog(`[${platform}] 完成: 爬取 ${d.count ?? '?'} 题${importedMsg}`, "success");
         // 记录本次任务嵌入状态
         setTaskEmbed({
@@ -176,6 +182,7 @@ export default function CrawlerManagement() {
           action: d.action || action,
           crawled: d.count ?? 0,
           imported: d.imported ?? 0,
+          importedDetail: d.importedDetail || null,
           time: new Date().toLocaleTimeString(),
         });
         // 开始轮询嵌入进度
@@ -340,7 +347,15 @@ export default function CrawlerManagement() {
                 <Box sx={{ display: "flex", alignItems: "center", gap: 1, flexWrap: "wrap" }}>
                   <Chip label={taskEmbed.platform} size="small" color="primary" variant="outlined" />
                   <Typography variant="body2">
-                    爬取 <strong>{taskEmbed.crawled}</strong> 题，入库 <strong>{taskEmbed.imported}</strong> 条
+                    爬取 <strong>{taskEmbed.crawled}</strong> 题
+                    {taskEmbed.importedDetail ? (
+                      <>，入库: 题目 <strong>{taskEmbed.importedDetail.problems}</strong> 题
+                      {taskEmbed.importedDetail.solutions > 0 && <>，题解 <strong>{taskEmbed.importedDetail.solutions}</strong> 条</>}
+                      {taskEmbed.importedDetail.records > 0 && <>，提交记录 <strong>{taskEmbed.importedDetail.records}</strong> 条</>}
+                      </>
+                    ) : (
+                      <>，入库 <strong>{taskEmbed.imported}</strong> 条</>
+                    )}
                   </Typography>
                   <Typography variant="caption" color="text.secondary">
                     {taskEmbed.time}
