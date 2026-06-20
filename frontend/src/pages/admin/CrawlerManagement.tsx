@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Box from "@mui/material/Box";
 import Typography from "@mui/material/Typography";
 import Paper from "@mui/material/Paper";
@@ -74,6 +74,31 @@ export default function CrawlerManagement() {
     embedTotal: number; embedDone: number; done: boolean;
   } | null>(null);
 
+  // Batch embed (全量重建向量)
+  const [batchEmbedPending, setBatchEmbedPending] = useState(false);
+
+  async function handleBatchEmbedAll() {
+    setBatchEmbedPending(true);
+    embedLogSeen.current = 0;
+    addLog("全量向量重建：清空现有向量 → 补全摘要 → 嵌入...");
+    try {
+      const resp = await api.post("/crawler/batch-embed/all");
+      const d = resp.data as any;
+      addLog("全量向量重建任务已启动（并发=200），正在后台运行...", "success");
+      if (d.embedJobId) {
+        setEmbedJobId(d.embedJobId);
+        setEmbedProgress(null);
+      }
+    } catch (e: any) {
+      addLog(`全量向量重建启动失败: ${e.message ?? String(e)}`, "error");
+    } finally {
+      setBatchEmbedPending(false);
+    }
+  }
+
+  // Track last seen log index to avoid duplicates
+  const embedLogSeen = useRef(0);
+
   // Poll embed progress every 2s while a job is active
   useEffect(() => {
     if (!embedJobId || embedProgress?.done) return;
@@ -82,6 +107,14 @@ export default function CrawlerManagement() {
         const resp = await api.get(`/crawler/embed-progress/${embedJobId}`);
         const data = resp.data;
         setEmbedProgress({ embedTotal: data.embedTotal, embedDone: data.embedDone, done: data.done });
+
+        // Pick up new log lines from server
+        const lines: Array<{ time: string; message: string; level: string }> = data.logLines || [];
+        for (let i = embedLogSeen.current; i < lines.length; i++) {
+          addLog(lines[i].message, lines[i].level as LogEntry["level"]);
+        }
+        embedLogSeen.current = lines.length;
+
         if (data.done) {
           setEmbedJobId(null);
           addLog(`[${data.platform}] 向量嵌入完成！${data.embedDone}/${data.embedTotal} 条`, "success");
@@ -336,10 +369,22 @@ export default function CrawlerManagement() {
 
       {/* 向量嵌入状态 — 本次任务 */}
       <Paper sx={{ p: 2, mb: 3 }}>
-        <Typography variant="subtitle1" fontWeight={600} gutterBottom>
-          <StorageIcon fontSize="small" sx={{ mr: 0.5, verticalAlign: "middle" }} />
-          向量嵌入状态（RAG）
-        </Typography>
+        <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", mb: 1 }}>
+          <Typography variant="subtitle1" fontWeight={600}>
+            <StorageIcon fontSize="small" sx={{ mr: 0.5, verticalAlign: "middle" }} />
+            向量嵌入状态（RAG）
+          </Typography>
+          <Button
+            size="small"
+            variant="contained"
+            color="warning"
+            onClick={handleBatchEmbedAll}
+            disabled={batchEmbedPending}
+            startIcon={batchEmbedPending ? <CircularProgress size={14} /> : <StorageIcon />}
+          >
+            {batchEmbedPending ? "重建中..." : "全量重建向量"}
+          </Button>
+        </Box>
         {taskEmbed ? (
           <Box>
             <Grid container spacing={2} alignItems="center">

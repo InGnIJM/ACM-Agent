@@ -61,16 +61,7 @@ export interface VectorSearchRequest {
   difficultyMax?: number;
 }
 
-/** A single child-solution match returned with the parent problem */
-export interface VectorSolutionHit {
-  id: string;
-  content: string;
-  author: string | null;
-  solutionIndex: number;
-  similarity: number;
-}
-
-/** One search result row (parent problem + child solutions) */
+/** One search result row — matches problem row from ANN search on solution_summary vector */
 export interface VectorSearchResultItem {
   id: string;
   title: string;
@@ -80,7 +71,6 @@ export interface VectorSearchResultItem {
   tagsNormalized: string[];
   solutionSummary: string | null;
   similarity: number;
-  solutions: VectorSolutionHit[];
 }
 
 /** Full response from POST /api/problems/search/vector */
