@@ -150,49 +150,26 @@ describe('VectorService', () => {
   });
 
   // ====================================================================
-  // setProblemVectors
+  // setProblemVector
   // ====================================================================
 
-  describe('setProblemVectors', () => {
+  describe('setProblemVector', () => {
     it('calls $executeRaw with correct SQL', async () => {
       const id = '550e8400-e29b-41d4-a716-446655440000';
-      const pVec = [0.1, 0.2, 0.3];
-      const cVec = [0.4, 0.5, 0.6];
+      const vec = [0.1, 0.2, 0.3];
 
       mock$executeRaw.mockResolvedValueOnce(undefined);
 
-      await service.setProblemVectors(id, pVec, cVec);
+      await service.setProblemVector(id, vec);
 
       expect(mock$executeRaw).toHaveBeenCalledTimes(1);
-      // tagged template: first arg is string[] chunks
       const allSql = (mock$executeRaw.mock.calls[0][0] as string[]).join('');
       expect(allSql).toContain('UPDATE problems');
       expect(allSql).toContain('vector_embedding');
-      expect(allSql).toContain('content_vector');
-    });
-
-    it('no-ops on empty vectors', async () => {
-      await service.setProblemVectors('id', [], [0.1]);
-      await service.setProblemVectors('id', [0.1], []);
-      expect(mock$executeRaw).not.toHaveBeenCalled();
-    });
-  });
-
-  // ====================================================================
-  // setSolutionVector
-  // ====================================================================
-
-  describe('setSolutionVector', () => {
-    it('calls $executeRaw with correct SQL', async () => {
-      mock$executeRaw.mockResolvedValueOnce(undefined);
-      await service.setSolutionVector('sid', [0.1, 0.2]);
-      expect(mock$executeRaw).toHaveBeenCalledTimes(1);
-      const allSql = (mock$executeRaw.mock.calls[0][0] as string[]).join('');
-      expect(allSql).toContain('UPDATE problem_solutions');
     });
 
     it('no-ops on empty vector', async () => {
-      await service.setSolutionVector('sid', []);
+      await service.setProblemVector('id', []);
       expect(mock$executeRaw).not.toHaveBeenCalled();
     });
   });
@@ -211,7 +188,6 @@ describe('VectorService', () => {
         difficultyNormalized: 3,
         tagsNormalized: ['array', 'hash_map'],
         solutionSummary: 'Use hash map.',
-        fullContent: 'Find two numbers...',
         similarity: 0.95,
       },
     ];
@@ -254,40 +230,4 @@ describe('VectorService', () => {
     });
   });
 
-  // ====================================================================
-  // getSolutionsForProblems
-  // ====================================================================
-
-  describe('getSolutionsForProblems', () => {
-    const mockRows = [
-      {
-        id: 's1',
-        problemId: 'p1',
-        content: 'Solution text...',
-        author: 'coder',
-        solutionIndex: 1,
-        similarity: 0.88,
-      },
-    ];
-
-    it('fetches solutions with similarity', async () => {
-      mock$queryRawUnsafe.mockResolvedValueOnce(mockRows);
-      const res = await service.getSolutionsForProblems(
-        ['p1'],
-        Array(1024).fill(0.1),
-      );
-      expect(res).toHaveLength(1);
-      expect(res[0].problemId).toBe('p1');
-      expect(res[0].similarity).toBe(0.88);
-    });
-
-    it('returns empty for empty problemIds', async () => {
-      const res = await service.getSolutionsForProblems(
-        [],
-        Array(1024).fill(0.1),
-      );
-      expect(res).toEqual([]);
-      expect(mock$queryRawUnsafe).not.toHaveBeenCalled();
-    });
-  });
 });

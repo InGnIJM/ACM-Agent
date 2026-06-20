@@ -38,9 +38,8 @@ const mockPrisma = {
 } as any;
 
 const mockVectorService = {
-  embedText: jest.fn().mockResolvedValue(new Array(768).fill(0.1)),
-  setProblemVectors: jest.fn(),
-  setSolutionVector: jest.fn(),
+  embedText: jest.fn().mockResolvedValue(new Array(1024).fill(0.1)),
+  setProblemVector: jest.fn(),
 } as any;
 
 const FIXTURE_PATH = path.join(__dirname, 'fixtures', 'leetcode-two-sum-content.html');
