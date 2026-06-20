@@ -87,7 +87,7 @@ export class CrawlerController {
   @Roles('admin')
   @HttpCode(200)
   @ApiOperation({ summary: 'Trigger crawl task (problems, user, records, solutions, import)' })
-  async triggerProblemCrawl(@Body() dto: TriggerCrawlDto): Promise<{ success: boolean; platform?: string; action?: string; imported?: number; count?: number; titles?: string; embedJobId?: string | null }> {
+  async triggerProblemCrawl(@Body() dto: TriggerCrawlDto): Promise<{ success: boolean; platform?: string; action?: string; imported?: number; importedDetail?: { problems: number; solutions: number; records: number; total: number }; count?: number; titles?: string; embedJobId?: string | null }> {
     this.logger.log(`Triggering crawl: platform=${dto.platform || 'all'}, action=${dto.action}, uid=${dto.uid || 'none'}, tags=${dto.tags || 'none'}, count=${dto.count ?? 50}`);
 
     // Map platform to its crawler script
@@ -103,7 +103,7 @@ export class CrawlerController {
       try {
         const existing = await this.prisma.$queryRaw<Array<{sourceId: string}>>`
           SELECT "source_id" as "sourceId" FROM "problems"
-            WHERE "source_platform" = ${dto.platform}
+            WHERE "source_platform" = ${dto.platform}::"Platform"
               AND "deleted_at" IS NULL
         `;
         skipIds = existing.map((p) => p.sourceId);
@@ -122,9 +122,6 @@ export class CrawlerController {
       skip_ids: skipIds,
     };
 
-    // Snapshot existing files before crawl (plan B: only import new files)
-    const filesBefore = dto.platform ? this.listImportFiles(dto.platform) : new Set<string>();
-
     // Await Python execution so we can return problem names
     try {
       const result: any = await this.pythonService.execute(script, params);
@@ -137,27 +134,25 @@ export class CrawlerController {
         this.logger.log(`Fetched ${dataList.length} problems: ${titles}`);
       }
 
-      // Auto-import: only import files created by THIS crawl task (plan B)
-      let imported = 0;
+      // Auto-import: import all files in the platform directory.
+      // The Python crawler overwrites existing files, so "new file" detection
+      // by file existence does not work.  upsert handles duplicates safely.
+      let importDetail = { problems: 0, solutions: 0, records: 0, total: 0 };
       let embedJobId: string | null = null;
       if (result?.success && dto.platform) {
         try {
-          const filesAfter = this.listImportFiles(dto.platform);
-          const newFiles = new Set([...filesAfter].filter((f) => !filesBefore.has(f)));
-          this.logger.log(`Import: ${newFiles.size} new file(s) to import for ${dto.platform}`);
-
-          imported = await this.importPlatformData(dto.platform, newFiles);
-          this.logger.log(`Import completed for ${dto.platform}: ${imported} records upserted`);
+          importDetail = await this.importPlatformData(dto.platform);
+          this.logger.log(`Import completed for ${dto.platform}: ${importDetail.total} records upserted (${importDetail.problems} problems, ${importDetail.solutions} solutions, ${importDetail.records} records)`);
 
           // Only auto-summarize if DeepSeek API key is configured
           const hasApiKey = !!(process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_API_KEY !== 'sk-placeholder');
-          if (imported > 0 && hasApiKey) {
+          if (importDetail.total > 0 && hasApiKey) {
             const embedJob = await this.prisma.crawlJob.create({
               data: {
                 platform: dto.platform as any,
                 status: 'running',
                 phase: 'import_',
-                config: { type: 'embed', sourceAction: dto.action, imported },
+                config: { type: 'embed', sourceAction: dto.action, imported: importDetail.total },
                 startedAt: new Date(),
               },
             });
@@ -188,7 +183,8 @@ export class CrawlerController {
         platform: dto.platform,
         action: dto.action,
         count: dataList.length,
-        imported,
+        imported: importDetail.total,
+        importedDetail: importDetail,
         embedJobId,
         titles: titles || undefined,
       };
@@ -198,80 +194,83 @@ export class CrawlerController {
     }
   }
 
-  /** List all importable JSON file paths under a platform directory. */
-  private listImportFiles(platform: string): Set<string> {
-    const files = new Set<string>();
+  /** Read JSON files from data/raw/{platform}/{subDir}/ and upsert to database. */
+  private async importPlatformData(platform: string): Promise<{ problems: number; solutions: number; records: number; total: number }> {
     const platformDir = path.join(this.dataDir, platform);
-    if (!fs.existsSync(platformDir)) return files;
-    for (const subDir of ['problems', 'profiles', 'records', 'solutions']) {
-      const dir = path.join(platformDir, subDir);
-      if (!fs.existsSync(dir)) continue;
-      const entries = fs.readdirSync(dir).filter(
-        (f) => f.endsWith('.json') && !f.startsWith('bulk_list_') && !f.startsWith('bulk_detail_progress_'),
-      );
-      for (const f of entries) files.add(path.join(dir, f));
-    }
-    return files;
-  }
-
-  /** Read JSON files from data/raw/{platform}/{subDir}/ and upsert to database.
-   *  If `onlyFiles` is provided, only those paths are imported; otherwise all JSON files. */
-  private async importPlatformData(platform: string, onlyFiles?: Set<string>): Promise<number> {
-    const platformDir = path.join(this.dataDir, platform);
+    this.logger.log(`[IMPORT] platform=${platform} dataDir=${this.dataDir} platformDir=${platformDir}`);
     if (!fs.existsSync(platformDir)) {
-      this.logger.warn(`No data directory for platform ${platform}: ${platformDir}`);
-      return 0;
+      this.logger.warn(`[IMPORT] No data directory for platform ${platform}: ${platformDir}`);
+      return { problems: 0, solutions: 0, records: 0, total: 0 };
     }
 
-    let total = 0;
+    let problems = 0;
+    let solutions = 0;
+    let recordsCount = 0;
     const subDirs = ['problems', 'profiles', 'records', 'solutions'];
 
     for (const subDir of subDirs) {
       const dir = path.join(platformDir, subDir);
-      if (!fs.existsSync(dir)) continue;
+      if (!fs.existsSync(dir)) {
+        this.logger.log(`[IMPORT]   subDir ${subDir}: does not exist, skip`);
+        continue;
+      }
 
       const files = fs.readdirSync(dir).filter((f) => f.endsWith('.json') && !f.startsWith('bulk_list_') && !f.startsWith('bulk_detail_progress_'));
+      this.logger.log(`[IMPORT]   subDir ${subDir}: ${files.length} files`);
       if (files.length === 0) continue;
 
       for (const file of files) {
         const filePath = path.join(dir, file);
-        // If filtering, skip files not in the allowed set
-        if (onlyFiles && !onlyFiles.has(filePath)) continue;
 
         try {
           const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
           const records = Array.isArray(raw) ? raw : [raw];
+          this.logger.log(`[IMPORT]     file=${file} records=${records.length}`);
 
           // Extract sourceId from filename: {date}_{sourceId}.json
           const fileSourceId = file.replace(/^\d{4}-\d{2}-\d{2}_/, '').replace('.json', '');
 
           for (const record of records) {
             if (subDir === 'problems') {
+              const sid = platform === 'leetcode'
+                ? (record.titleSlug || record.slug || record.questionId || record.questionFrontendId)
+                : (record.source_id || record.pid || record.id);
+              this.logger.log(`[IMPORT]       upsertProblem: sourceId=${sid} title=${(record.title || record.name || '?').slice(0, 30)}`);
               await this.upsertProblem(platform, record);
-              total++;
+              problems++;
             } else if (subDir === 'records') {
               await this.upsertRecord(platform, record);
-              total++;
+              recordsCount++;
             } else if (subDir === 'solutions') {
               await this.upsertSolutions(platform, record, fileSourceId);
-              total++;
+              solutions++;
             }
           }
           // Remove processed file to avoid re-import
           fs.unlinkSync(filePath);
+          this.logger.log(`[IMPORT]     file=${file} done, deleted`);
         } catch (err: any) {
-          this.logger.warn(`Failed to import ${file}: ${err?.message || err}`);
+          this.logger.warn(`[IMPORT]     FAILED file=${file}: ${err?.message || err}`);
         }
       }
     }
 
-    return total;
+    const total = problems + solutions + recordsCount;
+    this.logger.log(`[IMPORT] DONE: problems=${problems} solutions=${solutions} records=${recordsCount} total=${total}`);
+    return { problems, solutions, records: recordsCount, total };
   }
 
   private async upsertProblem(platform: string, record: any): Promise<void> {
     // Codeforces: construct sourceId from contestId+index (e.g. "2236C")
     const cfId = record.contestId && record.index ? `${record.contestId}${record.index}` : null;
-    const sourceId = record.source_id || record.pid || record.id || cfId || record.questionId || record.questionFrontendId || record.titleSlug;
+    // LeetCode: prefer titleSlug (natural identifier, matches solution filenames)
+    let sourceId = platform === 'leetcode'
+      ? (record.titleSlug || record.slug || record.questionId || record.questionFrontendId || record.source_id || record.pid || record.id)
+      : (record.source_id || record.pid || record.id || cfId || record.titleSlug || record.questionId || record.questionFrontendId);
+    // Truncate to VARCHAR(50) limit
+    if (sourceId && sourceId.length > 50) {
+      sourceId = sourceId.slice(0, 50);
+    }
     if (!sourceId) return;
 
     const rawDifficulty = record.difficulty != null ? String(record.difficulty)
@@ -343,6 +342,7 @@ export class CrawlerController {
         tagsPlatform: tagsPlatformSafe,
         rawDetail: record,
         fullContent,
+        deletedAt: null,
       },
       update: {
         sourceUrl,
@@ -353,6 +353,7 @@ export class CrawlerController {
         tagsPlatform: tagsPlatformSafe,
         rawDetail: record,
         fullContent,
+        deletedAt: null,  // defensive: ensure re-imported records are un-deleted
       },
     });
   }
@@ -367,10 +368,26 @@ export class CrawlerController {
       // Find the problem this solution belongs to
       const sourceId = sol.problem_id || sol.pid || sourceIdHint;
       if (!sourceId) continue;
-      const problem = await this.prisma.problem.findUnique({
+      let problem = await this.prisma.problem.findUnique({
         where: { sourcePlatform_sourceId: { sourcePlatform: platform as any, sourceId: String(sourceId) } },
         select: { id: true },
       });
+      // Fallback for LeetCode: sourceIdHint is titleSlug, but problem.sourceId may be questionId
+      // or a truncated version of the slug (VARCHAR(50) limit)
+      if (!problem && platform === 'leetcode' && sourceIdHint) {
+        const allLc = await this.prisma.problem.findMany({
+          where: { sourcePlatform: 'leetcode' as any },
+          select: { id: true, rawDetail: true },
+        });
+        for (const p of allLc) {
+          const detail = (p.rawDetail || {}) as any;
+          const slug = detail.titleSlug || detail.slug || '';
+          if (slug === sourceIdHint || slug.slice(0, 50) === sourceIdHint) {
+            problem = { id: p.id };
+            break;
+          }
+        }
+      }
       if (!problem) continue;
       const solutionIndex = sol.solution_index ?? (sol.vote_count ? sol.vote_count + Date.now() % 1000 : Date.now() % 10000);
       const upserted = await this.prisma.problemSolution.upsert({
@@ -586,7 +603,7 @@ export class CrawlerController {
     let skipIds: string[] = [];
     try {
       const existingProblems = await this.prisma.$queryRaw<Array<{sourceId: string}>>`
-        SELECT "source_id" as "sourceId" FROM "problems" WHERE "source_platform" = ${platform}
+        SELECT "source_id" as "sourceId" FROM "problems" WHERE "source_platform" = ${platform}::"Platform"
       `;
       skipIds = existingProblems.map((p) => p.sourceId);
     } catch (err: any) {
@@ -633,11 +650,11 @@ export class CrawlerController {
             const imported = await this.importPlatformData(platform);
             await this.prisma.crawlJob.update({
               where: { id: job.id },
-              data: { summary: { imported } },
+              data: { summary: { imported: imported.total } },
             });
-            this.logger.log(`Auto-import done for bulk crawl ${job.id}: ${imported} records`);
+            this.logger.log(`Auto-import done for bulk crawl ${job.id}: ${imported.total} records (${imported.problems} problems, ${imported.solutions} solutions, ${imported.records} records)`);
             // Fire-and-forget: auto-summarize newly imported problems
-            if (imported > 0) {
+            if (imported.total > 0) {
               this.summarizeUnprocessed(platform, job.id)
                 .then((n) => this.logger.log(`Auto-summarize done for bulk crawl ${job.id}: ${n} problems summarized`))
                 .catch((err) => this.logger.error(`Auto-summarize failed for bulk crawl ${job.id}: ${err?.message || err}`));
@@ -1144,7 +1161,7 @@ Return a Chinese summary with these sections (2-3 sentences each):
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
       body: JSON.stringify({
-        model: 'deepseek-chat',
+        model: 'deepseek-v4-flash',
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.3,
         max_tokens: 600,
