@@ -189,7 +189,6 @@ model Problem {
   fullContent          String?                            @map("full_content") @db.Text
   solutionSummary      String?                            @map("solution_summary") @db.Text
   vectorEmbedding      Unsupported("vector(1024)")?       @map("vector_embedding")
-  contentVector        Unsupported("vector(1024)")?       @map("content_vector")
 
   createdAt            DateTime                           @default(now()) @map("created_at")
   updatedAt            DateTime                           @updatedAt @map("updated_at")
@@ -213,7 +212,6 @@ model ProblemSolution {
   content         String                        @db.Text
   author          String?                       @db.VarChar(100)
   sourceUrl       String?                       @map("source_url") @db.VarChar(500)
-  vectorEmbedding Unsupported("vector(1024)")?  @map("vector_embedding")
 
   createdAt       DateTime                      @default(now()) @map("created_at")
   updatedAt       DateTime                      @updatedAt @map("updated_at")
