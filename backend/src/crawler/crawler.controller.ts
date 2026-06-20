@@ -390,7 +390,7 @@ export class CrawlerController {
       }
       if (!problem) continue;
       const solutionIndex = sol.solution_index ?? (sol.vote_count ? sol.vote_count + Date.now() % 1000 : Date.now() % 10000);
-      const upserted = await this.prisma.problemSolution.upsert({
+      await this.prisma.problemSolution.upsert({
         where: {
           problemId_solutionIndex: { problemId: problem.id, solutionIndex: Number(solutionIndex) % 100000 },
         },
@@ -405,15 +405,7 @@ export class CrawlerController {
           author: String(author),
         },
       });
-
-      // Generate and store solution embedding (spec: 子2)
-      try {
-        const truncated = content.length > 2000 ? content.slice(0, 2000) : content;
-        const solVec = await this.vectorService.embedText(truncated);
-        await this.vectorService.setSolutionVector(upserted.id, solVec);
-      } catch (embedErr: any) {
-        this.logger.warn(`Solution embedding failed for ${sourceId}: ${embedErr?.message || embedErr}`);
-      }
+      // Note: solution vectors are no longer stored — only problem.solution_summary is vectorized.
     }
   }
 
@@ -805,20 +797,22 @@ export class CrawlerController {
   @ApiOperation({ summary: 'Get embed progress for a crawl job' })
   async getEmbedProgress(@Param('jobId') jobId: string): Promise<{
     jobId: string; platform: string; embedTotal: number; embedDone: number;
-    done: boolean; summary?: any;
+    done: boolean; summary?: any; logLines?: Array<{ time: string; message: string; level: string }>;
   }> {
     const job = await this.prisma.crawlJob.findUnique({ where: { id: jobId } });
     if (!job) throw new NotFoundException(`CrawlJob ${jobId} not found`);
 
     const embedTotal = job.embedTotal ?? 0;
     const embedDone = job.embedDone ?? 0;
+    const summary = (job.summary || {}) as any;
     return {
       jobId: job.id,
       platform: job.platform,
       embedTotal,
       embedDone,
       done: embedTotal > 0 && embedDone >= embedTotal,
-      summary: job.summary as any,
+      summary,
+      logLines: summary.logLines || [],
     };
   }
 
@@ -1012,6 +1006,44 @@ export class CrawlerController {
     return { accepted: true, platform, embedJobId: embedJob.id };
   }
 
+  @Post('batch-embed/all')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('admin')
+  @HttpCode(202)
+  @ApiOperation({ summary: 'Clear all vectors and re-summarize + re-embed ALL problems across all platforms (concurrency=40)' })
+  async batchEmbedAll(): Promise<{ accepted: boolean; embedJobId: string }> {
+    this.logger.log('Starting batch-embed/all: clear all vectors, re-summarize + re-embed all problems');
+
+    const embedJob = await this.prisma.crawlJob.create({
+      data: {
+        platform: 'luogu' as any, // dummy platform — batch spans all
+        status: 'running',
+        phase: 'import_',
+        config: { type: 'batch-embed', scope: 'all' },
+        startedAt: new Date(),
+      },
+    });
+
+    // Fire-and-forget
+    this.runBatchEmbedAll(embedJob.id)
+      .then(async (stats) => {
+        this.logger.log(`Batch-embed/all done: ${JSON.stringify(stats)}`);
+        await this.prisma.crawlJob.update({
+          where: { id: embedJob.id },
+          data: { status: 'completed', finishedAt: new Date(), summary: stats },
+        }).catch(() => {});
+      })
+      .catch(async (err) => {
+        this.logger.error(`Batch-embed/all failed: ${err?.message || err}`);
+        await this.prisma.crawlJob.update({
+          where: { id: embedJob.id },
+          data: { status: 'failed', finishedAt: new Date() },
+        }).catch(() => {});
+      });
+
+    return { accepted: true, embedJobId: embedJob.id };
+  }
+
   @Get('logs')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('admin')
@@ -1098,13 +1130,10 @@ export class CrawlerController {
               data: { solutionSummary: summary },
             });
 
-            // Generate and store vector embeddings (parent + content)
+            // Generate and store vector embedding from solution_summary only
             try {
-              const [parentVec, contentVec] = await Promise.all([
-                this.vectorService.embedText(summary),
-                this.vectorService.embedText(p.fullContent || ''),
-              ]);
-              await this.vectorService.setProblemVectors(p.id, parentVec, contentVec);
+              const vec = await this.vectorService.embedText(summary);
+              await this.vectorService.setProblemVector(p.id, vec);
             } catch (embedErr: any) {
               this.logger.warn(`Embedding failed for ${p.sourceId}: ${embedErr?.message || embedErr}`);
             }
@@ -1164,7 +1193,7 @@ Return a Chinese summary with these sections (2-3 sentences each):
         model: 'deepseek-v4-flash',
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.3,
-        max_tokens: 600,
+        max_tokens: 16384,
       }),
     });
 
@@ -1175,5 +1204,164 @@ Return a Chinese summary with these sections (2-3 sentences each):
 
     const data: any = await resp.json();
     return data?.choices?.[0]?.message?.content || null;
+  }
+
+  /**
+   * 全量批量处理：清空所有向量 → 补全摘要 → 嵌入向量
+   * 并发数 = 200（基于 worker 竞争队列）
+   */
+  private async runBatchEmbedAll(jobId: string): Promise<{
+    total: number; cleared: number; summarized: number; embedded: number; skipped: number; errors: number;
+  }> {
+    const POOL = 200;
+    const stats = { total: 0, cleared: 0, summarized: 0, embedded: 0, skipped: 0, errors: 0 };
+    const logLines: Array<{ time: string; message: string; level: string }> = [];
+
+    const flushLogs = async () => {
+      if (!jobId || logLines.length === 0) return;
+      // 只保留最近 200 条日志行，避免 JSON 膨胀
+      const recent = logLines.slice(-200);
+      await this.prisma.crawlJob.update({
+        where: { id: jobId },
+        data: { summary: { logLines: recent, stats } },
+      }).catch(() => {});
+    };
+
+    const addLine = (message: string, level: string = 'info') => {
+      const time = new Date().toISOString();
+      logLines.push({ time, message, level });
+      this.logger.log(`[batch-embed] ${message}`);
+    };
+
+    // ── Step 0: 清空所有向量 ─────────────────────────────────────
+    const clearResult: any = await this.prisma.$executeRaw`
+      UPDATE problems
+      SET vector_embedding = NULL, updated_at = NOW()
+      WHERE vector_embedding IS NOT NULL
+    `;
+    stats.cleared = clearResult;
+    addLine(`清空 ${stats.cleared} 条旧向量`);
+
+    // ── Step 1: 拉取全量题目 ─────────────────────────────────────
+    const rows: any[] = await this.prisma.$queryRaw`
+      SELECT id, source_id::text, title, full_content, solution_summary, difficulty_raw
+      FROM problems
+      WHERE deleted_at IS NULL
+      ORDER BY created_at DESC
+    `;
+    stats.total = rows.length;
+    const needSummary = rows.filter((r: any) => !r.solution_summary || String(r.solution_summary).trim().length === 0).length;
+    addLine(`共 ${stats.total} 题，需生成摘要: ${needSummary}，仅需嵌入: ${stats.total - needSummary}`);
+
+    if (stats.total === 0) {
+      if (jobId) {
+        await this.prisma.crawlJob.update({
+          where: { id: jobId },
+          data: { embedTotal: 0, embedDone: 0 },
+        }).catch(() => {});
+      }
+      return stats;
+    }
+
+    if (jobId) {
+      await this.prisma.crawlJob.update({
+        where: { id: jobId },
+        data: { embedTotal: stats.total, embedDone: 0 },
+      }).catch(() => {});
+    }
+
+    // ── Step 2: worker 竞争队列并发处理 ───────────────────────────
+    const queue = rows.slice();
+    let completed = 0;
+
+    const processOne = async (p: any): Promise<void> => {
+      let summary = p.solution_summary;
+
+      // 检查三个必要段落是否都存在、末尾是否完整结束
+      const hasAllSections = (s: string | null | undefined): boolean => {
+        if (!s || s.trim().length === 0) return false;
+        return /【核心考点】/.test(s) && /【推荐解法】/.test(s) && /【易错点】/.test(s)
+          && /[。.！!？?）)]\s*$/.test(s.trim());
+      };
+
+      // 无摘要或摘要不完整 → 重新生成摘要
+      if (!hasAllSections(summary)) {
+        try {
+          summary = await this.callDeepSeekSummarize(
+            p.title,
+            p.full_content || '',
+            p.difficulty_raw || '',
+          );
+          if (summary) {
+            await this.prisma.$executeRaw`
+              UPDATE problems
+              SET solution_summary = ${summary}, updated_at = NOW()
+              WHERE id = ${p.id}::uuid
+            `;
+            stats.summarized++;
+          }
+        } catch (err: any) {
+          stats.errors++;
+          addLine(`[ERR] summarize ${p.source_id}: ${err?.message || err}`, 'error');
+          return;
+        }
+      }
+
+      // 有摘要 → 生成向量
+      if (summary && String(summary).trim().length > 0) {
+        try {
+          const vec = await this.vectorService.embedText(String(summary));
+          await this.vectorService.setProblemVector(p.id, vec);
+          stats.embedded++;
+        } catch (err: any) {
+          stats.errors++;
+          addLine(`[ERR] embed ${p.source_id}: ${err?.message || err}`, 'error');
+          return;
+        }
+      } else {
+        stats.skipped++;
+      }
+
+      completed++;
+      if (completed % 500 === 0) {
+        addLine(
+          `${completed}/${stats.total} (${((completed / stats.total) * 100).toFixed(1)}%) — summarized=${stats.summarized} embedded=${stats.embedded} skipped=${stats.skipped} errors=${stats.errors}`,
+          'success',
+        );
+        await flushLogs();
+      }
+      if (jobId && completed % 10 === 0) {
+        await this.prisma.crawlJob.update({
+          where: { id: jobId },
+          data: { embedDone: completed },
+        }).catch(() => {});
+      }
+    };
+
+    const worker = async () => {
+      while (queue.length > 0) {
+        const item = queue.shift();
+        if (!item) break;
+        await processOne(item);
+      }
+    };
+
+    const workers = Array.from({ length: Math.min(POOL, stats.total) }, () => worker());
+    await Promise.all(workers);
+
+    // 最终更新进度 + 日志
+    addLine(
+      `完成！summarized=${stats.summarized} embedded=${stats.embedded} skipped=${stats.skipped} errors=${stats.errors}`,
+      'success',
+    );
+    if (jobId) {
+      await this.prisma.crawlJob.update({
+        where: { id: jobId },
+        data: { embedDone: completed },
+      }).catch(() => {});
+    }
+    await flushLogs();
+
+    return stats;
   }
 }
