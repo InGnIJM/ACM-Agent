@@ -1,4 +1,4 @@
-"""Problem and solution embedding via Ollama (Qwen3-Embedding-0.6B) or OpenAI."""
+"""Problem embedding via Ollama (Qwen3-Embedding-0.6B) or OpenAI."""
 
 import asyncio
 import json
@@ -9,10 +9,12 @@ import aiohttp
 
 
 class ProblemEmbedder:
-    """Embeds problems and solutions using a local Ollama server or OpenAI API.
+    """Embeds problems using a local Ollama server or OpenAI API.
 
     Default backend is Ollama (``http://localhost:11434/api/embed``).
     Set ``EMBED_BACKEND=openai`` to use OpenAI instead.
+
+    Only the ``solution_summary`` field is vectorised.
     """
 
     def __init__(
@@ -124,51 +126,21 @@ class ProblemEmbedder:
         ) from last_exc
 
     async def embed_problems(self, problems: list[dict]) -> list[dict]:
-        """Embed problems by creating a parent vector from ``solution_summary``
-        and a content vector from ``full_content``.
+        """Embed problems by creating a vector from ``solution_summary``.
 
         Each problem dict is mutated in-place by adding:
 
         - ``vector_embedding``    – embedding of ``solution_summary``
-        - ``content_vector``      – embedding of ``full_content``
         """
         if not problems:
             return problems
 
-        # Parent vectors from solution_summary
         summaries = [
             p.get("solution_summary", "") or "" for p in problems
         ]
-        parent_vectors = await self.embed_batch(summaries)
+        vectors = await self.embed_batch(summaries)
 
-        # Content vectors from full_content
-        contents = [
-            p.get("full_content", "") or "" for p in problems
-        ]
-        content_vectors = await self.embed_batch(contents)
-
-        for prob, pvec, cvec in zip(problems, parent_vectors, content_vectors):
-            prob["vector_embedding"] = pvec
-            prob["content_vector"] = cvec
+        for prob, vec in zip(problems, vectors):
+            prob["vector_embedding"] = vec
 
         return problems
-
-    async def embed_solutions(self, solutions: list[dict]) -> list[dict]:
-        """Embed solutions by vectorising their content (truncated to 2000 chars).
-
-        Each solution dict is mutated in-place by adding:
-
-        - ``vector_embedding`` – embedding of (truncated) ``content``
-        """
-        if not solutions:
-            return solutions
-
-        truncated = [
-            (s.get("content", "") or "")[:2000] for s in solutions
-        ]
-        vectors = await self.embed_batch(truncated)
-
-        for sol, vec in zip(solutions, vectors):
-            sol["vector_embedding"] = vec
-
-        return solutions

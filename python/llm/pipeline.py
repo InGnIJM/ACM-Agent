@@ -2,7 +2,7 @@
 
 Provides ProblemPipeline, the main orchestrator that takes raw ACM problems
 through the full enrichment flow: tag/difficulty normalization, LLM summarization,
-and embedding generation.  Also includes a CLI for batch processing.
+and embedding generation (solution_summary vector only).  Also includes a CLI for batch processing.
 """
 
 from __future__ import annotations
@@ -60,8 +60,7 @@ class ProblemPipeline:
 
         1. Normalize tags (deterministic, taxonomy-backed) and difficulty.
         2. Generate LLM summary (solution approach, key points, pitfalls ...).
-        3. Generate embeddings (parent vector from summary, content vector from
-           ``full_content``).
+        3. Generate embedding from ``solution_summary``.
 
         Returns a *new* enriched dict -- the input dict is not mutated.
         """
@@ -93,7 +92,7 @@ class ProblemPipeline:
         # Build a single textual summary column for the parent embedding
         problem["solution_summary"] = self._summarizer._format_summary(summary_result)
 
-        # ---- step 3: embeddings (parent + content) -------------------------
+        # ---- step 3: embedding (solution_summary vector) --------------------
         enriched_list: List[Dict[str, Any]] = await self._embedder.embed_problems(
             [problem]
         )
