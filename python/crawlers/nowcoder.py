@@ -1703,6 +1703,13 @@ def main(argv: Optional[list] = None) -> None:
                     enriched.append(prob_copy)
             result = CrawlResult(success=True, data=enriched, source=result.source)
             _save_result(crawler, result.data, "problems", str(tag) or "all")
+            # Fetch solutions for each problem
+            for prob in enriched:
+                sid = prob.get("id", "")
+                if sid:
+                    sol_result = executor.execute("fetch_solutions", str(sid))
+                    if sol_result and sol_result.success and sol_result.data:
+                        _save_result(crawler, sol_result.data, "solutions", str(sid))
 
         elif action == "fetch_records":
             uid = params.get("uid", "")
@@ -1760,7 +1767,9 @@ def _emit(
         "error": error,
         "platform": platform,
     }
-    print(json.dumps(payload, ensure_ascii=False, default=str))
+    json_str = json.dumps(payload, ensure_ascii=False, default=str)
+    sys.stdout.buffer.write((json_str + "\n").encode("utf-8"))
+    sys.stdout.buffer.flush()
 
 
 if __name__ == "__main__":

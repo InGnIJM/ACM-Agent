@@ -387,7 +387,9 @@ def main(argv: Optional[list] = None) -> None:
         )
     )
 
-    print(json.dumps(summary, ensure_ascii=False, default=str))
+    json_str = json.dumps(summary, ensure_ascii=False, default=str)
+    sys.stdout.buffer.write((json_str + "\n").encode("utf-8"))
+    sys.stdout.buffer.flush()
 
 
 if __name__ == "__main__":
