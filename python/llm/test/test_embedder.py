@@ -111,22 +111,21 @@ async def test_embed_batch_empty_list():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_embed_problems_creates_both_parent_and_content_vectors():
-    """embed_problems attaches vector_embedding and content_vector to each problem."""
+async def test_embed_problems_creates_vector_embedding():
+    """embed_problems attaches vector_embedding (from solution_summary) to each problem."""
     client = _make_mock_client()
     embedder = ProblemEmbedder(client, batch_size=10, backend="openai")
     problems = [
-        {"id": "p1", "solution_summary": "sum1", "full_content": "cont1"},
-        {"id": "p2", "solution_summary": "sum2", "full_content": "cont2"},
+        {"id": "p1", "solution_summary": "sum1"},
+        {"id": "p2", "solution_summary": "sum2"},
     ]
     result = await embedder.embed_problems(problems)
 
     assert len(result) == 2
     for p in result:
         assert "vector_embedding" in p
-        assert "content_vector" in p
+        assert "content_vector" not in p  # no longer generated
         assert len(p["vector_embedding"]) == 1536
-        assert len(p["content_vector"]) == 1536
 
 
 @pytest.mark.asyncio
@@ -140,78 +139,11 @@ async def test_embed_problems_empty_list():
 
 @pytest.mark.asyncio
 async def test_embed_problems_handles_missing_keys():
-    """embed_problems treats missing solution_summary / full_content as empty string."""
+    """embed_problems treats missing solution_summary as empty string."""
     client = _make_mock_client()
     embedder = ProblemEmbedder(client, batch_size=10, backend="openai")
-    problems = [{"id": "p1"}]  # no summary or content
+    problems = [{"id": "p1"}]  # no summary
     result = await embedder.embed_problems(problems)
     assert len(result) == 1
     assert "vector_embedding" in result[0]
-    assert "content_vector" in result[0]
-
-
-# ---------------------------------------------------------------------------
-# embed_solutions
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_embed_solutions_truncates_long_content():
-    """embed_solutions truncates content > 2000 chars before embedding."""
-    client = _make_mock_client()
-
-    # Capture what was sent to the API
-    sent_inputs: list[str] = []
-
-    async def _capture_create(*, model: str, input: list[str]) -> MagicMock:
-        sent_inputs.extend(input)
-        response = MagicMock()
-        response.data = [MagicMock(embedding=[0.1] * 1536) for _ in input]
-        return response
-
-    client.embeddings.create = _capture_create
-
-    embedder = ProblemEmbedder(client, batch_size=10, backend="openai")
-    long_text = "x" * 3000
-    solutions = [{"id": "s1", "content": long_text}]
-    result = await embedder.embed_solutions(solutions)
-
-    assert len(result) == 1
-    assert "vector_embedding" in result[0]
-    assert len(result[0]["vector_embedding"]) == 1536
-    # The text sent to the API must be truncated
-    assert sent_inputs[0] == long_text[:2000]
-    assert len(sent_inputs[0]) == 2000
-
-
-@pytest.mark.asyncio
-async def test_embed_solutions_shorter_than_2000_chars():
-    """embed_solutions does not modify content under the 2000-char limit."""
-    client = _make_mock_client()
-
-    sent_inputs: list[str] = []
-
-    async def _capture_create(*, model: str, input: list[str]) -> MagicMock:
-        sent_inputs.extend(input)
-        response = MagicMock()
-        response.data = [MagicMock(embedding=[0.1] * 1536) for _ in input]
-        return response
-
-    client.embeddings.create = _capture_create
-
-    embedder = ProblemEmbedder(client, batch_size=10, backend="openai")
-    short_text = "hello world"
-    solutions = [{"id": "s1", "content": short_text}]
-    result = await embedder.embed_solutions(solutions)
-
-    assert len(result) == 1
-    assert sent_inputs[0] == short_text
-    assert len(result[0]["vector_embedding"]) == 1536
-
-
-@pytest.mark.asyncio
-async def test_embed_solutions_empty_list():
-    """embed_solutions returns the list unchanged for empty input."""
-    client = _make_mock_client()
-    embedder = ProblemEmbedder(client, backend="openai")
-    result = await embedder.embed_solutions([])
-    assert result == []
+    assert "content_vector" not in result[0]

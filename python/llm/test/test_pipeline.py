@@ -66,7 +66,6 @@ def _make_mock_embedder() -> MagicMock:
     async def _embed_problems(problems: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         for p in problems:
             p["vector_embedding"] = [0.1] * MOCK_EMBEDDING_DIM
-            p["content_vector"] = [0.2] * MOCK_EMBEDDING_DIM
         return problems
 
     mock.embed_problems = _embed_problems
@@ -119,11 +118,10 @@ class TestProcessProblem:
         assert result["similar_problems_hint"] == MOCK_SUMMARY_RESULT["similar_problems_hint"]
         assert result["solution_summary"] == "Formatted summary text."
 
-        # Step 3: embedding vectors
+        # Step 3: embedding vector
         assert "vector_embedding" in result
         assert len(result["vector_embedding"]) == MOCK_EMBEDDING_DIM
-        assert "content_vector" in result
-        assert len(result["content_vector"]) == MOCK_EMBEDDING_DIM
+        assert "content_vector" not in result  # no longer generated
 
     @pytest.mark.asyncio
     async def test_does_not_mutate_input_dict(self):
@@ -180,7 +178,7 @@ class TestProcessProblem:
         pipeline._summarizer.summarize.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_embedder_called_with_solution_summary_and_content(self):
+    async def test_embedder_called_with_solution_summary(self):
         """embedder.embed_problems must receive the problem with solution_summary set."""
         pipeline = _make_pipeline()
 
@@ -191,7 +189,6 @@ class TestProcessProblem:
             captured.append(problems)
             for p in problems:
                 p["vector_embedding"] = [0.1] * MOCK_EMBEDDING_DIM
-                p["content_vector"] = [0.2] * MOCK_EMBEDDING_DIM
             return problems
 
         pipeline._embedder.embed_problems = _capture_embed
@@ -202,7 +199,6 @@ class TestProcessProblem:
         sent_problem = captured[0][0]
         # At this point solution_summary must exist (from _format_summary)
         assert "solution_summary" in sent_problem
-        assert "full_content" in sent_problem
 
     @pytest.mark.asyncio
     async def test_unknown_platform_uses_defaults(self):
@@ -497,7 +493,7 @@ class TestEdgeCases:
         assert result["tags_normalized"] == []
         assert result["difficulty_normalized"] == 5.0
         assert "vector_embedding" in result
-        assert "content_vector" in result
+        assert "content_vector" not in result  # no longer generated
 
     @pytest.mark.asyncio
     async def test_missing_platform_defaults_to_unknown(self):
@@ -687,7 +683,6 @@ class TestRunReEmbed:
             async def _fake_embed(problems):
                 for p in problems:
                     p["vector_embedding"] = [0.1] * 10
-                    p["content_vector"] = [0.2] * 10
                 return problems
 
             mock_instance.embed_problems = _fake_embed
@@ -705,7 +700,6 @@ class TestRunReEmbed:
             # The written problems should have embeddings attached
             written = mock_write.call_args[0][0]
             assert "vector_embedding" in written[0]
-            assert "content_vector" in written[0]
 
     @pytest.mark.asyncio
     async def test_run_re_embed_count_limit(self):
