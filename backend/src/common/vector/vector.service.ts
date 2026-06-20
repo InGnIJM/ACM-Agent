@@ -16,16 +16,6 @@ export interface ProblemSearchResult {
   difficultyNormalized: number;
   tagsNormalized: string[];
   solutionSummary: string | null;
-  fullContent: string | null;
-  similarity: number;
-}
-
-export interface SolutionSearchResult {
-  id: string;
-  problemId: string;
-  content: string;
-  author: string | null;
-  solutionIndex: number;
   similarity: number;
 }
 
@@ -103,38 +93,20 @@ export class VectorService {
   // Vector writes (raw SQL — Prisma Unsupported type)
   // ------------------------------------------------------------------
 
-  /** Write parent + content vectors for a problem. */
-  async setProblemVectors(
+  /** Write the solution_summary embedding vector for a problem. */
+  async setProblemVector(
     problemId: string,
-    parentVec: number[],
-    contentVec: number[],
-  ): Promise<void> {
-    if (!parentVec.length || !contentVec.length) return;
-
-    await this.prisma.$executeRaw`
-      UPDATE problems
-      SET vector_embedding = ${this._toVec(parentVec)}::vector,
-          content_vector   = ${this._toVec(contentVec)}::vector,
-          updated_at       = NOW()
-      WHERE id = ${problemId}::uuid
-    `;
-    this.logger.debug(`Vectors written for problem ${problemId}`);
-  }
-
-  /** Write embedding vector for a problem solution. */
-  async setSolutionVector(
-    solutionId: string,
     vec: number[],
   ): Promise<void> {
     if (!vec.length) return;
 
     await this.prisma.$executeRaw`
-      UPDATE problem_solutions
+      UPDATE problems
       SET vector_embedding = ${this._toVec(vec)}::vector,
           updated_at       = NOW()
-      WHERE id = ${solutionId}::uuid
+      WHERE id = ${problemId}::uuid
     `;
-    this.logger.debug(`Vector written for solution ${solutionId}`);
+    this.logger.debug(`Vector written for problem ${problemId}`);
   }
 
   // ------------------------------------------------------------------
@@ -142,8 +114,8 @@ export class VectorService {
   // ------------------------------------------------------------------
 
   /**
-   * Parent-vector ANN search on problems.
-   * Spec: 父向量 ANN Top-K → returns problems with cosine similarity.
+   * ANN search on problems.vector_embedding (solution_summary vector).
+   * Returns problems ranked by cosine similarity.
    */
   async searchProblems(
     queryVec: number[],
@@ -189,7 +161,6 @@ export class VectorService {
              p.difficulty_normalized  AS "difficultyNormalized",
              p.tags_normalized        AS "tagsNormalized",
              p.solution_summary       AS "solutionSummary",
-             p.full_content           AS "fullContent",
              1 - (p.vector_embedding <=> $1::vector) AS similarity
       FROM problems p
       WHERE 1=1
@@ -200,52 +171,11 @@ export class VectorService {
     params.push(String(topK));
 
     // Wrap SET + SELECT in a transaction so they share the same connection
-    // (Prisma connection pool may otherwise route them to different connections)
     const rows: any[] = await this.prisma.$transaction([
       this.prisma.$executeRawUnsafe('SET LOCAL ivfflat.probes = 10'),
       this.prisma.$queryRawUnsafe(sql, ...params),
     ]).then(([, selectResult]) => selectResult as any[]);
     return rows.map(this._mapProblemRow);
-  }
-
-  /**
-   * Fetch child-solution vectors associated with the parent problems
-   * returned by `searchProblems`.  Spec: 子2 关联返回.
-   */
-  async getSolutionsForProblems(
-    problemIds: string[],
-    queryVec: number[],
-  ): Promise<SolutionSearchResult[]> {
-    if (!problemIds.length) return [];
-
-    const sql = `
-      SELECT ps.id,
-             ps.problem_id::text       AS "problemId",
-             ps.content,
-             ps.author,
-             ps.solution_index         AS "solutionIndex",
-             1 - (ps.vector_embedding <=> $1::vector) AS similarity
-      FROM problem_solutions ps
-      WHERE ps.deleted_at IS NULL
-        AND ps.vector_embedding IS NOT NULL
-        AND ps.problem_id = ANY($2::uuid[])
-      ORDER BY ps.vector_embedding <=> $1::vector
-      LIMIT 50
-    `;
-
-    const rows: any[] = await this.prisma.$queryRawUnsafe(
-      sql,
-      this._toVec(queryVec),
-      problemIds,
-    );
-    return rows.map((r) => ({
-      id: r.id,
-      problemId: r.problemId,
-      content: r.content,
-      author: r.author,
-      solutionIndex: r.solutionIndex,
-      similarity: Number(r.similarity),
-    }));
   }
 
   // ------------------------------------------------------------------
@@ -266,7 +196,6 @@ export class VectorService {
       difficultyNormalized: Number(r.difficultyNormalized),
       tagsNormalized: r.tagsNormalized || [],
       solutionSummary: r.solutionSummary,
-      fullContent: r.fullContent,
       similarity: Number(r.similarity),
     };
   }

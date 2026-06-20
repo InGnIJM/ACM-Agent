@@ -72,7 +72,7 @@ export class ProblemService {
     return similar;
   }
 
-  /** Semantic vector search with optional filters. */
+  /** Semantic vector search — embeds query, ANN searches problems by solution_summary vector. */
   async searchByVector(dto: {
     query: string;
     topK?: number;
@@ -92,19 +92,6 @@ export class ProblemService {
 
     const problems = await this.vectorService.searchProblems(queryVec, topK, filters);
 
-    // Fetch child solutions for matching problems
-    const problemIds = problems.map((p) => p.id);
-    const solutions = problemIds.length > 0
-      ? await this.vectorService.getSolutionsForProblems(problemIds, queryVec)
-      : [];
-
-    const solutionMap = new Map<string, typeof solutions>();
-    for (const s of solutions) {
-      const list = solutionMap.get(s.problemId) || [];
-      list.push(s);
-      solutionMap.set(s.problemId, list);
-    }
-
     const results = problems.map((p) => ({
       id: p.id,
       title: p.title,
@@ -114,13 +101,6 @@ export class ProblemService {
       tagsNormalized: p.tagsNormalized,
       solutionSummary: p.solutionSummary,
       similarity: p.similarity,
-      solutions: (solutionMap.get(p.id) || []).map((s) => ({
-        id: s.id,
-        content: s.content,
-        author: s.author,
-        solutionIndex: s.solutionIndex,
-        similarity: s.similarity,
-      })),
     }));
 
     return { query, results, total: results.length };
