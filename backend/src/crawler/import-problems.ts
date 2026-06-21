@@ -271,9 +271,14 @@ async function importOne(platform: string, filePath: string): Promise<boolean> {
 
   // Determine sourceId
   const cfId = record.contestId && record.index ? `${record.contestId}${record.index}` : null;
-  const sourceId =
-    record.source_id || record.pid || record.id || cfId ||
-    record.questionId || record.questionFrontendId || record.titleSlug;
+  let sourceId =
+    platform === 'leetcode'
+      ? (record.titleSlug || record.slug || record.questionId || record.questionFrontendId || record.source_id || record.pid || record.id)
+      : (record.source_id || record.pid || record.id || cfId || record.titleSlug || record.questionId || record.questionFrontendId);
+  // Truncate to VARCHAR(50) limit
+  if (sourceId && sourceId.length > 50) {
+    sourceId = sourceId.slice(0, 50);
+  }
   if (!sourceId) {
     console.log(`  SKIP ${path.basename(filePath)}: no sourceId`);
     return false;
@@ -320,6 +325,7 @@ async function importOne(platform: string, filePath: string): Promise<boolean> {
       tagsPlatform: tagsPlatformSafe,
       rawDetail: record,
       fullContent,
+      deletedAt: null,
     },
     update: {
       sourceUrl,
@@ -330,6 +336,7 @@ async function importOne(platform: string, filePath: string): Promise<boolean> {
       tagsPlatform: tagsPlatformSafe,
       rawDetail: record,
       fullContent,
+      deletedAt: null,  // defensive: ensure re-imported records are un-deleted
     },
   });
 
