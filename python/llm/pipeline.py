@@ -280,6 +280,38 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_deepseek_config() -> Optional[Dict[str, str]]:
+    """解析 DeepSeek API 配置。
+
+    环境变量：
+      DEEPSEEK_API_KEY    — API Key（必填）
+      DEEPSEEK_PROVIDER   — "aliyun"（阿里云百炼）/ "deepseek"（官方，默认）
+      DEEPSEEK_BASE_URL   — 覆盖默认 base URL（可选）
+      DEEPSEEK_MODEL      — 模型名（默认 deepseek-v4-flash）
+    """
+    import os
+
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not api_key or api_key == "sk-placeholder":
+        return None
+
+    provider = os.environ.get("DEEPSEEK_PROVIDER", "deepseek").strip().lower()
+    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
+
+    base_url = os.environ.get("DEEPSEEK_BASE_URL", "")
+    if not base_url:
+        base_url = (
+            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            if provider == "aliyun"
+            else "https://api.deepseek.com/v1"
+        )
+    # 向后兼容：旧配置无 /v1 后缀自动追加
+    if not base_url.endswith("/v1") and not base_url.endswith("/v2") and "/compatible-mode/" not in base_url:
+        base_url = base_url.rstrip("/") + "/v1"
+
+    return {"api_key": api_key, "base_url": base_url, "model": model}
+
+
 async def main_async(argv: Optional[List[str]] = None) -> None:
     """Async CLI entry point."""
     args = parse_args(argv)
@@ -291,10 +323,14 @@ async def main_async(argv: Optional[List[str]] = None) -> None:
     base_dir = _project_root()
 
     if args.action == "process":
+        deepseek_config = _resolve_deepseek_config()
+        if not deepseek_config:
+            print("错误: 未配置 DeepSeek API Key（请设置 DEEPSEEK_API_KEY）")
+            return
         llm = ChatOpenAI(
-            model="deepseek-chat",
-            base_url="https://api.deepseek.com/v1",
-            api_key="placeholder",  # resolved from env
+            model=deepseek_config["model"],
+            base_url=deepseek_config["base_url"],
+            api_key=deepseek_config["api_key"],
         )
         openai_client = None  # Ollama is default now
         db = None

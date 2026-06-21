@@ -720,7 +720,11 @@ def main(argv: Optional[list] = None) -> None:
                 if raw_count > 0:
                     _log(f"[CRAWL] First 5 API slugs: {[p.get('titleSlug') for p in result.data[:5]]}")
 
-                new_items = [p for p in result.data if p.get('titleSlug') not in skip_ids and str(p.get('frontendQuestionId', '')) not in skip_ids]
+                new_items = [p for p in result.data if (
+                    p.get('titleSlug') not in skip_ids
+                    and p.get('titleSlug', '')[:50] not in skip_ids  # DB VARCHAR(50) truncation
+                    and str(p.get('frontendQuestionId', '')) not in skip_ids
+                )]
                 _log(f"[CRAWL] After skip_ids filter: {len(new_items)} problems")
                 new_items = new_items[:count]
                 _log(f"[CRAWL] After count limit: {len(new_items)} problems")

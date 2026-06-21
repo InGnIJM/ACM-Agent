@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from crawlers.base import BaseCrawler, CrawlResult, CrawlerExecutor, RateLimiter
 from crawlers.codeforces import CodeforcesCrawler
-from crawlers.leetcode import LeetCodeCrawler
+from crawlers.leetcode import LeetCodeCrawler, _PROBLEMSET_QUERY as _LC_PROBLEMSET_QUERY
 from crawlers.luogu import LuoguCrawler
 from crawlers.nowcoder import NowCoderCrawler
 
@@ -263,14 +263,15 @@ class BulkCrawler:
             if not isinstance(data, dict):
                 break
 
-            problems = data.get("problems", {}).get("result", [])
+            problems = data.get("problems", [])
             if not problems:
                 break
 
             # Filter out already-imported problems
+            # pid may be truncated in DB (VARCHAR(50)), check both full and [:50]
             for p in problems:
                 pid = p.get("pid", "")
-                if pid not in skip_ids:
+                if pid not in skip_ids and pid[:50] not in skip_ids:
                     all_problems.append(p)
 
             # Track page timing
@@ -309,16 +310,162 @@ class BulkCrawler:
         logger.info("List phase complete: %d problems collected", len(all_problems))
         return all_problems
 
+    # ── _fetch_list_page (platform-dispatch) ─────────────────────
+
     def _fetch_list_page(self, tag: Optional[str], page: int) -> CrawlResult:
         """Fetch a single page of the problem list.
 
-        Directly calls LuoguCrawler._get_json for paginated access.
-        If *tag* is None/empty, fetches all problem types.
+        Dispatches to platform-specific logic and returns a **normalized**
+        ``CrawlResult`` whose ``data["problems"]`` is a flat list of dicts,
+        each containing at minimum a ``pid`` field.
         """
-        kwargs = {"page": str(page)}
+        if self.platform == "luogu":
+            return self._fetch_list_page_luogu(tag, page)
+        if self.platform == "leetcode":
+            return self._fetch_list_page_leetcode(tag, page)
+        if self.platform == "codeforces":
+            return self._fetch_list_page_codeforces(tag, page)
+        if self.platform == "nowcoder":
+            return self._fetch_list_page_nowcoder(tag, page)
+        return CrawlResult(
+            success=False,
+            error=f"List phase not implemented for platform '{self.platform}'",
+            source="http",
+        )
+
+    # ── _fetch_list_page_Luogu ────────────────────────────────────
+
+    def _fetch_list_page_luogu(
+        self, tag: Optional[str], page: int
+    ) -> CrawlResult:
+        kwargs: Dict[str, str] = {"page": str(page)}
         if tag:
             kwargs["type"] = tag
-        return self.crawler._get_json("/problem/list", **kwargs)
+        result = self.crawler._get_json("/problem/list", **kwargs)
+        if not result.success:
+            return result
+        data = result.data
+        if not isinstance(data, dict):
+            return CrawlResult(
+                success=False, error="Unexpected Luogu response format",
+                source="http",
+            )
+        problems = data.get("problems", {}).get("result", [])
+        return CrawlResult(
+            success=True,
+            data={"problems": problems},
+            source=result.source,
+            retry_count=result.retry_count,
+        )
+
+    # ── _fetch_list_page_LeetCode ─────────────────────────────────
+
+    def _fetch_list_page_leetcode(
+        self, tag: Optional[str], page: int
+    ) -> CrawlResult:
+        page_size = 20
+        variables: Dict[str, Any] = {
+            "categorySlug": "",
+            "limit": page_size,
+            "skip": (page - 1) * page_size,
+            "filters": {},
+        }
+        if tag:
+            variables["filters"] = {"tags": [tag]}
+
+        result = self.crawler._graphql(_LC_PROBLEMSET_QUERY, variables=variables)
+        if not result.success:
+            return result
+        data = result.data
+        if not isinstance(data, dict):
+            return CrawlResult(
+                success=False, error="Unexpected LeetCode GraphQL response",
+                source="http",
+            )
+        pql = data.get("problemsetQuestionList", {})
+        questions = pql.get("questions", []) if isinstance(pql, dict) else []
+
+        # Normalize: use titleSlug as pid (the source_id for detail/solutions)
+        normalized: List[Dict[str, Any]] = []
+        for q in questions:
+            normalized.append({
+                "pid": q.get("titleSlug", ""),
+                "frontendQuestionId": q.get("frontendQuestionId", ""),
+                "title": q.get("title", ""),
+                "titleSlug": q.get("titleSlug", ""),
+                "difficulty": q.get("difficulty", ""),
+                "acRate": q.get("acRate", 0),
+                "paidOnly": q.get("paidOnly", False),
+                "topicTags": q.get("topicTags", []),
+                "status": q.get("status"),
+            })
+        return CrawlResult(
+            success=True,
+            data={"problems": normalized},
+            source="http",
+            retry_count=result.retry_count,
+        )
+
+    # ── _fetch_list_page_Codeforces ────────────────────────────────
+
+    def _fetch_list_page_codeforces(
+        self, tag: Optional[str], page: int
+    ) -> CrawlResult:
+        # CF API returns all problems at once — only fetch on page 1.
+        if page > 1:
+            return CrawlResult(
+                success=True, data={"problems": []}, source="http",
+            )
+        params: Dict[str, str] = {}
+        if tag:
+            params["tags"] = tag
+        result = self.crawler._api("problemset.problems", **params)
+        if not result.success:
+            return result
+        data = result.data
+        if not isinstance(data, dict):
+            return CrawlResult(
+                success=False, error="Unexpected Codeforces API response",
+                source="http",
+            )
+        raw_problems = data.get("problems", [])
+        # Normalize: pid = "{contestId}{index}" (e.g. "1742E")
+        normalized: List[Dict[str, Any]] = []
+        for p in raw_problems:
+            cid = p.get("contestId", 0)
+            idx = p.get("index", "")
+            pid = f"{cid}{idx}" if cid and idx else ""
+            normalized.append({**p, "pid": pid})
+        return CrawlResult(
+            success=True,
+            data={"problems": normalized},
+            source=result.source,
+            retry_count=result.retry_count,
+        )
+
+    # ── _fetch_list_page_NowCoder ──────────────────────────────────
+
+    def _fetch_list_page_nowcoder(
+        self, tag: Optional[str], page: int
+    ) -> CrawlResult:
+        # fetch_problems_by_tag supports page param, 50 per page.
+        result = self.crawler.fetch_problems_by_tag(
+            tag or "", count=50, page=page,
+        )
+        if not result.success:
+            return result
+        problems = result.data if isinstance(result.data, list) else []
+        # Normalize: ensure pid field exists
+        normalized: List[Dict[str, Any]] = []
+        for p in problems:
+            pid = p.get("problemId") or p.get("pid") or str(p.get("id", ""))
+            normalized.append({**p, "pid": str(pid)})
+        return CrawlResult(
+            success=True,
+            data={"problems": normalized},
+            source=result.source,
+            retry_count=result.retry_count,
+        )
 
     # ── Phase 2: DETAIL ────────────────────────────────────────
 
