@@ -6,6 +6,7 @@ All GraphQL calls are mocked via _graphql so no real network calls are made.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -21,6 +22,9 @@ from crawlers.leetcode import (
     _RECENT_AC_SUBMISSIONS_QUERY,
     _PROBLEM_QUERY,
     _PROBLEMSET_QUERY,
+    _SOLUTIONS_QUERY,
+    _OFFICIAL_SOLUTION_QUERY,
+    main as leetcode_main,
 )
 
 
@@ -1062,3 +1066,728 @@ class TestLeetCodeGraphQLMethod:
         assert result.success
         call_json = c._session.post.call_args[1]["json"]
         assert call_json["variables"] == {}
+
+
+# ──────────────────────────────────────────────
+# fetch_solutions
+# ──────────────────────────────────────────────
+
+class TestLeetCodeFetchSolutions:
+    """Tests for LeetCodeCrawler.fetch_solutions."""
+
+    def test_fetches_community_and_official_solutions(self) -> None:
+        """fetch_solutions makes two GraphQL calls: community + official."""
+        c = _mock_crawler()
+
+        call_count = 0
+
+        def _side_effect(_query, variables=None, retry_count=0):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Community solutions response (new questionSolutionArticles format)
+                return _crawl_ok({
+                    "questionSolutionArticles": {
+                        "totalNum": 2,
+                        "edges": [
+                            {
+                                "node": {
+                                    "title": "暴力解法",
+                                    "slug": "bao-li-jie-fa",
+                                    "content": "<p>用双重循环遍历</p>",
+                                    "author": {"username": "user1"},
+                                    "upvoteCount": 42,
+                                }
+                            },
+                            {
+                                "node": {
+                                    "title": "哈希表优化",
+                                    "slug": "ha-xi-biao-you-hua",
+                                    "content": "<p>用哈希表存储已遍历元素</p>",
+                                    "author": {"username": "user2"},
+                                    "upvoteCount": 88,
+                                }
+                            },
+                        ],
+                    }
+                })
+            else:
+                # Official solution response
+                return _crawl_ok({
+                    "question": {
+                        "solution": {
+                            "title": "官方题解",
+                            "content": "<p>推荐使用哈希表，时间复杂度O(n)</p>",
+                        }
+                    }
+                })
+
+        c._graphql.side_effect = _side_effect
+
+        result = c.fetch_solutions("two-sum", first=10)
+
+        assert result.success
+        assert len(result.data) == 3  # 2 community + 1 official
+
+        # Community solutions
+        assert result.data[0]["author"] == "user1"
+        assert result.data[0]["title"] == "暴力解法"
+        assert result.data[0]["vote_count"] == 42
+        assert result.data[0]["is_official"] is False
+        assert result.data[0]["solution_id"] == "bao-li-jie-fa"
+
+        assert result.data[1]["author"] == "user2"
+        assert result.data[1]["vote_count"] == 88
+
+        # Official solution
+        assert result.data[2]["author"] == "LeetCode官方"
+        assert result.data[2]["title"] == "官方题解"
+        assert result.data[2]["is_official"] is True
+        assert result.data[2]["solution_id"] == "official"
+
+        # Verify two GraphQL calls were made
+        assert call_count == 2
+
+    def test_community_solutions_failure_still_tries_official(self) -> None:
+        """When community solutions fail, still attempt official solution."""
+        c = _mock_crawler()
+
+        call_count = 0
+
+        def _side_effect(_query, variables=None, retry_count=0):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return CrawlResult(success=False, error="GraphQL error", source="http")
+            else:
+                return _crawl_ok({
+                    "question": {
+                        "solution": {
+                            "title": "官方题解",
+                            "content": "<p>官方解法</p>",
+                        }
+                    }
+                })
+
+        c._graphql.side_effect = _side_effect
+
+        result = c.fetch_solutions("two-sum")
+
+        assert result.success
+        assert len(result.data) == 1  # only official
+        assert result.data[0]["is_official"] is True
+        assert call_count == 2
+
+    def test_official_solution_empty_skipped(self) -> None:
+        """When official solution has no content, it is not added."""
+        c = _mock_crawler()
+
+        call_count = 0
+
+        def _side_effect(_query, variables=None, retry_count=0):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _crawl_ok({
+                    "questionSolutionArticles": {
+                        "totalNum": 1,
+                        "edges": [
+                            {
+                                "node": {
+                                    "title": "社区题解",
+                                    "slug": "she-qu-ti-jie",
+                                    "content": "<p>内容</p>",
+                                    "author": {"username": "u1"},
+                                    "upvoteCount": 10,
+                                }
+                            }
+                        ],
+                    }
+                })
+            else:
+                return _crawl_ok({
+                    "question": {
+                        "solution": None  # No official solution
+                    }
+                })
+
+        c._graphql.side_effect = _side_effect
+
+        result = c.fetch_solutions("two-sum")
+
+        assert result.success
+        assert len(result.data) == 1  # only community
+        assert result.data[0]["is_official"] is False
+
+    def test_no_solutions_found_returns_error(self) -> None:
+        """When both community and official have no solutions, return error."""
+        c = _mock_crawler()
+
+        call_count = 0
+
+        def _side_effect(_query, variables=None, retry_count=0):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _crawl_ok({
+                    "questionSolutionArticles": {
+                        "totalNum": 0,
+                        "edges": [],
+                    }
+                })
+            else:
+                return _crawl_ok({
+                    "question": {
+                        "solution": None
+                    }
+                })
+
+        c._graphql.side_effect = _side_effect
+
+        result = c.fetch_solutions("two-sum")
+
+        assert not result.success
+        assert "No solutions found" in (result.error or "")
+
+    def test_community_data_is_not_dict(self) -> None:
+        """Gracefully handle non-dict community solutions data."""
+        c = _mock_crawler()
+
+        call_count = 0
+
+        def _side_effect(_query, variables=None, retry_count=0):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _crawl_ok(["unexpected", "list"])
+            else:
+                return _crawl_ok({
+                    "question": {
+                        "solution": {"title": "官方", "content": "<p>解</p>"}
+                    }
+                })
+
+        c._graphql.side_effect = _side_effect
+
+        result = c.fetch_solutions("two-sum")
+
+        assert result.success
+        assert len(result.data) == 1  # only official
+        assert result.data[0]["is_official"] is True
+
+    def test_solution_with_missing_author_fields(self) -> None:
+        """Solutions with missing author fields use defaults."""
+        c = _mock_crawler()
+
+        def _side_effect(_query, variables=None, retry_count=0):
+            return _crawl_ok({
+                "questionSolutionArticles": {
+                    "totalNum": 1,
+                    "edges": [
+                        {
+                            "node": {
+                                "title": "",
+                                "slug": "sol-minimal",
+                                "content": "<p>minimal</p>",
+                                "author": None,
+                                "upvoteCount": 0,
+                            }
+                        }
+                    ],
+                }
+            })
+
+        c._graphql.side_effect = _side_effect
+
+        result = c.fetch_solutions("two-sum")
+
+        # One community solution, no official (second call returns same data
+        # but _OFFICIAL_SOLUTION_QUERY path checks data.get("question") → None)
+        assert result.success
+        assert len(result.data) >= 1
+        community = [s for s in result.data if not s["is_official"]]
+        assert len(community) >= 1
+        assert community[0]["author"] == "匿名"  # default when author is None
+        assert community[0]["vote_count"] == 0
+
+    def test_sends_correct_variables(self) -> None:
+        """Verify the GraphQL calls use correct variables."""
+        c = _mock_crawler()
+
+        c._graphql.side_effect = lambda query, variables=None, retry_count=0: _crawl_ok({
+            "questionSolutionArticles": {"totalNum": 0, "edges": []},
+        })
+
+        c.fetch_solutions("two-sum", first=15)
+
+        assert c._graphql.call_count == 2
+
+        # First call: community solutions
+        call_0_args, call_0_kwargs = c._graphql.call_args_list[0]
+        assert call_0_args[0] == _SOLUTIONS_QUERY
+        assert call_0_kwargs["variables"] == {
+            "questionSlug": "two-sum",
+            "skip": 0,
+            "first": 15,
+        }
+
+        # Second call: official solution
+        call_1_args, call_1_kwargs = c._graphql.call_args_list[1]
+        assert call_1_args[0] == _OFFICIAL_SOLUTION_QUERY
+        assert call_1_kwargs["variables"] == {"titleSlug": "two-sum"}
+
+    # ── error propagation tests ──────────────────────────────────
+
+    def test_both_graphql_calls_fail_propagates_errors(self) -> None:
+        """When BOTH community and official GraphQL calls fail, the error
+        message includes the actual underlying errors (e.g. 'connection reset'),
+        NOT the generic 'No solutions found'."""
+        c = _mock_crawler()
+
+        c._graphql.side_effect = [
+            CrawlResult(success=False, error="connection reset", source="http"),
+            CrawlResult(success=False, error="HTTP 500", source="http"),
+        ]
+
+        result = c.fetch_solutions("two-sum")
+
+        assert not result.success
+        assert "connection reset" in (result.error or "")
+        assert "HTTP 500" in (result.error or "")
+
+    def test_one_call_fails_other_empty_propagates_error(self) -> None:
+        """When one GraphQL call fails and the other returns empty data
+        (no solutions), the error message propagates the actual failure
+        reason, not 'No solutions found'."""
+        c = _mock_crawler()
+
+        c._graphql.side_effect = [
+            CrawlResult(success=False, error="connection reset", source="http"),
+            _crawl_ok({"question": {"solution": None}}),  # official: empty
+        ]
+
+        result = c.fetch_solutions("two-sum")
+
+        assert not result.success
+        assert "connection reset" in (result.error or "")
+
+    def test_api_returns_empty_data_no_solutions_found(self) -> None:
+        """When the API returns success but with empty data (no errors,
+        just no solutions), the error remains 'No solutions found'
+        (unchanged behavior)."""
+        c = _mock_crawler()
+
+        c._graphql.side_effect = [
+            _crawl_ok({"questionSolutionArticles": {"totalNum": 0, "edges": []}}),
+            _crawl_ok({"question": {"solution": None}}),
+        ]
+
+        result = c.fetch_solutions("two-sum")
+
+        assert not result.success
+        assert "No solutions found" in (result.error or "")
+
+
+# ──────────────────────────────────────────────
+# main() — fetch_problems now chains fetch_solutions
+# ──────────────────────────────────────────────
+
+class TestLeetCodeMainFetchProblems:
+    """Tests for main() with fetch_problems action — verifies solutions are fetched."""
+
+    def test_fetch_problems_calls_fetch_solutions_for_each_problem(self) -> None:
+        """When action=fetch_problems, fetch_solutions is called for each enriched problem."""
+        from unittest.mock import patch, MagicMock
+
+        tag = "array"
+        count = 2
+        params = {
+            "action": "fetch_problems",
+            "tags": tag,
+            "count": count,
+            "skip_ids": [],
+        }
+
+        # Mock problem list
+        problem_list = [
+            {"titleSlug": "two-sum", "title": "Two Sum", "id": "1"},
+            {"titleSlug": "add-two-numbers", "title": "Add Two Numbers", "id": "2"},
+        ]
+
+        # Mock problem detail
+        detail_1 = {"titleSlug": "two-sum", "title": "两数之和", "difficulty": "Easy", "content": "<p>test</p>"}
+        detail_2 = {"titleSlug": "add-two-numbers", "title": "两数相加", "difficulty": "Medium", "content": "<p>test2</p>"}
+
+        # Mock solutions
+        solutions_1 = [
+            {"author": "user1", "title": "题解1", "content": "<p>sol1</p>", "vote_count": 10, "is_official": False, "solution_id": "s1"},
+        ]
+        solutions_2 = [
+            {"author": "user2", "title": "题解2", "content": "<p>sol2</p>", "vote_count": 20, "is_official": False, "solution_id": "s2"},
+        ]
+
+        with patch("crawlers.leetcode.LeetCodeCrawler") as MockCrawler, \
+             patch("crawlers.leetcode.CrawlerExecutor") as MockExecutor, \
+             patch("crawlers.leetcode._save_result") as mock_save, \
+             patch("crawlers.leetcode._emit") as mock_emit:
+
+            mock_crawler_instance = MagicMock()
+            mock_crawler_instance.PLATFORM = "leetcode"
+            MockCrawler.return_value = mock_crawler_instance
+
+            mock_executor_instance = MagicMock()
+            MockExecutor.return_value = mock_executor_instance
+
+            # Simulate execute() calls in order:
+            # 1. fetch_problems_by_tag → problem list
+            # 2. fetch_problem("two-sum") → detail_1
+            # 3. fetch_problem("add-two-numbers") → detail_2
+            # 4. fetch_solutions("two-sum", 10) → solutions_1
+            # 5. fetch_solutions("add-two-numbers", 10) → solutions_2
+            execute_results = [
+                CrawlResult(success=True, data=problem_list, source="http"),          # fetch_problems_by_tag
+                CrawlResult(success=True, data=detail_1, source="http"),              # fetch_problem two-sum
+                CrawlResult(success=True, data=detail_2, source="http"),              # fetch_problem add-two-numbers
+                CrawlResult(success=True, data=solutions_1, source="http"),           # fetch_solutions two-sum
+                CrawlResult(success=True, data=solutions_2, source="http"),           # fetch_solutions add-two-numbers
+            ]
+            mock_executor_instance.execute.side_effect = execute_results
+
+            leetcode_main(["--input", json.dumps(params)])
+
+            # Verify executor.execute was called with correct methods
+            calls = mock_executor_instance.execute.call_args_list
+            method_names = [c[0][0] for c in calls]
+
+            assert "fetch_problems_by_tag" in method_names
+            assert method_names.count("fetch_problem") == 2
+            assert method_names.count("fetch_solutions") == 2  # <-- the key assertion
+
+            # Verify solutions were saved to "solutions" subdirectory
+            save_calls = [(c[0][2], c[0][3]) for c in mock_save.call_args_list]  # (sub_dir, label)
+            solutions_saves = [(sub, label) for (sub, label) in save_calls if sub == "solutions"]
+            assert len(solutions_saves) == 2
+            assert solutions_saves[0][1] == "two-sum"
+            assert solutions_saves[1][1] == "add-two-numbers"
+
+            # Verify problems were saved to "problems" subdirectory
+            problems_saves = [(sub, label) for (sub, label) in save_calls if sub == "problems"]
+            assert len(problems_saves) == 1
+
+    def test_fetch_problems_skip_solutions_when_no_slug(self) -> None:
+        """Problems without titleSlug/slug skip solutions fetching."""
+        from unittest.mock import patch, MagicMock
+
+        params = {
+            "action": "fetch_problems",
+            "tags": "array",
+            "count": 1,
+            "skip_ids": [],
+        }
+
+        problem_list = [
+            {"titleSlug": "", "slug": "", "title": "No Slug", "id": "1"},
+        ]
+
+        with patch("crawlers.leetcode.LeetCodeCrawler") as MockCrawler, \
+             patch("crawlers.leetcode.CrawlerExecutor") as MockExecutor, \
+             patch("crawlers.leetcode._save_result") as mock_save, \
+             patch("crawlers.leetcode._emit") as mock_emit:
+
+            mock_crawler_instance = MagicMock()
+            mock_crawler_instance.PLATFORM = "leetcode"
+            MockCrawler.return_value = mock_crawler_instance
+
+            mock_executor_instance = MagicMock()
+            MockExecutor.return_value = mock_executor_instance
+
+            execute_results = [
+                CrawlResult(success=True, data=problem_list, source="http"),
+            ]
+            mock_executor_instance.execute.side_effect = execute_results
+
+            leetcode_main(["--input", json.dumps(params)])
+
+            # fetch_solutions should NOT be called (no slug)
+            method_names = [c[0][0] for c in mock_executor_instance.execute.call_args_list]
+            assert "fetch_solutions" not in method_names
+
+    def test_fetch_problems_solutions_failure_does_not_break_flow(self) -> None:
+        """When fetch_solutions fails for a problem, other problems still get solutions."""
+        from unittest.mock import patch, MagicMock
+
+        params = {
+            "action": "fetch_problems",
+            "tags": "array",
+            "count": 2,
+            "skip_ids": [],
+        }
+
+        problem_list = [
+            {"titleSlug": "two-sum", "title": "Two Sum", "id": "1"},
+            {"titleSlug": "three-sum", "title": "3Sum", "id": "2"},
+        ]
+
+        detail_1 = {"titleSlug": "two-sum", "title": "两数之和", "difficulty": "Easy", "content": "<p>test</p>"}
+        detail_2 = {"titleSlug": "three-sum", "title": "三数之和", "difficulty": "Medium", "content": "<p>test2</p>"}
+
+        solutions_2 = [
+            {"author": "u2", "title": "题解", "content": "<p>sol</p>", "vote_count": 5, "is_official": False, "solution_id": "s2"},
+        ]
+
+        with patch("crawlers.leetcode.LeetCodeCrawler") as MockCrawler, \
+             patch("crawlers.leetcode.CrawlerExecutor") as MockExecutor, \
+             patch("crawlers.leetcode._save_result") as mock_save, \
+             patch("crawlers.leetcode._emit") as mock_emit:
+
+            mock_crawler_instance = MagicMock()
+            mock_crawler_instance.PLATFORM = "leetcode"
+            MockCrawler.return_value = mock_crawler_instance
+
+            mock_executor_instance = MagicMock()
+            MockExecutor.return_value = mock_executor_instance
+
+            execute_results = [
+                CrawlResult(success=True, data=problem_list, source="http"),
+                CrawlResult(success=True, data=detail_1, source="http"),
+                CrawlResult(success=True, data=detail_2, source="http"),
+                CrawlResult(success=False, error="No solutions found", source="http"),  # two-sum fails
+                CrawlResult(success=True, data=solutions_2, source="http"),              # three-sum succeeds
+            ]
+            mock_executor_instance.execute.side_effect = execute_results
+
+            leetcode_main(["--input", json.dumps(params)])
+
+            # Both fetch_solutions were called
+            sol_calls = [c for c in mock_executor_instance.execute.call_args_list if c[0][0] == "fetch_solutions"]
+            assert len(sol_calls) == 2
+
+            # Only three-sum solutions saved (two-sum failed)
+            solutions_saves = [c[0][3] for c in mock_save.call_args_list if c[0][2] == "solutions"]
+            assert len(solutions_saves) == 1
+            assert solutions_saves[0] == "three-sum"
+
+            # Problems still saved correctly
+            problems_saves = [c for c in mock_save.call_args_list if c[0][2] == "problems"]
+            assert len(problems_saves) == 1
+
+    def test_skip_ids_filters_by_titleslug(self) -> None:
+        """When skip_ids contains titleSlug values, matching problems are filtered out
+        before enrichment and solution fetching."""
+        from unittest.mock import patch, MagicMock
+
+        params = {
+            "action": "fetch_problems",
+            "tags": "array",
+            "count": 2,
+            "skip_ids": ["two-sum"],
+        }
+
+        problem_list = [
+            {"titleSlug": "two-sum", "title": "Two Sum", "frontendQuestionId": "1"},
+            {"titleSlug": "add-two-numbers", "title": "Add Two Numbers", "frontendQuestionId": "2"},
+            {"titleSlug": "three-sum", "title": "3Sum", "frontendQuestionId": "3"},
+        ]
+
+        detail_add = {"titleSlug": "add-two-numbers", "title": "Add Two Numbers", "difficulty": "Medium", "content": "<p>test</p>"}
+        detail_three = {"titleSlug": "three-sum", "title": "3Sum", "difficulty": "Medium", "content": "<p>test</p>"}
+
+        solutions_add = [
+            {"author": "u", "title": "sol", "content": "<p>sol</p>", "vote_count": 5, "is_official": False, "solution_id": "s1"},
+        ]
+        solutions_three = [
+            {"author": "u", "title": "sol", "content": "<p>sol</p>", "vote_count": 5, "is_official": False, "solution_id": "s2"},
+        ]
+
+        with patch("crawlers.leetcode.LeetCodeCrawler") as MockCrawler, \
+             patch("crawlers.leetcode.CrawlerExecutor") as MockExecutor, \
+             patch("crawlers.leetcode._save_result") as mock_save, \
+             patch("crawlers.leetcode._emit") as mock_emit:
+
+            mock_crawler_instance = MagicMock()
+            mock_crawler_instance.PLATFORM = "leetcode"
+            MockCrawler.return_value = mock_crawler_instance
+
+            mock_executor_instance = MagicMock()
+            MockExecutor.return_value = mock_executor_instance
+
+            execute_results = [
+                CrawlResult(success=True, data=problem_list, source="http"),  # fetch_problems_by_tag
+                CrawlResult(success=True, data=detail_add, source="http"),     # fetch_problem add-two-numbers
+                CrawlResult(success=True, data=detail_three, source="http"),   # fetch_problem three-sum
+                CrawlResult(success=True, data=solutions_add, source="http"),  # fetch_solutions add-two-numbers
+                CrawlResult(success=True, data=solutions_three, source="http"),# fetch_solutions three-sum
+            ]
+            mock_executor_instance.execute.side_effect = execute_results
+
+            leetcode_main(["--input", json.dumps(params)])
+
+            # Verify fetch_problem was NOT called for two-sum (it was filtered out)
+            fetch_problem_slugs = [
+                c[0][1] for c in mock_executor_instance.execute.call_args_list
+                if c[0][0] == "fetch_problem"
+            ]
+            assert "two-sum" not in fetch_problem_slugs
+            assert "add-two-numbers" in fetch_problem_slugs
+            assert "three-sum" in fetch_problem_slugs
+
+            # Verify fetch_solutions was NOT called for two-sum
+            fetch_solutions_slugs = [
+                c[0][1] for c in mock_executor_instance.execute.call_args_list
+                if c[0][0] == "fetch_solutions"
+            ]
+            assert "two-sum" not in fetch_solutions_slugs
+            assert "add-two-numbers" in fetch_solutions_slugs
+            assert "three-sum" in fetch_solutions_slugs
+
+    def test_skip_ids_filters_by_frontend_question_id(self) -> None:
+        """When skip_ids contains frontendQuestionId string values, matching problems
+        are filtered out."""
+        from unittest.mock import patch, MagicMock
+
+        params = {
+            "action": "fetch_problems",
+            "tags": "array",
+            "count": 2,
+            "skip_ids": ["2"],
+        }
+
+        problem_list = [
+            {"titleSlug": "two-sum", "title": "Two Sum", "frontendQuestionId": "1"},
+            {"titleSlug": "add-two-numbers", "title": "Add Two Numbers", "frontendQuestionId": "2"},
+            {"titleSlug": "three-sum", "title": "3Sum", "frontendQuestionId": "3"},
+        ]
+
+        detail_one = {"titleSlug": "two-sum", "title": "Two Sum", "difficulty": "Easy", "content": "<p>test</p>"}
+        detail_three = {"titleSlug": "three-sum", "title": "3Sum", "difficulty": "Medium", "content": "<p>test</p>"}
+
+        solutions_one = [
+            {"author": "u", "title": "sol", "content": "<p>sol</p>", "vote_count": 5, "is_official": False, "solution_id": "s1"},
+        ]
+        solutions_three = [
+            {"author": "u", "title": "sol", "content": "<p>sol</p>", "vote_count": 5, "is_official": False, "solution_id": "s2"},
+        ]
+
+        with patch("crawlers.leetcode.LeetCodeCrawler") as MockCrawler, \
+             patch("crawlers.leetcode.CrawlerExecutor") as MockExecutor, \
+             patch("crawlers.leetcode._save_result") as mock_save, \
+             patch("crawlers.leetcode._emit") as mock_emit:
+
+            mock_crawler_instance = MagicMock()
+            mock_crawler_instance.PLATFORM = "leetcode"
+            MockCrawler.return_value = mock_crawler_instance
+
+            mock_executor_instance = MagicMock()
+            MockExecutor.return_value = mock_executor_instance
+
+            execute_results = [
+                CrawlResult(success=True, data=problem_list, source="http"),  # fetch_problems_by_tag
+                CrawlResult(success=True, data=detail_one, source="http"),     # fetch_problem two-sum
+                CrawlResult(success=True, data=detail_three, source="http"),   # fetch_problem three-sum
+                CrawlResult(success=True, data=solutions_one, source="http"),  # fetch_solutions two-sum
+                CrawlResult(success=True, data=solutions_three, source="http"),# fetch_solutions three-sum
+            ]
+            mock_executor_instance.execute.side_effect = execute_results
+
+            leetcode_main(["--input", json.dumps(params)])
+
+            # Verify fetch_problem was NOT called for add-two-numbers (filtered by frontendQuestionId)
+            fetch_problem_slugs = [
+                c[0][1] for c in mock_executor_instance.execute.call_args_list
+                if c[0][0] == "fetch_problem"
+            ]
+            assert "add-two-numbers" not in fetch_problem_slugs
+            assert "two-sum" in fetch_problem_slugs
+            assert "three-sum" in fetch_problem_slugs
+
+            # Verify fetch_solutions was NOT called for add-two-numbers
+            fetch_solutions_slugs = [
+                c[0][1] for c in mock_executor_instance.execute.call_args_list
+                if c[0][0] == "fetch_solutions"
+            ]
+            assert "add-two-numbers" not in fetch_solutions_slugs
+            assert "two-sum" in fetch_solutions_slugs
+            assert "three-sum" in fetch_solutions_slugs
+
+    def test_skip_ids_problems_not_matched_are_included(self) -> None:
+        """Problems whose titleSlug and frontendQuestionId are NOT in skip_ids
+        are still enriched and have solutions fetched."""
+        from unittest.mock import patch, MagicMock
+
+        params = {
+            "action": "fetch_problems",
+            "tags": "array",
+            "count": 3,
+            "skip_ids": ["two-sum", "5"],
+        }
+
+        problem_list = [
+            {"titleSlug": "two-sum", "title": "Two Sum", "frontendQuestionId": "1"},
+            {"titleSlug": "add-two-numbers", "title": "Add Two Numbers", "frontendQuestionId": "2"},
+            {"titleSlug": "three-sum", "title": "3Sum", "frontendQuestionId": "3"},
+            {"titleSlug": "four-sum", "title": "4Sum", "frontendQuestionId": "4"},
+            {"titleSlug": "five-sum", "title": "5Sum", "frontendQuestionId": "5"},
+        ]
+
+        detail_add = {"titleSlug": "add-two-numbers", "title": "Add Two Numbers", "difficulty": "Medium", "content": "<p>test</p>"}
+        detail_three = {"titleSlug": "three-sum", "title": "3Sum", "difficulty": "Medium", "content": "<p>test</p>"}
+        detail_four = {"titleSlug": "four-sum", "title": "4Sum", "difficulty": "Medium", "content": "<p>test</p>"}
+
+        solutions_add = [
+            {"author": "u", "title": "sol", "content": "<p>sol</p>", "vote_count": 5, "is_official": False, "solution_id": "s1"},
+        ]
+        solutions_three = [
+            {"author": "u", "title": "sol", "content": "<p>sol</p>", "vote_count": 5, "is_official": False, "solution_id": "s2"},
+        ]
+        solutions_four = [
+            {"author": "u", "title": "sol", "content": "<p>sol</p>", "vote_count": 5, "is_official": False, "solution_id": "s3"},
+        ]
+
+        with patch("crawlers.leetcode.LeetCodeCrawler") as MockCrawler, \
+             patch("crawlers.leetcode.CrawlerExecutor") as MockExecutor, \
+             patch("crawlers.leetcode._save_result") as mock_save, \
+             patch("crawlers.leetcode._emit") as mock_emit:
+
+            mock_crawler_instance = MagicMock()
+            mock_crawler_instance.PLATFORM = "leetcode"
+            MockCrawler.return_value = mock_crawler_instance
+
+            mock_executor_instance = MagicMock()
+            MockExecutor.return_value = mock_executor_instance
+
+            execute_results = [
+                CrawlResult(success=True, data=problem_list, source="http"),  # fetch_problems_by_tag
+                CrawlResult(success=True, data=detail_add, source="http"),     # fetch_problem add-two-numbers
+                CrawlResult(success=True, data=detail_three, source="http"),   # fetch_problem three-sum
+                CrawlResult(success=True, data=detail_four, source="http"),    # fetch_problem four-sum
+                CrawlResult(success=True, data=solutions_add, source="http"),  # fetch_solutions add-two-numbers
+                CrawlResult(success=True, data=solutions_three, source="http"),# fetch_solutions three-sum
+                CrawlResult(success=True, data=solutions_four, source="http"), # fetch_solutions four-sum
+            ]
+            mock_executor_instance.execute.side_effect = execute_results
+
+            leetcode_main(["--input", json.dumps(params)])
+
+            fetch_problem_slugs = [
+                c[0][1] for c in mock_executor_instance.execute.call_args_list
+                if c[0][0] == "fetch_problem"
+            ]
+            # two-sum filtered by titleSlug; five-sum filtered by frontendQuestionId
+            assert "two-sum" not in fetch_problem_slugs
+            assert "five-sum" not in fetch_problem_slugs
+            # others are included
+            assert "add-two-numbers" in fetch_problem_slugs
+            assert "three-sum" in fetch_problem_slugs
+            assert "four-sum" in fetch_problem_slugs
+            assert len(fetch_problem_slugs) == 3
+
+            fetch_solutions_slugs = [
+                c[0][1] for c in mock_executor_instance.execute.call_args_list
+                if c[0][0] == "fetch_solutions"
+            ]
+            assert "two-sum" not in fetch_solutions_slugs
+            assert "five-sum" not in fetch_solutions_slugs
+            assert "add-two-numbers" in fetch_solutions_slugs
+            assert "three-sum" in fetch_solutions_slugs
+            assert "four-sum" in fetch_solutions_slugs
+            assert len(fetch_solutions_slugs) == 3
