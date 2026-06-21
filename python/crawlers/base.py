@@ -610,6 +610,7 @@ class DataImporter:
 
         data/raw/{platform}/problems/          # problem JSONs
         data/raw/{platform}/records/           # record JSONs
+        data/raw/{platform}/solutions/         # solution JSONs
 
     Files are expected to be named with an ISO-8601 date prefix
     (e.g. ``2025-06-13_two-sum.json``) so that imports can be
@@ -791,15 +792,105 @@ class DataImporter:
         logger.info("Imported %d records for %s", count, platform)
         return count
 
+    # ── import solutions ────────────────────────────────────────
+
+    async def import_solutions(
+        self, platform: str, date: Optional[str] = None
+    ) -> int:
+        """Read solution JSONs for *platform* and upsert them via prisma.
+
+        Solution files are named ``{date}_{source_id}.json`` and each
+        contains a list of solution dicts with ``author``, ``content``,
+        ``title``, ``vote_count`` fields.
+
+        Returns the number of solution records upserted.
+        """
+        directory = self._platform_dir(platform) / "solutions"
+        if not directory.exists():
+            logger.info("No solutions directory for %s", platform)
+            return 0
+
+        pattern = f"{date}_*.json" if date else "*.json"
+        count = 0
+        for path in sorted(directory.glob(pattern)):
+            # Extract source_id from filename: {date}_{sourceId}.json
+            filename = path.name
+            # Strip date prefix (YYYY-MM-DD_) if present
+            source_id = filename
+            if len(filename) > 11 and filename[4] == '-' and filename[7] == '-':
+                source_id = filename[11:].replace('.json', '')
+            else:
+                source_id = filename.replace('.json', '')
+
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("Skipping %s: %s", path, exc)
+                continue
+
+            solutions = payload if isinstance(payload, list) else [payload]
+            for idx, sol in enumerate(solutions):
+                content = sol.get("content", "")
+                if not content:
+                    continue
+                author = sol.get("author", "匿名")
+                try:
+                    # Find the problem this solution belongs to
+                    problem = await self.prisma.problem.find_unique(
+                        where={
+                            "platform_source_id": {
+                                "platform": platform,
+                                "source_id": str(source_id),
+                            }
+                        },
+                    )
+                    if not problem:
+                        logger.debug(
+                            "No problem found for solution %s/%s (idx %d)",
+                            platform, source_id, idx,
+                        )
+                        continue
+
+                    solution_index = sol.get("solution_index", idx)
+                    await self.prisma.problemsolution.upsert(
+                        where={
+                            "problemId_solutionIndex": {
+                                "problemId": problem.id,
+                                "solutionIndex": int(solution_index) % 100000,
+                            }
+                        },
+                        data={
+                            "create": {
+                                "problemId": problem.id,
+                                "solutionIndex": int(solution_index) % 100000,
+                                "content": content,
+                                "author": str(author),
+                            },
+                            "update": {
+                                "content": content,
+                                "author": str(author),
+                            },
+                        },
+                    )
+                    count += 1
+                except Exception as exc:
+                    logger.error(
+                        "Failed to upsert solution %s/%s (idx %d): %s",
+                        platform, source_id, idx, exc,
+                    )
+
+        logger.info("Imported %d solutions for %s", count, platform)
+        return count
+
     # ── import all ───────────────────────────────────────────────
 
     async def import_all(self, date: Optional[str] = None) -> Dict[str, Dict[str, int]]:
-        """Import problems + records for every platform directory found
-        under ``data/raw/``.
+        """Import problems + records + solutions for every platform directory
+        found under ``data/raw/``.
 
         Returns a dict like::
 
-            {"leetcode": {"problems": 42, "records": 158}, ...}
+            {"leetcode": {"problems": 42, "records": 158, "solutions": 12}, ...}
         """
         results: Dict[str, Dict[str, int]] = {}
         if not self.data_dir.exists():
@@ -813,11 +904,13 @@ class DataImporter:
 
             problem_count = await self.import_problems(platform, date)
             record_count = await self.import_records(platform, date)
+            solution_count = await self.import_solutions(platform, date)
 
-            if problem_count or record_count:
+            if problem_count or record_count or solution_count:
                 results[platform] = {
                     "problems": problem_count,
                     "records": record_count,
+                    "solutions": solution_count,
                 }
 
         return results
