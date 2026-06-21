@@ -144,8 +144,8 @@ export class CrawlerController {
           importDetail = await this.importPlatformData(dto.platform);
           this.logger.log(`Import completed for ${dto.platform}: ${importDetail.total} records upserted (${importDetail.problems} problems, ${importDetail.solutions} solutions, ${importDetail.records} records)`);
 
-          // Only auto-summarize if DeepSeek API key is configured
-          const hasApiKey = !!(process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_API_KEY !== 'sk-placeholder');
+          // Only auto-summarize if DeepSeek (official or Alibaba Cloud) API key is configured
+          const hasApiKey = this.resolveDeepSeekConfig() !== null;
           if (importDetail.total > 0 && hasApiKey) {
             const embedJob = await this.prisma.crawlJob.create({
               data: {
@@ -586,9 +586,22 @@ export class CrawlerController {
       where: { platform: platform as any, status: 'running' },
     });
     if (existing) {
-      throw new ConflictException(
-        `Platform ${platform} already has a running bulk crawl (jobId=${existing.id}). Cancel it first or wait for completion.`
-      );
+      // 卡住超过 30 分钟 → 自动标记失败，允许新任务
+      const STALE_MS = 30 * 60 * 1000;
+      const age = Date.now() - new Date(existing.updatedAt).getTime();
+      if (age > STALE_MS) {
+        this.logger.warn(
+          `Auto-failing stale job ${existing.id} (${platform}, idle for ${Math.round(age / 60000)}min)`,
+        );
+        await this.prisma.crawlJob.update({
+          where: { id: existing.id },
+          data: { status: 'failed', finishedAt: new Date() },
+        });
+      } else {
+        throw new ConflictException(
+          `Platform ${platform} already has a running bulk crawl (jobId=${existing.id}). Cancel it first or wait for completion.`
+        );
+      }
     }
 
     // Query existing sourceIds for skip
@@ -1044,6 +1057,43 @@ export class CrawlerController {
     return { accepted: true, embedJobId: embedJob.id };
   }
 
+  @Post('batch-embed/missing')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('admin')
+  @HttpCode(202)
+  @ApiOperation({ summary: 'Only summarize + embed problems missing summary, incomplete summary, or missing vector (no full reset)' })
+  async batchEmbedMissing(): Promise<{ accepted: boolean; embedJobId: string }> {
+    this.logger.log('Starting batch-embed/missing: only missing/incomplete summaries + missing vectors');
+
+    const embedJob = await this.prisma.crawlJob.create({
+      data: {
+        platform: 'luogu' as any,
+        status: 'running',
+        phase: 'import_',
+        config: { type: 'batch-embed', scope: 'missing' },
+        startedAt: new Date(),
+      },
+    });
+
+    this.runBatchEmbedMissing(embedJob.id)
+      .then(async (stats) => {
+        this.logger.log(`Batch-embed/missing done: ${JSON.stringify(stats)}`);
+        await this.prisma.crawlJob.update({
+          where: { id: embedJob.id },
+          data: { status: 'completed', finishedAt: new Date(), summary: stats },
+        }).catch(() => {});
+      })
+      .catch(async (err) => {
+        this.logger.error(`Batch-embed/missing failed: ${err?.message || err}`);
+        await this.prisma.crawlJob.update({
+          where: { id: embedJob.id },
+          data: { status: 'failed', finishedAt: new Date() },
+        }).catch(() => {});
+      });
+
+    return { accepted: true, embedJobId: embedJob.id };
+  }
+
   @Get('logs')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('admin')
@@ -1065,8 +1115,8 @@ export class CrawlerController {
    */
   async summarizeUnprocessed(platform: string, jobId?: string): Promise<number> {
     // Skip if no LLM API key configured — summarization requires DeepSeek
-    const apiKey = process.env.DEEPSEEK_API_KEY || '';
-    if (!apiKey || apiKey === 'sk-placeholder') {
+    const deepSeekConfig = this.resolveDeepSeekConfig();
+    if (!deepSeekConfig) {
       this.logger.log('No DeepSeek API key configured, skipping summarization and embedding');
       if (jobId) {
         await this.prisma.crawlJob.update({
@@ -1164,12 +1214,39 @@ export class CrawlerController {
     return count;
   }
 
+  // ── DeepSeek Config Resolver ───────────────────────────────────────────
+
+  /**
+   * Resolve DeepSeek API config.
+   *
+   * DEEPSEEK_PROVIDER=aliyun  → 阿里云百炼 DeepSeek
+   * DEEPSEEK_PROVIDER=deepseek (or unset) → 官方 DeepSeek
+   * DEEPSEEK_BASE_URL 可覆盖默认 base URL
+   */
+  private resolveDeepSeekConfig(): { apiKey: string; baseUrl: string; model: string } | null {
+    const apiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
+    if (!apiKey || apiKey === 'sk-placeholder') return null;
+
+    const provider = (process.env.DEEPSEEK_PROVIDER || 'deepseek').trim().toLowerCase();
+    const model = process.env.DEEPSEEK_MODEL || 'deepseek-v4-flash';
+
+    let baseUrl = process.env.DEEPSEEK_BASE_URL || '';
+    if (!baseUrl) {
+      baseUrl = provider === 'aliyun'
+        ? 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+        : 'https://api.deepseek.com/v1';
+    }
+    // 向后兼容：旧配置无 /v1 后缀的自动追加
+    if (!baseUrl.endsWith('/v1') && !baseUrl.endsWith('/v2') && !baseUrl.includes('/compatible-mode/')) {
+      baseUrl = baseUrl.replace(/\/$/, '') + '/v1';
+    }
+
+    return { apiKey, baseUrl, model };
+  }
+
   private async callDeepSeekSummarize(title: string, content: string, difficultyRaw: string): Promise<string | null> {
-    const apiKey = process.env.DEEPSEEK_API_KEY || '';
-    const baseUrl = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
-    if (!apiKey || apiKey === 'sk-placeholder') {
-      // No valid API key configured — skip summarization entirely.
-      // Frontend shows "暂无题解总结（配置 DeepSeek API Key 后可获得 AI 生成的题解总结）"
+    const config = this.resolveDeepSeekConfig();
+    if (!config) {
       this.logger.debug('DeepSeek API key not configured, skipping summarization');
       return null;
     }
@@ -1186,11 +1263,11 @@ Return a Chinese summary with these sections (2-3 sentences each):
 【推荐解法】...
 【易错点】...`;
 
-    const resp = await fetch(`${baseUrl}/v1/chat/completions`, {
+    const resp = await fetch(`${config.baseUrl}/chat/completions`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.apiKey}` },
       body: JSON.stringify({
-        model: 'deepseek-v4-flash',
+        model: config.model,
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.3,
         max_tokens: 16384,
@@ -1350,6 +1427,172 @@ Return a Chinese summary with these sections (2-3 sentences each):
     await Promise.all(workers);
 
     // 最终更新进度 + 日志
+    addLine(
+      `完成！summarized=${stats.summarized} embedded=${stats.embedded} skipped=${stats.skipped} errors=${stats.errors}`,
+      'success',
+    );
+    if (jobId) {
+      await this.prisma.crawlJob.update({
+        where: { id: jobId },
+        data: { embedDone: completed },
+      }).catch(() => {});
+    }
+    await flushLogs();
+
+    return stats;
+  }
+
+  /**
+   * 增量补全：仅处理 summary 缺失/不完整 或 vector_embedding 缺失的题目
+   * 不清空任何已有向量，不做全量重建
+   */
+  private async runBatchEmbedMissing(jobId: string): Promise<{
+    total: number; summarized: number; embedded: number; skipped: number; errors: number;
+  }> {
+    const POOL = 200;
+    const stats = { total: 0, summarized: 0, embedded: 0, skipped: 0, errors: 0 };
+    const logLines: Array<{ time: string; message: string; level: string }> = [];
+
+    const flushLogs = async () => {
+      if (!jobId || logLines.length === 0) return;
+      const recent = logLines.slice(-200);
+      await this.prisma.crawlJob.update({
+        where: { id: jobId },
+        data: { summary: { logLines: recent, stats } },
+      }).catch(() => {});
+    };
+
+    const addLine = (message: string, level: string = 'info') => {
+      const time = new Date().toISOString();
+      logLines.push({ time, message, level });
+      this.logger.log(`[batch-embed-missing] ${message}`);
+    };
+
+    // ── Step 0: 检测哪些题目需要补充 ─────────────────────────────
+    // 缺失摘要 / 摘要不完整 / 缺少向量
+    const rows: any[] = await this.prisma.$queryRaw`
+      SELECT id, source_id::text, title, full_content, solution_summary, difficulty_raw,
+             vector_embedding IS NOT NULL AS has_vector
+      FROM problems
+      WHERE deleted_at IS NULL
+        AND (
+          -- 无摘要
+          solution_summary IS NULL OR solution_summary = ''
+          OR
+          -- 摘要不完整（缺少三个必要段落之一 或 结尾不完整）
+          NOT (
+            solution_summary ~ '【核心考点】'
+            AND solution_summary ~ '【推荐解法】'
+            AND solution_summary ~ '【易错点】'
+            AND solution_summary ~ '[。.!！?？)）]\\s*$'
+          )
+          OR
+          -- 有完整摘要但无向量
+          vector_embedding IS NULL
+        )
+      ORDER BY created_at DESC
+    `;
+    stats.total = rows.length;
+    addLine(`共需补全 ${stats.total} 题（缺失/不完整摘要 或 无向量）`);
+
+    if (stats.total === 0) {
+      addLine('所有题目均完整，无需补全', 'success');
+      if (jobId) {
+        await this.prisma.crawlJob.update({
+          where: { id: jobId },
+          data: { embedTotal: 0, embedDone: 0 },
+        }).catch(() => {});
+      }
+      await flushLogs();
+      return stats;
+    }
+
+    if (jobId) {
+      await this.prisma.crawlJob.update({
+        where: { id: jobId },
+        data: { embedTotal: stats.total, embedDone: 0 },
+      }).catch(() => {});
+    }
+
+    // ── Step 1: worker 竞争队列并发处理 ───────────────────────────
+    const queue = rows.slice();
+    let completed = 0;
+
+    const processOne = async (p: any): Promise<void> => {
+      let summary = p.solution_summary;
+
+      // 检查三个必要段落是否都存在、末尾是否完整结束
+      const hasAllSections = (s: string | null | undefined): boolean => {
+        if (!s || s.trim().length === 0) return false;
+        return /【核心考点】/.test(s) && /【推荐解法】/.test(s) && /【易错点】/.test(s)
+          && /[。.！!？?）)]\s*$/.test(s.trim());
+      };
+
+      // 无摘要或摘要不完整 → 重新生成摘要
+      if (!hasAllSections(summary)) {
+        try {
+          summary = await this.callDeepSeekSummarize(
+            p.title,
+            p.full_content || '',
+            p.difficulty_raw || '',
+          );
+          if (summary) {
+            await this.prisma.$executeRaw`
+              UPDATE problems
+              SET solution_summary = ${summary}, updated_at = NOW()
+              WHERE id = ${p.id}::uuid
+            `;
+            stats.summarized++;
+          }
+        } catch (err: any) {
+          stats.errors++;
+          addLine(`[ERR] summarize ${p.source_id}: ${err?.message || err}`, 'error');
+          return;
+        }
+      }
+
+      // 有摘要但无向量 → 只生成向量
+      if (summary && String(summary).trim().length > 0) {
+        try {
+          const vec = await this.vectorService.embedText(String(summary));
+          await this.vectorService.setProblemVector(p.id, vec);
+          stats.embedded++;
+        } catch (err: any) {
+          stats.errors++;
+          addLine(`[ERR] embed ${p.source_id}: ${err?.message || err}`, 'error');
+          return;
+        }
+      } else {
+        stats.skipped++;
+      }
+
+      completed++;
+      if (completed % 500 === 0) {
+        addLine(
+          `${completed}/${stats.total} (${((completed / stats.total) * 100).toFixed(1)}%) — summarized=${stats.summarized} embedded=${stats.embedded} skipped=${stats.skipped} errors=${stats.errors}`,
+          'success',
+        );
+        await flushLogs();
+      }
+      if (jobId && completed % 10 === 0) {
+        await this.prisma.crawlJob.update({
+          where: { id: jobId },
+          data: { embedDone: completed },
+        }).catch(() => {});
+      }
+    };
+
+    const worker = async () => {
+      while (queue.length > 0) {
+        const item = queue.shift();
+        if (!item) break;
+        await processOne(item);
+      }
+    };
+
+    const workers = Array.from({ length: Math.min(POOL, stats.total) }, () => worker());
+    await Promise.all(workers);
+
     addLine(
       `完成！summarized=${stats.summarized} embedded=${stats.embedded} skipped=${stats.skipped} errors=${stats.errors}`,
       'success',
