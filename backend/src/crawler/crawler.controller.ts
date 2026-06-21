@@ -137,7 +137,7 @@ export class CrawlerController {
       // Auto-import: import all files in the platform directory.
       // The Python crawler overwrites existing files, so "new file" detection
       // by file existence does not work.  upsert handles duplicates safely.
-      let importDetail = { problems: 0, solutions: 0, records: 0, total: 0 };
+      let importDetail = { problems: 0, solutions: 0, records: 0, total: 0, problemSourceIds: [] as string[] };
       let embedJobId: string | null = null;
       if (result?.success && dto.platform) {
         try {
@@ -157,12 +157,12 @@ export class CrawlerController {
               },
             });
             embedJobId = embedJob.id;
-            this.summarizeUnprocessed(dto.platform, embedJob.id)
-              .then(async (n) => {
-                this.logger.log(`Auto-summarize done for ${dto.platform}: ${n} problems summarized`);
+            this.summarizeUnprocessed(dto.platform, embedJob.id, importDetail.problemSourceIds)
+              .then(async (r) => {
+                this.logger.log(`Auto-summarize done for ${dto.platform}: ${r.embedded} summarized, ${r.skipped} skipped`);
                 await this.prisma.crawlJob.update({
                   where: { id: embedJob.id },
-                  data: { status: 'completed', finishedAt: new Date(), summary: { embedded: n } },
+                  data: { status: 'completed', finishedAt: new Date(), summary: { embedded: r.embedded, skipped: r.skipped } },
                 }).catch(() => {});
               })
               .catch(async (err) => {
@@ -195,17 +195,18 @@ export class CrawlerController {
   }
 
   /** Read JSON files from data/raw/{platform}/{subDir}/ and upsert to database. */
-  private async importPlatformData(platform: string): Promise<{ problems: number; solutions: number; records: number; total: number }> {
+  private async importPlatformData(platform: string): Promise<{ problems: number; solutions: number; records: number; total: number; problemSourceIds: string[] }> {
     const platformDir = path.join(this.dataDir, platform);
     this.logger.log(`[IMPORT] platform=${platform} dataDir=${this.dataDir} platformDir=${platformDir}`);
     if (!fs.existsSync(platformDir)) {
       this.logger.warn(`[IMPORT] No data directory for platform ${platform}: ${platformDir}`);
-      return { problems: 0, solutions: 0, records: 0, total: 0 };
+      return { problems: 0, solutions: 0, records: 0, total: 0, problemSourceIds: [] };
     }
 
     let problems = 0;
     let solutions = 0;
     let recordsCount = 0;
+    const problemSourceIds: string[] = [];
     const subDirs = ['problems', 'profiles', 'records', 'solutions'];
 
     for (const subDir of subDirs) {
@@ -238,6 +239,7 @@ export class CrawlerController {
               this.logger.log(`[IMPORT]       upsertProblem: sourceId=${sid} title=${(record.title || record.name || '?').slice(0, 30)}`);
               await this.upsertProblem(platform, record);
               problems++;
+              if (sid) problemSourceIds.push(String(sid));
             } else if (subDir === 'records') {
               await this.upsertRecord(platform, record);
               recordsCount++;
@@ -257,7 +259,7 @@ export class CrawlerController {
 
     const total = problems + solutions + recordsCount;
     this.logger.log(`[IMPORT] DONE: problems=${problems} solutions=${solutions} records=${recordsCount} total=${total}`);
-    return { problems, solutions, records: recordsCount, total };
+    return { problems, solutions, records: recordsCount, total, problemSourceIds };
   }
 
   private async upsertProblem(platform: string, record: any): Promise<void> {
@@ -660,8 +662,8 @@ export class CrawlerController {
             this.logger.log(`Auto-import done for bulk crawl ${job.id}: ${imported.total} records (${imported.problems} problems, ${imported.solutions} solutions, ${imported.records} records)`);
             // Fire-and-forget: auto-summarize newly imported problems
             if (imported.total > 0) {
-              this.summarizeUnprocessed(platform, job.id)
-                .then((n) => this.logger.log(`Auto-summarize done for bulk crawl ${job.id}: ${n} problems summarized`))
+              this.summarizeUnprocessed(platform, job.id, imported.problemSourceIds)
+                .then((r) => this.logger.log(`Auto-summarize done for bulk crawl ${job.id}: ${r.embedded} summarized, ${r.skipped} skipped`))
                 .catch((err) => this.logger.error(`Auto-summarize failed for bulk crawl ${job.id}: ${err?.message || err}`));
             }
           } catch (importErr: any) {
@@ -809,7 +811,7 @@ export class CrawlerController {
   @Roles('admin')
   @ApiOperation({ summary: 'Get embed progress for a crawl job' })
   async getEmbedProgress(@Param('jobId') jobId: string): Promise<{
-    jobId: string; platform: string; embedTotal: number; embedDone: number;
+    jobId: string; platform: string; embedTotal: number; embedDone: number; skipped: number;
     done: boolean; summary?: any; logLines?: Array<{ time: string; message: string; level: string }>;
   }> {
     const job = await this.prisma.crawlJob.findUnique({ where: { id: jobId } });
@@ -818,11 +820,13 @@ export class CrawlerController {
     const embedTotal = job.embedTotal ?? 0;
     const embedDone = job.embedDone ?? 0;
     const summary = (job.summary || {}) as any;
+    const skipped = summary?.skipped ?? 0;
     return {
       jobId: job.id,
       platform: job.platform,
       embedTotal,
       embedDone,
+      skipped,
       done: embedTotal > 0 && embedDone >= embedTotal,
       summary,
       logLines: summary.logLines || [],
@@ -1002,11 +1006,11 @@ export class CrawlerController {
       },
     });
     this.summarizeUnprocessed(platform, embedJob.id)
-      .then(async (n) => {
-        this.logger.log(`Summarization done for ${platform}: ${n} problems processed`);
+      .then(async (r) => {
+        this.logger.log(`Summarization done for ${platform}: ${r.embedded} processed, ${r.skipped} skipped`);
         await this.prisma.crawlJob.update({
           where: { id: embedJob.id },
-          data: { status: 'completed', finishedAt: new Date(), summary: { embedded: n } },
+          data: { status: 'completed', finishedAt: new Date(), summary: { embedded: r.embedded, skipped: r.skipped } },
         }).catch(() => {});
       })
       .catch(async (err) => {
@@ -1113,7 +1117,7 @@ export class CrawlerController {
    *
    * @param jobId  If provided, CrawlJob.embedTotal/embedDone are updated in real time.
    */
-  async summarizeUnprocessed(platform: string, jobId?: string): Promise<number> {
+  async summarizeUnprocessed(platform: string, jobId?: string, sourceIds?: string[]): Promise<{ embedded: number; skipped: number }> {
     // Skip if no LLM API key configured — summarization requires DeepSeek
     const deepSeekConfig = this.resolveDeepSeekConfig();
     if (!deepSeekConfig) {
@@ -1124,34 +1128,42 @@ export class CrawlerController {
           data: { embedTotal: 0, embedDone: 0, status: 'completed', finishedAt: new Date() },
         }).catch(() => {});
       }
-      return 0;
+      return { embedded: 0, skipped: 0 };
+    }
+
+    // Build WHERE clause — if sourceIds provided, only target those specific problems
+    const whereBase: any = { sourcePlatform: platform as any };
+    if (sourceIds && sourceIds.length > 0) {
+      whereBase.sourceId = { in: sourceIds };
     }
 
     // Count total unprocessed (for progress tracking)
     const totalUnprocessed = await this.prisma.problem.count({
       where: {
-        sourcePlatform: platform as any,
+        ...whereBase,
         OR: [{ solutionSummary: null }, { solutionSummary: '' }],
       },
     });
 
+    const skipped = sourceIds ? sourceIds.length - totalUnprocessed : 0;
+
     if (totalUnprocessed === 0) {
-      this.logger.log(`No unprocessed problems for ${platform}`);
+      this.logger.log(`No unprocessed problems for ${platform} (skipped ${skipped} already complete)`);
       if (jobId) {
         await this.prisma.crawlJob.update({
           where: { id: jobId },
-          data: { embedTotal: 0, embedDone: 0 },
-        });
+          data: { embedTotal: 0, embedDone: 0, summary: { embedded: 0, skipped } },
+        }).catch(() => {});
       }
-      return 0;
+      return { embedded: 0, skipped };
     }
 
     // Set embedTotal on CrawlJob
     if (jobId) {
       await this.prisma.crawlJob.update({
         where: { id: jobId },
-        data: { embedTotal: totalUnprocessed, embedDone: 0 },
-      });
+        data: { embedTotal: totalUnprocessed, embedDone: 0, summary: { skipped } },
+      }).catch(() => {});
     }
 
     let count = 0;
@@ -1161,7 +1173,7 @@ export class CrawlerController {
     while (true) {
       const unprocessed = await this.prisma.problem.findMany({
         where: {
-          sourcePlatform: platform as any,
+          ...whereBase,
           OR: [{ solutionSummary: null }, { solutionSummary: '' }],
         },
         select: { id: true, title: true, sourceId: true, fullContent: true, difficultyRaw: true },
@@ -1211,7 +1223,7 @@ export class CrawlerController {
       // Don't increment offset — we're deleting processed items, so offset stays 0
     }
 
-    return count;
+    return { embedded: count, skipped };
   }
 
   // ── DeepSeek Config Resolver ───────────────────────────────────────────

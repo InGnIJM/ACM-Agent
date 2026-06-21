@@ -30,8 +30,33 @@ dotenv.config({ path: path.resolve(__dirname, '..', '.env') });
 const POOL_SIZE = 200;
 const OLLAMA_URL = (process.env.OLLAMA_URL || 'http://localhost:11434').replace(/\/$/, '');
 const EMBED_MODEL = process.env.EMBED_MODEL || 'qwen3-embedding:0.6b';
-const DEEPSEEK_KEY = process.env.DEEPSEEK_API_KEY || '';
-const DEEPSEEK_BASE = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
+
+// DeepSeek 配置解析（DEEPSEEK_PROVIDER=aliyun → 阿里云百炼，留空/其他 → 官方）
+function resolveDeepSeekConfig(): { apiKey: string; baseUrl: string; model: string } | null {
+  const apiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
+  if (!apiKey || apiKey === 'sk-placeholder') return null;
+
+  const provider = (process.env.DEEPSEEK_PROVIDER || 'deepseek').trim().toLowerCase();
+  const model = process.env.DEEPSEEK_MODEL || 'deepseek-v4-flash';
+
+  let baseUrl = process.env.DEEPSEEK_BASE_URL || '';
+  if (!baseUrl) {
+    baseUrl = provider === 'aliyun'
+      ? 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+      : 'https://api.deepseek.com/v1';
+  }
+  // 向后兼容：旧配置无 /v1 后缀的自动追加
+  if (!baseUrl.endsWith('/v1') && !baseUrl.endsWith('/v2') && !baseUrl.includes('/compatible-mode/')) {
+    baseUrl = baseUrl.replace(/\/$/, '') + '/v1';
+  }
+
+  return { apiKey, baseUrl, model };
+}
+
+const deepseekConfig = resolveDeepSeekConfig();
+const DEEPSEEK_KEY = deepseekConfig?.apiKey || '';
+const DEEPSEEK_BASE = deepseekConfig?.baseUrl || '';
+const DEEPSEEK_MODEL = deepseekConfig?.model || 'deepseek-v4-flash';
 
 // ── 信号量（控制并发数）───────────────────────────────────────────────
 class Semaphore {
@@ -103,14 +128,14 @@ Return a Chinese summary with these sections (2-3 sentences each):
 【推荐解法】...
 【易错点】...`;
 
-  const resp = await fetch(`${DEEPSEEK_BASE}/v1/chat/completions`, {
+  const resp = await fetch(`${DEEPSEEK_BASE}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${DEEPSEEK_KEY}`,
     },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: DEEPSEEK_MODEL,
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.3,
       max_tokens: 16384,

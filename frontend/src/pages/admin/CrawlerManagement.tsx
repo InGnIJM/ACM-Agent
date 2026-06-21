@@ -71,11 +71,12 @@ export default function CrawlerManagement() {
   // Embed progress tracking
   const [embedJobId, setEmbedJobId] = useState<string | null>(null);
   const [embedProgress, setEmbedProgress] = useState<{
-    embedTotal: number; embedDone: number; done: boolean;
+    embedTotal: number; embedDone: number; skipped: number; done: boolean;
   } | null>(null);
 
   // Batch embed (全量重建向量)
   const [batchEmbedPending, setBatchEmbedPending] = useState(false);
+  const [batchEmbedMissingPending, setBatchEmbedMissingPending] = useState(false);
 
   async function handleBatchEmbedAll() {
     setBatchEmbedPending(true);
@@ -96,6 +97,25 @@ export default function CrawlerManagement() {
     }
   }
 
+  async function handleBatchEmbedMissing() {
+    setBatchEmbedMissingPending(true);
+    embedLogSeen.current = 0;
+    addLog("增量补全：仅处理缺失/不完整摘要或无向量的题目（不清空已有向量）...");
+    try {
+      const resp = await api.post("/crawler/batch-embed/missing");
+      const d = resp.data as any;
+      addLog("增量补全任务已启动（并发=200），正在后台运行...", "success");
+      if (d.embedJobId) {
+        setEmbedJobId(d.embedJobId);
+        setEmbedProgress(null);
+      }
+    } catch (e: any) {
+      addLog(`增量补全启动失败: ${e.message ?? String(e)}`, "error");
+    } finally {
+      setBatchEmbedMissingPending(false);
+    }
+  }
+
   // Track last seen log index to avoid duplicates
   const embedLogSeen = useRef(0);
 
@@ -106,7 +126,7 @@ export default function CrawlerManagement() {
       try {
         const resp = await api.get(`/crawler/embed-progress/${embedJobId}`);
         const data = resp.data;
-        setEmbedProgress({ embedTotal: data.embedTotal, embedDone: data.embedDone, done: data.done });
+        setEmbedProgress({ embedTotal: data.embedTotal, embedDone: data.embedDone, skipped: data.skipped ?? 0, done: data.done });
 
         // Pick up new log lines from server
         const lines: Array<{ time: string; message: string; level: string }> = data.logLines || [];
@@ -117,7 +137,8 @@ export default function CrawlerManagement() {
 
         if (data.done) {
           setEmbedJobId(null);
-          addLog(`[${data.platform}] 向量嵌入完成！${data.embedDone}/${data.embedTotal} 条`, "success");
+          const skipMsg = data.skipped > 0 ? `（跳过 ${data.skipped} 条已完整）` : '';
+          addLog(`[${data.platform}] 向量嵌入完成！共 ${data.embedDone} 条 ${skipMsg}`, "success");
         }
       } catch { /* silently ignore */ }
     }, 2000);
@@ -374,16 +395,28 @@ export default function CrawlerManagement() {
             <StorageIcon fontSize="small" sx={{ mr: 0.5, verticalAlign: "middle" }} />
             向量嵌入状态（RAG）
           </Typography>
-          <Button
-            size="small"
-            variant="contained"
-            color="warning"
-            onClick={handleBatchEmbedAll}
-            disabled={batchEmbedPending}
-            startIcon={batchEmbedPending ? <CircularProgress size={14} /> : <StorageIcon />}
-          >
-            {batchEmbedPending ? "重建中..." : "全量重建向量"}
-          </Button>
+          <Box sx={{ display: "flex", gap: 1 }}>
+            <Button
+              size="small"
+              variant="contained"
+              color="primary"
+              onClick={handleBatchEmbedMissing}
+              disabled={batchEmbedMissingPending || batchEmbedPending}
+              startIcon={batchEmbedMissingPending ? <CircularProgress size={14} /> : <StorageIcon />}
+            >
+              {batchEmbedMissingPending ? "补全中..." : "补全缺失向量"}
+            </Button>
+            <Button
+              size="small"
+              variant="contained"
+              color="warning"
+              onClick={handleBatchEmbedAll}
+              disabled={batchEmbedPending || batchEmbedMissingPending}
+              startIcon={batchEmbedPending ? <CircularProgress size={14} /> : <StorageIcon />}
+            >
+              {batchEmbedPending ? "重建中..." : "全量重建向量"}
+            </Button>
+          </Box>
         </Box>
         {taskEmbed ? (
           <Box>
@@ -430,7 +463,9 @@ export default function CrawlerManagement() {
                         />
                         {embedProgress.done && (
                           <Alert severity="success" sx={{ mt: 1, py: 0 }}>
-                            向量嵌入完成！共处理 {embedProgress.embedDone} 条，现在可以使用 RAG 语义搜索。
+                            向量嵌入完成！本次处理 {embedProgress.embedDone} 条
+                            {embedProgress.skipped > 0 && <>，跳过 {embedProgress.skipped} 条（已有摘要和向量）</>}
+                            ，现在可以使用 RAG 语义搜索。
                           </Alert>
                         )}
                       </Box>
