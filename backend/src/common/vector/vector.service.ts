@@ -19,6 +19,11 @@ export interface ProblemSearchResult {
   similarity: number;
 }
 
+export interface SearchHit {
+  id: string;
+  score: number;
+}
+
 @Injectable()
 export class VectorService {
   private readonly logger = new Logger(VectorService.name);
@@ -102,11 +107,116 @@ export class VectorService {
 
     await this.prisma.$executeRaw`
       UPDATE problems
-      SET vector_embedding = ${this._toVec(vec)}::vector,
-          updated_at       = NOW()
+      SET vector_embedding     = ${this._toVec(vec)}::vector,
+          embedding_version    = ${VectorService.EMBED_VERSION},
+          embedding_generated_at = NOW(),
+          updated_at           = NOW()
       WHERE id = ${problemId}::uuid
     `;
     this.logger.debug(`Vector written for problem ${problemId}`);
+  }
+
+  // ------------------------------------------------------------------
+  // Instruction prefixes
+  // ------------------------------------------------------------------
+
+  private static readonly INST_CONTENT =
+    '为算法题题面生成用于题意相似检索的向量，重点关注输入输出、目标、约束条件、问题结构和场景描述。';
+  private static readonly INST_SOLUTION =
+    '为算法题解法摘要生成用于相似题检索的向量，重点关注算法类型、题目模式、触发条件、核心思想、状态语义、不变量和高区分度易错点。';
+  private static readonly INST_QUERY =
+    '为用户的算法题检索请求生成向量，重点识别题意、算法意图、题型模式、数据结构、约束条件和学习目标。';
+  private static readonly EMBED_VERSION = 'qwen3-embedding:0.6b@ollama';
+
+  /** Embed full_content with content instruction prefix. */
+  async embedContent(text: string): Promise<number[]> {
+    const truncated = text.length > 4000 ? text.slice(0, 4000) : text;
+    return this.embedText(`${VectorService.INST_CONTENT}\n\n${truncated}`);
+  }
+
+  /** Embed retrieval_summary with solution instruction prefix. */
+  async embedSummary(text: string): Promise<number[]> {
+    return this.embedText(`${VectorService.INST_SOLUTION}\n\n${text}`);
+  }
+
+  /** Embed user query with query instruction prefix. */
+  async embedQuery(text: string): Promise<number[]> {
+    return this.embedText(`${VectorService.INST_QUERY}\n\n${text}`);
+  }
+
+  // ------------------------------------------------------------------
+  // Content vector write
+  // ------------------------------------------------------------------
+
+  async setContentVector(problemId: string, vec: number[]): Promise<void> {
+    if (!vec.length) return;
+    await this.prisma.$executeRaw`
+      UPDATE problems
+      SET content_vector     = ${this._toVec(vec)}::vector,
+          embedding_version  = ${VectorService.EMBED_VERSION},
+          embedding_generated_at = NOW(),
+          updated_at         = NOW()
+      WHERE id = ${problemId}::uuid
+    `;
+  }
+
+  /** Write summary vector for a problem_solution record. */
+  async setSolutionSummaryVector(solutionId: string, vec: number[]): Promise<void> {
+    if (!vec.length) return;
+    await this.prisma.$executeRaw`
+      UPDATE problem_solutions
+      SET summary_vector     = ${this._toVec(vec)}::vector,
+          embedding_version  = ${VectorService.EMBED_VERSION},
+          embedding_generated_at = NOW()
+      WHERE id = ${solutionId}::uuid
+    `;
+  }
+
+  // ------------------------------------------------------------------
+  // Multi-path ANN search
+  // ------------------------------------------------------------------
+
+  async searchByContentVector(queryVec: number[], topK: number = 80): Promise<SearchHit[]> {
+    const sql = `
+      SELECT id,
+             1 - (content_vector <=> $1::vector) AS score
+      FROM problems
+      WHERE deleted_at IS NULL AND content_vector IS NOT NULL
+      ORDER BY content_vector <=> $1::vector
+      LIMIT $2::bigint
+    `;
+    const rows: any[] = await this.prisma.$queryRawUnsafe(sql, this._toVec(queryVec), String(topK));
+    return rows.map(r => ({ id: r.id, score: Number(r.score) }));
+  }
+
+  async searchBySolutionVector(queryVec: number[], topK: number = 80): Promise<SearchHit[]> {
+    const sql = `
+      SELECT id,
+             1 - (vector_embedding <=> $1::vector) AS score
+      FROM problems
+      WHERE deleted_at IS NULL AND vector_embedding IS NOT NULL
+      ORDER BY vector_embedding <=> $1::vector
+      LIMIT $2::bigint
+    `;
+    const rows: any[] = await this.prisma.$queryRawUnsafe(sql, this._toVec(queryVec), String(topK));
+    return rows.map(r => ({ id: r.id, score: Number(r.score) }));
+  }
+
+  async searchByKeyword(keywordOrQuery: string, topK: number = 50): Promise<SearchHit[]> {
+    const sql = `
+      SELECT id,
+             ts_rank(
+               to_tsvector('simple', coalesce(sparse_text, '')),
+               to_tsquery('simple', $1)
+             ) AS score
+      FROM problems
+      WHERE deleted_at IS NULL
+        AND to_tsvector('simple', coalesce(sparse_text, '')) @@ to_tsquery('simple', $1)
+      ORDER BY score DESC
+      LIMIT $2::bigint
+    `;
+    const rows: any[] = await this.prisma.$queryRawUnsafe(sql, keywordOrQuery, String(topK));
+    return rows.map(r => ({ id: r.id, score: Number(r.score) }));
   }
 
   // ------------------------------------------------------------------

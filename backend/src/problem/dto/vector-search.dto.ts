@@ -28,12 +28,10 @@ export class VectorSearchDto {
   @ApiPropertyOptional({ description: 'Minimum difficulty (1-10)' })
   @IsOptional()
   @Type(() => Number)
-  @IsInt()
   difficultyMin?: number;
 
   @ApiPropertyOptional({ description: 'Maximum difficulty (1-10)' })
   @IsOptional()
   @Type(() => Number)
-  @IsInt()
   difficultyMax?: number;
 }
