@@ -71,11 +71,31 @@ export interface VectorSearchResultItem {
   tagsNormalized: string[];
   solutionSummary: string | null;
   similarity: number;
+  // New optional fields for RAG v1 (backward compatible)
+  retrievalSummary?: string;
+  sparseText?: string;
+  scores?: {
+    contentScore: number;
+    solutionScore: number;
+    keywordScore: number;
+    roughScore: number;
+    rerankScore?: number;
+  };
+  matched?: {
+    keywords: string[];
+    sources: string[];
+  };
 }
 
 /** Full response from POST /api/problems/search/vector */
 export interface VectorSearchResponse {
   query: string;
+  queryAnalysis?: {
+    queryType: string;
+    expandedQuery: string;
+    algorithmTerms: string[];
+    weights: Record<string, number>;
+  };
   results: VectorSearchResultItem[];
   total: number;
 }
