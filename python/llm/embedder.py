@@ -14,7 +14,8 @@ class ProblemEmbedder:
     Default backend is Ollama (``http://localhost:11434/api/embed``).
     Set ``EMBED_BACKEND=openai`` to use OpenAI instead.
 
-    Only the ``solution_summary`` field is vectorised.
+    The ``text_field`` parameter controls which field is vectorised
+    (``solution_summary``, ``retrieval_summary``, or ``full_content``).
     """
 
     def __init__(
@@ -125,22 +126,34 @@ class ProblemEmbedder:
             f"OpenAI embedding failed after 4 attempts: {last_exc}"
         ) from last_exc
 
-    async def embed_problems(self, problems: list[dict]) -> list[dict]:
-        """Embed problems by creating a vector from ``solution_summary``.
+    async def embed_problems(self, problems: list[dict], text_field: str = "solution_summary") -> list[dict]:
+        """Embed problems by creating a vector from the specified text field.
+
+        Args:
+            problems: List of problem dicts
+            text_field: Which field to embed (``"solution_summary"``,
+                ``"retrieval_summary"``, or ``"full_content"``)
 
         Each problem dict is mutated in-place by adding:
 
-        - ``vector_embedding``    – embedding of ``solution_summary``
+        - ``vector_embedding``    – embedding of solution_summary/retrieval_summary
+        - ``content_vector``      – embedding of full_content (when text_field="full_content")
         """
         if not problems:
             return problems
 
-        summaries = [
-            p.get("solution_summary", "") or "" for p in problems
+        texts = [
+            p.get(text_field, "") or "" for p in problems
         ]
-        vectors = await self.embed_batch(summaries)
+        vectors = await self.embed_batch(texts)
+
+        vec_key = {
+            "solution_summary": "vector_embedding",
+            "retrieval_summary": "vector_embedding",
+            "full_content": "content_vector",
+        }.get(text_field, "vector_embedding")
 
         for prob, vec in zip(problems, vectors):
-            prob["vector_embedding"] = vec
+            prob[vec_key] = vec
 
         return problems

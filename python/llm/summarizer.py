@@ -30,7 +30,7 @@ class ProblemSummarizer:
             full_content[:3000] if len(full_content) > 3000 else full_content
         )
 
-        prompt = f"""You are an expert competitive programming analyst. Summarize the following problem.
+        prompt = f"""You are an expert competitive programming analyst. Analyze this problem and output a JSON object.
 
 Platform: {platform}
 Source ID: {source_id}
@@ -42,13 +42,19 @@ Problem content:
 {content_truncated}
 
 Return a JSON object with these keys:
-- summary: A concise 2-3 sentence summary of the problem
-- solution_approach: The recommended algorithm or technique to solve it
-- key_points: An array of 3-5 key observations about the problem
-- pitfalls: An array of 1-3 common pitfalls or edge cases
-- tags_normalized: An array of standardised topic tags (choose from common CP categories like two_pointers, binary_search, dp, bfs, dfs, dijkstra, segment_tree, union_find, etc.)
-- difficulty_normalized: A float from 1 to 10 representing the difficulty level
-- similar_problems_hint: A short description of what kind of known problems this resembles
+- summary: A concise 2-3 sentence summary of the problem (for display)
+- solution_approach: The recommended algorithm or technique
+- key_points: Array of 3-5 key observations
+- pitfalls: Array of 1-3 common pitfalls or edge cases
+- tags_normalized: Array of standardized topic tags
+- difficulty_normalized: Float from 1 to 10
+- similar_problems_hint: What kind of known problems this resembles
+
+- retrieval_summary: A 150-350 character Chinese summary for vector search. Must include: (1) problem type and algorithm subtype, (2) problem pattern, (3) why this algorithm fits, (4) core state semantics or invariants, (5) 1-3 distinctive pitfalls. Must NOT include: full code, long formulas, variable names, boilerplate advice like "watch out for boundaries".
+- sparse_text: Space-separated keywords (Chinese + English), including algorithm names, aliases, data structure names, distinguishing terms
+- primary_algo: The main algorithm category (e.g. "回溯", "动态规划", "图论", "贪心", "二分")
+- sub_algos: Array of algorithm subtypes (e.g. ["DFS", "剪枝"])
+- problem_patterns: Array of problem patterns (e.g. ["填数约束", "组合搜索"])
 
 Return ONLY the JSON object, no markdown fences or extra text."""
 
@@ -72,6 +78,12 @@ Return ONLY the JSON object, no markdown fences or extra text."""
             "tags_normalized": filtered_tags,
             "difficulty_normalized": parsed.get("difficulty_normalized", 5.0),
             "similar_problems_hint": parsed.get("similar_problems_hint", ""),
+            # New fields for RAG v1
+            "retrieval_summary": parsed.get("retrieval_summary", ""),
+            "sparse_text": parsed.get("sparse_text", ""),
+            "primary_algo": parsed.get("primary_algo", ""),
+            "sub_algos": parsed.get("sub_algos", []),
+            "problem_patterns": parsed.get("problem_patterns", []),
         }
 
     def _format_summary(self, result: Dict[str, Any]) -> str:
