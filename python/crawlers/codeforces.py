@@ -587,10 +587,15 @@ class CodeforcesCrawler(BaseCrawler):
         _merged = []
         for _l in _lines:
             _s = _l.strip()
-            # Don't merge new paragraphs (start with capital or section marker)
+            # Don't merge new paragraphs (start with capital or section marker).
+            # Also exclude standalone list-item markers ("-") produced by
+            # _unwind_inline from <li> conversion — merging them into the
+            # previous line destroys the list structure and causes missing
+            # newlines before bullet items (regression: CF 2233B).
             if (_merged and _s
                 and not _re.match(r'^[A-Z\[【]', _s)
                 and not _s.startswith('**')
+                and _s != '-'
                 and _merged[-1].strip()):
                 _merged[-1] = _merged[-1] + _s
             else:
