@@ -4,6 +4,10 @@
   "sourceRoot": "src",
   "compilerOptions": {
     "tsConfigPath": "tsconfig.json",
-    "deleteOutDir": true
+    "deleteOutDir": true,
+    "assets": [
+      { "include": "common/query-analysis/*.json", "outDir": "dist" }
+    ],
+    "watchAssets": true
   }
 }
