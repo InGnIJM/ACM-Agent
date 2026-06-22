@@ -51,3 +51,12 @@ temp/
 .claude/
 .superpowers/
 standalone-viewer/
+
+# Ad-hoc test scripts (underscore prefix convention)
+_*
+
+# Ollama model files
+ollama-models/
+
+# Enriched output data
+data/enriched/
