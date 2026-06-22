@@ -2,6 +2,8 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { PrismaModule } from './common/prisma/prisma.module';
 import { VectorModule } from './common/vector/vector.module';
+import { QueryAnalysisModule } from './common/query-analysis/query-analysis.module';
+import { RerankModule } from './common/rerank/rerank.module';
 import { HealthModule } from './health/health.module';
 import { AuthModule } from './auth/auth.module';
 import { UserModule } from './user/user.module';
@@ -23,6 +25,8 @@ import { TaskModule } from './task/task.module';
     }),
     PrismaModule,
     VectorModule,
+    QueryAnalysisModule,
+    RerankModule,
     HealthModule,
     AuthModule,
     UserModule,
