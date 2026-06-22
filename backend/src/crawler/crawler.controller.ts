@@ -233,9 +233,12 @@ export class CrawlerController {
 
           for (const record of records) {
             if (subDir === 'problems') {
+              // Match the fallback chain in upsertProblem() (line 267-271)
+              // so problemSourceIds is never empty for valid records.
+              const cfId = record.contestId && record.index ? `${record.contestId}${record.index}` : null;
               const sid = platform === 'leetcode'
                 ? (record.titleSlug || record.slug || record.questionId || record.questionFrontendId)
-                : (record.source_id || record.pid || record.id);
+                : (record.source_id || record.sourceId || record.pid || record.id || cfId);
               this.logger.log(`[IMPORT]       upsertProblem: sourceId=${sid} title=${(record.title || record.name || '?').slice(0, 30)}`);
               await this.upsertProblem(platform, record);
               problems++;
@@ -267,8 +270,8 @@ export class CrawlerController {
     const cfId = record.contestId && record.index ? `${record.contestId}${record.index}` : null;
     // LeetCode: prefer titleSlug (natural identifier, matches solution filenames)
     let sourceId = platform === 'leetcode'
-      ? (record.titleSlug || record.slug || record.questionId || record.questionFrontendId || record.source_id || record.pid || record.id)
-      : (record.source_id || record.pid || record.id || cfId || record.titleSlug || record.questionId || record.questionFrontendId);
+      ? (record.titleSlug || record.slug || record.questionId || record.questionFrontendId || record.source_id || record.sourceId || record.pid || record.id)
+      : (record.source_id || record.sourceId || record.pid || record.id || cfId || record.titleSlug || record.questionId || record.questionFrontendId);
     // Truncate to VARCHAR(50) limit
     if (sourceId && sourceId.length > 50) {
       sourceId = sourceId.slice(0, 50);
@@ -1145,7 +1148,7 @@ export class CrawlerController {
       },
     });
 
-    const skipped = sourceIds ? sourceIds.length - totalUnprocessed : 0;
+    const skipped = (sourceIds && sourceIds.length > 0) ? sourceIds.length - totalUnprocessed : 0;
 
     if (totalUnprocessed === 0) {
       this.logger.log(`No unprocessed problems for ${platform} (skipped ${skipped} already complete)`);
@@ -1216,6 +1219,14 @@ export class CrawlerController {
         } catch (err: any) {
           this.logger.warn(`Summarize failed for ${p.sourceId}: ${err?.message || err}`);
         }
+
+        // Rate-limit guard: pause between API calls to avoid RPM/QPS throttling.
+        // DEEPSEEK_RPM controls max requests per minute; DEEPSEEK_CALL_DELAY_MS
+        // directly sets the inter-call delay (overrides RPM calculation).
+        const callDelayMs = this._getSummarizeCallDelay();
+        if (callDelayMs > 0) {
+          await new Promise((r) => setTimeout(r, callDelayMs));
+        }
       }
 
       // If we got fewer than batchSize, we've processed everything
@@ -1224,6 +1235,28 @@ export class CrawlerController {
     }
 
     return { embedded: count, skipped };
+  }
+
+  /**
+   * Compute inter-call delay for summarization to stay within rate limits.
+   *
+   * Priority:
+   *  1. DEEPSEEK_CALL_DELAY_MS  — explicit delay in ms
+   *  2. DEEPSEEK_RPM            — max requests per minute → delay = 60000 / RPM
+   *  3. Default: 3000ms for aliyun, 0ms for deepseek official
+   */
+  private _getSummarizeCallDelay(): number {
+    const explicit = parseInt(process.env.DEEPSEEK_CALL_DELAY_MS || '', 10);
+    if (!isNaN(explicit) && explicit >= 0) return explicit;
+
+    const rpm = parseInt(process.env.DEEPSEEK_RPM || '', 10);
+    if (!isNaN(rpm) && rpm > 0) return Math.ceil(60000 / rpm);
+
+    // Default conservative delay for aliyun free tier
+    const provider = (process.env.DEEPSEEK_PROVIDER || 'deepseek').trim().toLowerCase();
+    if (provider === 'aliyun') return 3000;
+
+    return 0;
   }
 
   // ── DeepSeek Config Resolver ───────────────────────────────────────────
@@ -1275,24 +1308,80 @@ Return a Chinese summary with these sections (2-3 sentences each):
 【推荐解法】...
 【易错点】...`;
 
-    const resp = await fetch(`${config.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.apiKey}` },
-      body: JSON.stringify({
-        model: config.model,
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.3,
-        max_tokens: 16384,
-      }),
-    });
+    const timeoutMs = parseInt(process.env.DEEPSEEK_TIMEOUT_MS || '300000', 10);
+    const maxRetries = parseInt(process.env.DEEPSEEK_MAX_RETRIES || '3', 10);
 
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(`DeepSeek API error ${resp.status}: ${errText.slice(0, 200)}`);
+    let lastErr: Error | null = null;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+        const resp = await fetch(`${config.baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.apiKey}` },
+          body: JSON.stringify({
+            model: config.model,
+            messages: [{ role: 'user', content: prompt }],
+            temperature: 0.3,
+            max_tokens: 4096,
+            thinking: { type: 'disabled' },
+          }),
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+
+        if (!resp.ok) {
+          const errText = await resp.text().catch(() => '');
+          // Rate limit (429) → retry with backoff, respecting Retry-After header
+          if (resp.status === 429 && attempt < maxRetries) {
+            const retryAfterSec = parseInt(resp.headers.get('Retry-After') || '', 10);
+            const delay = retryAfterSec > 0 ? retryAfterSec * 1000 : 2 ** (attempt + 1) * 2000;
+            this.logger.warn(
+              `DeepSeek rate limited (429) for ${title}, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`,
+            );
+            await new Promise((r) => setTimeout(r, delay));
+            lastErr = new Error(`DeepSeek API error 429: ${errText.slice(0, 200)}`);
+            continue;
+          }
+          // Server error (5xx) → retryable
+          if (resp.status >= 500 && attempt < maxRetries) {
+            const delay = 2 ** (attempt + 1) * 2000;
+            this.logger.warn(
+              `DeepSeek server error ${resp.status} for ${title}, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`,
+            );
+            await new Promise((r) => setTimeout(r, delay));
+            lastErr = new Error(`DeepSeek API error ${resp.status}: ${errText.slice(0, 200)}`);
+            continue;
+          }
+          throw new Error(`DeepSeek API error ${resp.status}: ${errText.slice(0, 200)}`);
+        }
+
+        const data: any = await resp.json();
+        return data?.choices?.[0]?.message?.content || null;
+      } catch (err: any) {
+        lastErr = err instanceof Error ? err : new Error(String(err));
+        const isRetryable =
+          err.name === 'AbortError' ||
+          err.message?.includes('fetch failed') ||
+          err.message?.includes('ETIMEDOUT') ||
+          err.message?.includes('ECONNRESET') ||
+          err.message?.includes('ECONNREFUSED') ||
+          err.message?.includes('ENOTFOUND');
+        if (isRetryable && attempt < maxRetries) {
+          const delay = 2 ** (attempt + 1) * 2000; // 4s, 8s, 16s
+          this.logger.warn(
+            `DeepSeek summarize attempt ${attempt + 1} failed for ${title} (${lastErr.message}), retrying in ${delay}ms`,
+          );
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+        // Non-retryable → throw immediately; retryable-but-exhausted → fall through
+        if (!isRetryable) throw err;
+      }
     }
 
-    const data: any = await resp.json();
-    return data?.choices?.[0]?.message?.content || null;
+    throw new Error(`DeepSeek summarize failed after ${maxRetries + 1} attempts: ${lastErr?.message}`);
   }
 
   /**
