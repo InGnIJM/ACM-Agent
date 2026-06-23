@@ -121,14 +121,15 @@ class CodeforcesCrawler(BaseCrawler):
             proc = subprocess.run(
                 [
                     "curl", "-sL",
-                    "--max-time", "30",
+                    "--max-time", "15",   # 15 s is enough for a CF page
+                    "--connect-timeout", "10",
                     "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                     "-H", "Accept: text/html,application/xhtml+xml",
                     "-H", "Accept-Language: en-US,en;q=0.9",
                     url,
                 ],
                 capture_output=True,
-                timeout=35,
+                timeout=20,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
             return CrawlResult(
@@ -270,7 +271,9 @@ class CodeforcesCrawler(BaseCrawler):
         )
         return result
 
-    def fetch_problem(self, source_id: str) -> CrawlResult:
+    def fetch_problem(
+        self, source_id: str, meta: dict | None = None
+    ) -> CrawlResult:
         """Fetch problem metadata + full statement.
 
         1. Get metadata (rating, tags, etc.) from the CF API.
@@ -281,6 +284,9 @@ class CodeforcesCrawler(BaseCrawler):
 
         Args:
             source_id: Problem identifier (e.g. ``"1742E"``).
+            meta: Optional pre-fetched metadata from the problemset API.
+                  When provided (e.g. from ``fetch_problems_by_tag``),
+                  the API call is skipped entirely.
 
         Returns:
             CrawlResult with problem dict including ``description``,
@@ -294,8 +300,9 @@ class CodeforcesCrawler(BaseCrawler):
                 source="http",
             )
 
-        # ── Step 1: get API metadata (cached) ────────────────────
-        meta = self._get_cached_problemset_meta(contest_id, index)
+        # ── Step 1: get API metadata (cached, or passed in) ─────
+        if meta is None:
+            meta = self._get_cached_problemset_meta(contest_id, index)
         if meta is None:
             return CrawlResult(
                 success=False,
@@ -1259,20 +1266,37 @@ def main(argv: Optional[list] = None) -> None:
                     if key1 not in skip_keys and key2 not in skip_ids:
                         new_items.append(p)
                 new_items = new_items[:count]
-                # Enrich with full detail (scrape problem page)
-                enriched = []
-                for prob in new_items:
-                    cid = prob.get('contestId', '')
-                    idx = prob.get('index', '')
-                    sid = f"{cid}{idx}" if cid and idx else ''
-                    if sid:
-                        detail = executor.execute("fetch_problem", str(sid))
-                        if detail and detail.success and detail.data:
-                            enriched.append(dict(detail.data))
-                        else:
-                            enriched.append(prob)
-                    else:
-                        enriched.append(prob)
+                # Enrich with full detail (scrape problem page) — parallel
+                # _curl_request is a static method using subprocess, so it's
+                # I/O-bound and thread-safe.  6 workers saturate typical
+                # bandwidth without tripping CF rate limits.
+                import concurrent.futures as _futures
+                MAX_WORKERS = 6
+                enriched: list[dict] = [{}] * len(new_items)
+
+                def _fetch_one(i: int, prob: dict) -> tuple[int, dict]:
+                    cid = prob.get("contestId", "")
+                    idx = prob.get("index", "")
+                    sid = f"{cid}{idx}" if cid and idx else ""
+                    if not sid:
+                        return (i, prob)
+                    # Pass meta=prob so the worker skips the API call
+                    # entirely — only curl + HTML extraction runs.
+                    worker = CodeforcesCrawler()
+                    detail = worker.fetch_problem(sid, meta=prob)
+                    if detail and detail.success and detail.data:
+                        return (i, dict(detail.data))
+                    return (i, prob)
+
+                with _futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+                    futures = [
+                        pool.submit(_fetch_one, i, p)
+                        for i, p in enumerate(new_items)
+                    ]
+                    for fut in _futures.as_completed(futures):
+                        i, data = fut.result()
+                        enriched[i] = data
+
                 result = CrawlResult(success=True, data=enriched, source=result.source)
                 _save_result(crawler, result.data, "problems", str(tag) or "all")
                 # Fetch solutions for each problem
