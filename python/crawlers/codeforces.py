@@ -1149,8 +1149,17 @@ class CodeforcesCrawler(BaseCrawler):
                 _re.IGNORECASE,
             )
 
-            # Strategy A: find the problem-specific section in the editorial
-            ttypography = soup.select_one(".ttypography, .content, .blog-content, .post-content, .entry-content")
+            # Strategy A: find the problem-specific section in the editorial.
+            # .ttypography must come BEFORE .content so the innermost content
+            # container is chosen — CF blog pages wrap .ttypography inside
+            # a .content div, and we want the inner one.
+            ttypography = soup.select_one(
+                ".ttypography, .blog-content, .post-content, .entry-content, "
+                ".problem-statement, .content"
+            )
+            # Fallback: if none matched, use the whole page body
+            if not ttypography:
+                ttypography = soup.find("body")
             if ttypography:
                 # Convert editorial HTML to Markdown first so that
                 # code fences, math delimiters, and formatting survive.
