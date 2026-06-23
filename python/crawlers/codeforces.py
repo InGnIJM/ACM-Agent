@@ -916,6 +916,140 @@ class CodeforcesCrawler(BaseCrawler):
             return {"time": time_limit, "memory": memory_limit}
         return None
 
+    @staticmethod
+    def _editorial_html_to_markdown(html: str) -> str:
+        """Convert CF editorial HTML to Markdown suitable for frontend rendering.
+
+        Handles $$$ → $ math delimiters, <pre> → ``` fences, inline formatting,
+        and list structures — the same transformations that _cf_extract applies
+        to problem statements, adapted for editorial/blog pages.
+        """
+        import re as _re
+
+        try:
+            from bs4 import BeautifulSoup as _BS, NavigableString as _NS
+        except ImportError:
+            return html
+
+        soup = _BS(html, "html.parser")
+
+        # ── MathJax: extract <nobr> text from .MathJax spans ──────
+        for math_el in soup.select(".MathJax"):
+            nobr = math_el.find("nobr")
+            if nobr:
+                t = nobr.get_text("", strip=True)
+                if t:
+                    if _re.search(r'\\[a-zA-Z]', t):
+                        math_el.replace_with(f" ${t}$ ")
+                    else:
+                        math_el.replace_with(f" {t} ")
+                    continue
+            math_el.decompose()
+        for sel in (".MathJax_Preview", "script[type='math/tex']",
+                     ".MJX_Assistive_MathML"):
+            for el in soup.select(sel):
+                el.decompose()
+
+        # ── Code blocks: <pre> → ``` fences ──────────────────────
+        for pre in soup.find_all("pre"):
+            lang = ""
+            code_el = pre.find("code")
+            if code_el:
+                cls = code_el.get("class", [])
+                if isinstance(cls, str):
+                    cls = [cls]
+                for c in cls:
+                    if c.startswith("language-") or c.startswith("lang-"):
+                        lang = c.split("-", 1)[1]
+                        break
+            text = pre.get_text()
+            # Strip CF "Copy" button text
+            text = _re.sub(r'\bCopy\b', '', text)
+            fence = f"```{lang}" if lang else "```"
+            pre.replace_with(f"\n{fence}\n{text.strip()}\n```\n")
+
+        # ── Inline code: <code> → backticks ──────────────────────
+        for code in soup.find_all("code"):
+            if code.find_parent("pre"):
+                continue  # already handled
+            code.replace_with(f"`{code.get_text()}`")
+
+        # ── Inline formatting ─────────────────────────────────────
+        for b in soup.find_all(["b", "strong"]):
+            b.replace_with(f"**{b.get_text()}**")
+        for i in soup.find_all(["i", "em"]):
+            i.replace_with(f"*{i.get_text()}*")
+
+        # ── Lists ─────────────────────────────────────────────────
+        for li in soup.find_all("li"):
+            li.insert_before(_BS("", "html.parser").new_string("\n- "))
+            li.unwrap()
+        for tag in soup.find_all(["ul", "ol"]):
+            tag.unwrap()
+
+        # ── Headers ───────────────────────────────────────────────
+        for h_level in range(1, 7):
+            for h in soup.find_all(f"h{h_level}"):
+                prefix = "#" * h_level
+                h.insert_before(_BS("", "html.parser").new_string(
+                    f"\n\n{prefix} "))
+                h.insert_after("\n")
+                h.unwrap()
+
+        # ── Block elements → paragraph breaks ─────────────────────
+        for p in soup.find_all(["p", "div"]):
+            p.insert_after("\n\n")
+
+        # ── Sub/sup → LaTeX ──────────────────────────────────────
+        for sub in soup.find_all("sub"):
+            sub.replace_with(f"_{{{sub.get_text()}}}")
+        for sup in soup.find_all("sup"):
+            sup.replace_with(f"^{{{sup.get_text()}}}")
+
+        # ── Line breaks ──────────────────────────────────────────
+        for br in soup.find_all("br"):
+            br.replace_with("\n")
+
+        # ── Links: keep text, drop href ──────────────────────────
+        for a in soup.find_all("a"):
+            a.unwrap()
+
+        # ── Strip remaining tags ──────────────────────────────────
+        text = soup.get_text()
+
+        # ── $$$ delimiter conversion (same as _cf_extract) ───────
+        parts = text.split("$$$")
+        FENCE = "\x00MATHFENCE\x00"
+        rebuilt = parts[0]
+        for pi in range(1, len(parts)):
+            if pi % 2 == 1:
+                seg = parts[pi]
+                if seg.strip() == "":
+                    rebuilt += FENCE
+                else:
+                    rebuilt += "$" + seg + "$"
+            else:
+                rebuilt += parts[pi]
+        text = rebuilt
+        # Merge adjacent inline blocks $A$$B$ → $AB$
+        for _ in range(10):
+            new_text = _re.sub(r'\$([^$]+?)\$\$([^$]+?)\$', r'$\1\2$', text)
+            if new_text == text:
+                break
+            text = new_text
+        text = text.replace(FENCE, "$$")
+
+        # ── Whitespace normalisation ──────────────────────────────
+        import html as _html
+        text = _html.unescape(text)
+        text = _re.sub(r"\r\n|\r", "\n", text)
+        text = _re.sub(r"\n{3,}", "\n\n", text)
+        text = _re.sub(r"[ \t]+\n", "\n", text)
+        text = _re.sub(r"\n[ \t]+", "\n", text)
+        text = _re.sub(r"[ \t]{2,}", " ", text)
+        text = _re.sub(r"CopyCopyCopied!", "", text)
+        return text.strip()
+
     def fetch_solutions(
         self, source_id: str, max_editorials: int = 5
     ) -> CrawlResult:
@@ -1016,28 +1150,29 @@ class CodeforcesCrawler(BaseCrawler):
             # Strategy A: find the problem-specific section in the editorial
             ttypography = soup.select_one(".ttypography, .content, .blog-content, .post-content, .entry-content")
             if ttypography:
-                # Try to split by problem headers
-                full_text = ttypography.get_text("\n", strip=True)
+                # Convert editorial HTML to Markdown first so that
+                # code fences, math delimiters, and formatting survive.
+                md_text = self._editorial_html_to_markdown(str(ttypography))
+                lines = md_text.split("\n")
+
                 # Look for the section that mentions this problem index
-                lines = full_text.split("\n")
-                in_section = False
-                section_lines: List[str] = []
                 prob_header_re = _re.compile(
-                    rf"^\s*(?:{_re.escape(str(contest_id))}\s*)?"
+                    rf"^\s*(?:#+\s*)?(?:{_re.escape(str(contest_id))}\s*)?"
                     rf"{_re.escape(index)}[\s\.\-:：]",
                     _re.IGNORECASE,
                 )
                 next_header_re = _re.compile(
-                    r"^\s*(?:\d+)?[A-Z]\d*[\s\.\-:：]",
+                    r"^\s*(?:#+\s*)?(?:\d+)?[A-Z]\d*[\s\.\-:：]",
                 )
 
+                in_section = False
+                section_lines: List[str] = []
                 for line in lines:
                     if prob_header_re.match(line):
                         in_section = True
                         section_lines = [line]
                     elif in_section:
                         if next_header_re.match(line) and not prob_header_re.match(line):
-                            # Next problem section starts → stop
                             break
                         section_lines.append(line)
 
@@ -1052,11 +1187,8 @@ class CodeforcesCrawler(BaseCrawler):
                         })
                         continue
 
-                # Strategy B: return the whole editorial as one solution
-                # Clean up the text
-                clean = _re.sub(r"\n{3,}", "\n\n", full_text)
-                clean = _re.sub(r"CopyCopyCopied!", "", clean)
-                clean = clean.strip()
+                # Strategy B: return the whole editorial as Markdown
+                clean = md_text.strip()
                 if len(clean) > 100:
                     solutions.append({
                         "author": "Codeforces Editorial",
