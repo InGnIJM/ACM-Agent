@@ -1173,11 +1173,6 @@ class CodeforcesCrawler(BaseCrawler):
         editorial_url = self._discover_editorial_url(problem_url, contest_id)
         if editorial_url:
             tutorial_links.append(editorial_url)
-        # Fallback: the contest announcement blog (may not contain
-        # problem-specific solutions but is better than nothing).
-        fallback_url = f"https://codeforces.com/blog/entry/{contest_id}"
-        if fallback_url not in tutorial_links:
-            tutorial_links.append(fallback_url)
 
         # ── Step 2: fetch editorial content ───────────────────────
         solutions: list = []
