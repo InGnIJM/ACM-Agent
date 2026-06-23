@@ -24,6 +24,8 @@ from crawlers.codeforces import CodeforcesCrawler
 
 def _mock_crawler() -> CodeforcesCrawler:
     """Return a CodeforcesCrawler with _rate_limiter set to no-op and _http_request mocked."""
+    # Clear the class-level problemset cache so each test starts fresh.
+    CodeforcesCrawler._clear_problemset_cache()
     crawler = CodeforcesCrawler.__new__(CodeforcesCrawler)
     crawler.PLATFORM = "codeforces"
     crawler.API_URL = "https://codeforces.com/api"
@@ -358,7 +360,7 @@ class TestCodeforcesFetchProblem:
         c._http_request.return_value = _crawl_ok([1, 2, 3])
         result = c.fetch_problem("1742E")
         assert not result.success
-        assert "Unexpected problemset" in (result.error or "")
+        assert "not found" in (result.error or "").lower()
 
     def test_parse_problem_id_simple(self) -> None:
         result = CodeforcesCrawler._parse_problem_id("1742E")

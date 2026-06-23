@@ -32,6 +32,70 @@ class CodeforcesCrawler(BaseCrawler):
 
     PLATFORM: str = "codeforces"
 
+    # ── Problemset metadata cache ────────────────────────────────
+    # _api("problemset.problems") returns all ~10 000 problems in a
+    # single ~5 MB JSON blob.  fetch_problem() used to call it for
+    # EVERY problem, re-downloading the same data N times.  This
+    # cache holds the parsed list keyed by "contestId+index" so only
+    # the first call hits the API; subsequent lookups are O(1) dict
+    # reads.  TTL defaults to 1 hour — the problemset rarely changes
+    # outside of contest times.
+    _problemset_cache: dict[str, dict] | None = None
+    _problemset_cache_ts: float = 0.0
+    _problemset_cache_ttl: float = 3600.0  # seconds
+
+    @classmethod
+    def _clear_problemset_cache(cls) -> None:
+        """Clear the problemset cache (for testing)."""
+        cls._problemset_cache = None
+        cls._problemset_cache_ts = 0.0
+
+    def _get_cached_problemset_meta(
+        self, contest_id: int, index: str
+    ) -> dict | None:
+        """Return metadata for a single problem from the local problemset
+        cache, downloading and populating the cache on first use or after
+        the TTL expires.
+        """
+        import time as _time
+        now = _time.monotonic()
+
+        # ── Populate cache if needed ──────────────────────────────
+        cls = type(self)
+        if (
+            cls._problemset_cache is None
+            or (now - cls._problemset_cache_ts) > cls._problemset_cache_ttl
+        ):
+            logger.info("Downloading full problemset for local cache…")
+            api_result = self._api("problemset.problems")
+            if not api_result.success:
+                logger.warning(
+                    "Failed to populate problemset cache: %s",
+                    api_result.error,
+                )
+                return None
+
+            raw = api_result.data
+            if not isinstance(raw, dict):
+                logger.warning("Unexpected problemset response format")
+                return None
+
+            problems: list[dict] = raw.get("problems", [])
+            cache: dict[str, dict] = {}
+            for p in problems:
+                cid = p.get("contestId")
+                idx = p.get("index")
+                if cid is not None and idx is not None:
+                    cache[f"{cid}{idx}"] = p
+            cls._problemset_cache = cache
+            cls._problemset_cache_ts = now
+            logger.info(
+                "Problemset cache loaded: %d problems",
+                len(cache),
+            )
+
+        return cls._problemset_cache.get(f"{contest_id}{index}")
+
     # ── class constants ─────────────────────────────────────────
 
     API_URL: str = "https://codeforces.com/api"
@@ -230,26 +294,8 @@ class CodeforcesCrawler(BaseCrawler):
                 source="http",
             )
 
-        # ── Step 1: get API metadata ───────────────────────────
-        api_result = self._api("problemset.problems")
-        if not api_result.success:
-            return api_result
-
-        raw = api_result.data
-        if not isinstance(raw, dict):
-            return CrawlResult(
-                success=False,
-                error="Unexpected problemset response format",
-                source="http",
-            )
-
-        problems = raw.get("problems", [])
-        meta = None
-        for p in problems:
-            if p.get("contestId") == contest_id and p.get("index") == index:
-                meta = p
-                break
-
+        # ── Step 1: get API metadata (cached) ────────────────────
+        meta = self._get_cached_problemset_meta(contest_id, index)
         if meta is None:
             return CrawlResult(
                 success=False,
