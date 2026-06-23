@@ -1431,15 +1431,27 @@ def main(argv: Optional[list] = None) -> None:
 
                 result = CrawlResult(success=True, data=enriched, source=result.source)
                 _save_result(crawler, result.data, "problems", str(tag) or "all")
-                # Fetch solutions for each problem
-                for prob in enriched:
-                    cid = prob.get('contestId', '')
-                    idx = prob.get('index', '')
-                    sid = f"{cid}{idx}" if cid and idx else ''
-                    if sid:
-                        sol_result = executor.execute("fetch_solutions", str(sid), 5)
-                        if sol_result and sol_result.success and sol_result.data:
-                            _save_result(crawler, sol_result.data, "solutions", str(sid))
+                # Fetch solutions for each problem — parallel (I/O-bound)
+                import threading as _threading
+                _save_lock = _threading.Lock()
+
+                def _fetch_sol_worker(prob: dict) -> tuple[str, list | None]:
+                    cid = prob.get("contestId", "")
+                    idx = prob.get("index", "")
+                    sid = f"{cid}{idx}" if cid and idx else ""
+                    if not sid:
+                        return ("", None)
+                    worker = CodeforcesCrawler()
+                    sol = worker.fetch_solutions(sid, 5)
+                    if sol and sol.success and sol.data:
+                        with _save_lock:
+                            _save_result(crawler, sol.data, "solutions", str(sid))
+                        return (sid, sol.data)
+                    return (sid, None)
+
+                SOL_WORKERS = 3  # fewer workers: fetch_solutions uses _http_request
+                with _futures.ThreadPoolExecutor(max_workers=SOL_WORKERS) as pool:
+                    list(pool.map(_fetch_sol_worker, enriched))
 
         elif action == "fetch_records":
             uid = params.get("uid", "")

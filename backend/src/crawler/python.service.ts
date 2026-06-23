@@ -6,7 +6,7 @@ import * as fs from 'fs';
 @Injectable()
 export class PythonService {
   private readonly logger = new Logger(PythonService.name);
-  private readonly timeout = 300_000; // 5 minutes for full user record crawl
+  private readonly timeout = parseInt(process.env.CRAWLER_TIMEOUT_MS || '600000', 10);
   private readonly activeProcesses = new Map<string, ChildProcess>();
   // Windows CreateProcess has ~32K limit for command line; stay well below
   private readonly MAX_INLINE_JSON = 8000;
