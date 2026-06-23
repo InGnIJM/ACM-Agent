@@ -1010,6 +1010,19 @@ class CodeforcesCrawler(BaseCrawler):
         for br in soup.find_all("br"):
             br.replace_with("\n")
 
+        # ── CF spoilers: remove "Tutorial is loading…" placeholders ──
+        # The actual tutorial text is AJAX-loaded from /data/problemTutorial
+        # (Cloudflare-protected, inaccessible to curl).  The placeholder div
+        # contains no useful content; remove it.  The .spoiler-content wrapper
+        # is unwrapped so its children (e.g. <pre> code blocks) are preserved.
+        for spoiler_content in soup.select(".spoiler-content"):
+            # Remove "Tutorial is loading..." placeholder divs
+            for placeholder in spoiler_content.select(".problemTutorial"):
+                placeholder.decompose()
+            spoiler_content.unwrap()
+        for spoiler_title in soup.select(".spoiler-title"):
+            spoiler_title.unwrap()
+
         # ── Links: keep text, drop href ──────────────────────────
         for a in soup.find_all("a"):
             a.unwrap()
@@ -1212,14 +1225,17 @@ class CodeforcesCrawler(BaseCrawler):
                 md_text = self._editorial_html_to_markdown(str(ttypography))
                 lines = md_text.split("\n")
 
-                # Look for the section that mentions this problem index
+                # Look for the section that mentions this problem index.
+                # After Markdown conversion, problem headers may be
+                # wrapped in **bold** (e.g. "**2237I2 - Title**").
+                # Allow optional "**" prefix so the regex still matches.
                 prob_header_re = _re.compile(
-                    rf"^\s*(?:#+\s*)?(?:{_re.escape(str(contest_id))}\s*)?"
+                    rf"^\s*(?:\*\*)?(?:#+\s*)?(?:{_re.escape(str(contest_id))}\s*)?"
                     rf"{_re.escape(index)}[\s\.\-:：]",
                     _re.IGNORECASE,
                 )
                 next_header_re = _re.compile(
-                    r"^\s*(?:#+\s*)?(?:\d+)?[A-Z]\d*[\s\.\-:：]",
+                    r"^\s*(?:\*\*)?(?:#+\s*)?(?:\d+)?[A-Z]\d*[\s\.\-:：]",
                 )
 
                 in_section = False
