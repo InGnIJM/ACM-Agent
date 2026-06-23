@@ -164,7 +164,7 @@ export default function ProblemDetail() {
         <Paper sx={{ p: 3, overflow: "hidden" }}>
           {/* Solution Summary */}
           <Typography variant="h6" gutterBottom>题解总结</Typography>
-          <Markdown content={problem.solutionSummary ?? "暂无题解总结（配置 DeepSeek API Key 后可获得 AI 生成的题解总结）"} sourcePlatform={problem.sourcePlatform} />
+          <Markdown content={problem.solutionSummary ?? "暂无题解总结（配置 DeepSeek API Key 后可获得 AI 生成的题解总结）"} />
 
           <Divider sx={{ my: 3 }} />
 
@@ -179,7 +179,7 @@ export default function ProblemDetail() {
                   </Typography>
                 </AccordionSummary>
                 <AccordionDetails sx={{ overflow: "hidden" }}>
-                  <Markdown content={sol.content} sourcePlatform={problem.sourcePlatform} />
+                  <Markdown content={sol.content} />
                 </AccordionDetails>
               </Accordion>
             ))
