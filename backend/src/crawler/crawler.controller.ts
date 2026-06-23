@@ -394,14 +394,22 @@ export class CrawlerController {
         }
       }
       if (!problem) continue;
-      const solutionIndex = sol.solution_index ?? (sol.vote_count ? sol.vote_count + Date.now() % 1000 : Date.now() % 10000);
+      // Hash the first 200 chars of content as a stable solutionIndex so
+      // same content always maps to the same row (upsert → update instead
+      // of insert duplicate).  Prevents duplicate solutions across re-crawls.
+      const contentFingerprint = content.slice(0, 200);
+      let hash = 0;
+      for (let i = 0; i < contentFingerprint.length; i++) {
+        hash = ((hash << 5) - hash + contentFingerprint.charCodeAt(i)) | 0;
+      }
+      const solutionIndex = Math.abs(hash) % 100000;
       await this.prisma.problemSolution.upsert({
         where: {
-          problemId_solutionIndex: { problemId: problem.id, solutionIndex: Number(solutionIndex) % 100000 },
+          problemId_solutionIndex: { problemId: problem.id, solutionIndex },
         },
         create: {
           problemId: problem.id,
-          solutionIndex: Number(solutionIndex) % 100000,
+          solutionIndex,
           content,
           author: String(author),
         },
