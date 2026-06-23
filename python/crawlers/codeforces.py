@@ -1088,30 +1088,32 @@ class CodeforcesCrawler(BaseCrawler):
 
         editorial_keywords = ("editorial", "tutorial", "solution", "analysis")
 
-        # Check contest page
-        contest_result = self.fetch_with_fallback(contest_url)
+        # Check contest page — use curl (bypasses CF Cloudflare)
+        contest_result = self._curl_request(contest_url)
         if contest_result.success:
             html = self._extract_html_text(contest_result)
-            soup = _BS(html, "html.parser")
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                text = a.get_text(strip=True).lower()
-                if any(kw in text for kw in editorial_keywords):
-                    full = f"https://codeforces.com{href}" if href.startswith("/") else href
-                    if full not in tutorial_links:
-                        tutorial_links.append(full)
+            if html:
+                soup = _BS(html, "html.parser")
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    text = a.get_text(strip=True).lower()
+                    if any(kw in text for kw in editorial_keywords):
+                        full = f"https://codeforces.com{href}" if href.startswith("/") else href
+                        if full not in tutorial_links:
+                            tutorial_links.append(full)
 
-        # Check problem page sidebar
-        problem_result = self.fetch_with_fallback(problem_url)
+        # Check problem page sidebar — use curl
+        problem_result = self._curl_request(problem_url)
         if problem_result.success:
             html = self._extract_html_text(problem_result)
-            soup = _BS(html, "html.parser")
-            for a in soup.select(".sidebar-menu a, .roundbox a, .second-level-menu a"):
-                href = a.get("href", "")
-                if href and "blog/entry" in href:
-                    full = f"https://codeforces.com{href}" if href.startswith("/") else href
-                    if full not in tutorial_links:
-                        tutorial_links.append(full)
+            if html:
+                soup = _BS(html, "html.parser")
+                for a in soup.select(".sidebar-menu a, .roundbox a, .second-level-menu a"):
+                    href = a.get("href", "")
+                    if href and "blog/entry" in href:
+                        full = f"https://codeforces.com{href}" if href.startswith("/") else href
+                        if full not in tutorial_links:
+                            tutorial_links.append(full)
 
         # Always try the standard blog/entry/<contest_id> editorial URL
         blog_url = f"https://codeforces.com/blog/entry/{contest_id}"
@@ -1123,7 +1125,7 @@ class CodeforcesCrawler(BaseCrawler):
 
         for link in tutorial_links[:max_editorials]:
             logger.debug("CF fetching editorial: %s", link)
-            ed_result = self.fetch_with_fallback(link)
+            ed_result = self._curl_request(link)
             if not ed_result.success:
                 continue
 
@@ -1449,7 +1451,7 @@ def main(argv: Optional[list] = None) -> None:
                         return (sid, sol.data)
                     return (sid, None)
 
-                SOL_WORKERS = 3  # fewer workers: fetch_solutions uses _http_request
+                SOL_WORKERS = 5  # _curl_request is not rate-limited, safe to parallelize
                 with _futures.ThreadPoolExecutor(max_workers=SOL_WORKERS) as pool:
                     list(pool.map(_fetch_sol_worker, enriched))
 
