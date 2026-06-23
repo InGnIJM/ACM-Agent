@@ -1050,6 +1050,74 @@ class CodeforcesCrawler(BaseCrawler):
         text = _re.sub(r"CopyCopyCopied!", "", text)
         return text.strip()
 
+    @staticmethod
+    def _discover_editorial_url(
+        problem_url: str, contest_id: int
+    ) -> str | None:
+        """Find the editorial blog URL for a contest by scraping blog entry
+        links from the problem page.
+
+        CF no longer embeds editorial links in static HTML — the sidebar
+        is loaded via JS from /data/problemTutorial which is behind
+        Cloudflare.  Instead, we collect ALL blog/entry/{id} links visible
+        on the problem page (Recent Actions, top menu, etc.), fetch each
+        page title, and return the one whose <title> contains "Editorial"
+        and the contest ID.
+        """
+        import re as _re
+
+        page = CodeforcesCrawler._curl_request(problem_url)
+        if not page.success:
+            return None
+        html = CodeforcesCrawler._extract_html_text(page)
+        if not html:
+            return None
+
+        # Collect unique blog entry IDs from the page
+        blog_ids: set[int] = set()
+        for m in _re.finditer(r'/blog/entry/(\d+)', html):
+            blog_ids.add(int(m.group(1)))
+        if not blog_ids:
+            return None
+
+        logger.info(
+            "Scanning %d blog entries for editorial (contest %d)…",
+            len(blog_ids), contest_id,
+        )
+
+        for bid in blog_ids:
+            blog_url = f"https://codeforces.com/blog/entry/{bid}"
+            # Only fetch the first few KB — enough for <title>
+            result = CodeforcesCrawler._curl_request(blog_url)
+            if not result.success:
+                continue
+            blog_html = CodeforcesCrawler._extract_html_text(result)
+            if not blog_html:
+                continue
+            # Extract <title> from the first 8 KB (CF pages have
+            # large <head> sections with GA / meta / CSRF / MathJax).
+            head = blog_html[:8192]
+            title_m = _re.search(r'<title>([^<]*)</title>', head, _re.IGNORECASE)
+            if not title_m:
+                continue
+            title = title_m.group(1)
+            if "editorial" not in title.lower():
+                continue
+            # The title rarely contains the contest ID (CF uses round
+            # numbers like "Round 1104" instead).  Verify by checking
+            # the page content for contest URL patterns.  Search the
+            # full HTML — editorial content starts ~50 KB in after CF
+            # boilerplate (header, menus, sidebar).
+            if _re.search(
+                rf'/contest/{contest_id}\b', blog_html
+            ) or _re.search(
+                rf'contestId[=:]\s*{contest_id}', blog_html
+            ):
+                logger.info("Found editorial: %s → %s", blog_url, title)
+                return blog_url
+
+        return None
+
     def fetch_solutions(
         self, source_id: str, max_editorials: int = 5
     ) -> CrawlResult:
@@ -1078,47 +1146,25 @@ class CodeforcesCrawler(BaseCrawler):
         problem_url = f"https://codeforces.com/problemset/problem/{contest_id}/{index}"
         contest_url = f"https://codeforces.com/contest/{contest_id}"
 
-        # ── Step 1: find editorial / tutorial URLs ────────────────
-        tutorial_links: List[str] = []
-
+        # ── Step 1: find the editorial blog URL ──────────────────
+        # CF's editorial sidebar is loaded via JS (/data/problemTutorial)
+        # which is behind Cloudflare.  Instead, collect all blog/entry
+        # links from the problem page and pick the one whose <title>
+        # contains "Editorial" + the contest ID.
         try:
             from bs4 import BeautifulSoup as _BS
         except ImportError:
             return CrawlResult(success=True, data=[], source="http")
 
-        editorial_keywords = ("editorial", "tutorial", "solution", "analysis")
-
-        # Check contest page — use curl (bypasses CF Cloudflare)
-        contest_result = self._curl_request(contest_url)
-        if contest_result.success:
-            html = self._extract_html_text(contest_result)
-            if html:
-                soup = _BS(html, "html.parser")
-                for a in soup.find_all("a", href=True):
-                    href = a["href"]
-                    text = a.get_text(strip=True).lower()
-                    if any(kw in text for kw in editorial_keywords):
-                        full = f"https://codeforces.com{href}" if href.startswith("/") else href
-                        if full not in tutorial_links:
-                            tutorial_links.append(full)
-
-        # Check problem page sidebar — use curl
-        problem_result = self._curl_request(problem_url)
-        if problem_result.success:
-            html = self._extract_html_text(problem_result)
-            if html:
-                soup = _BS(html, "html.parser")
-                for a in soup.select(".sidebar-menu a, .roundbox a, .second-level-menu a"):
-                    href = a.get("href", "")
-                    if href and "blog/entry" in href:
-                        full = f"https://codeforces.com{href}" if href.startswith("/") else href
-                        if full not in tutorial_links:
-                            tutorial_links.append(full)
-
-        # Always try the standard blog/entry/<contest_id> editorial URL
-        blog_url = f"https://codeforces.com/blog/entry/{contest_id}"
-        if blog_url not in tutorial_links:
-            tutorial_links.append(blog_url)
+        tutorial_links: List[str] = []
+        editorial_url = self._discover_editorial_url(problem_url, contest_id)
+        if editorial_url:
+            tutorial_links.append(editorial_url)
+        # Fallback: the contest announcement blog (may not contain
+        # problem-specific solutions but is better than nothing).
+        fallback_url = f"https://codeforces.com/blog/entry/{contest_id}"
+        if fallback_url not in tutorial_links:
+            tutorial_links.append(fallback_url)
 
         # ── Step 2: fetch editorial content ───────────────────────
         solutions: list = []
