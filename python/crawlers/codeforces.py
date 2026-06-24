@@ -44,6 +44,23 @@ class CodeforcesCrawler(BaseCrawler):
     _problemset_cache_ts: float = 0.0
     _problemset_cache_ttl: float = 3600.0  # seconds
 
+    # ── Editorial caches ─────────────────────────────────────────
+    # When using a headless browser to load editorial pages (so that
+    # AJAX-loaded Tutorial text becomes available), the rendered HTML
+    # is cached here so all problems in the same contest reuse the
+    # same page load.  The URL → editorial-URL mapping is also cached
+    # so _discover_editorial_url only runs once per contest.
+    _editorial_cache: dict[str, str] = {}       # URL → rendered HTML
+    _editorial_url_cache: dict[int, str | None] = {}  # contest_id → editorial_url
+    _editorial_cache_lock: object = __import__('threading').Lock()
+
+    @classmethod
+    def _clear_editorial_cache(cls) -> None:
+        """Clear the editorial caches (for testing)."""
+        with cls._editorial_cache_lock:
+            cls._editorial_cache.clear()
+            cls._editorial_url_cache.clear()
+
     @classmethod
     def _clear_problemset_cache(cls) -> None:
         """Clear the problemset cache (for testing)."""
@@ -1067,15 +1084,15 @@ class CodeforcesCrawler(BaseCrawler):
     def _discover_editorial_url(
         problem_url: str, contest_id: int
     ) -> str | None:
-        """Find the editorial blog URL for a contest by scraping blog entry
-        links from the problem page.
+        """Find the editorial blog URL for a contest.
 
-        CF no longer embeds editorial links in static HTML — the sidebar
-        is loaded via JS from /data/problemTutorial which is behind
-        Cloudflare.  Instead, we collect ALL blog/entry/{id} links visible
-        on the problem page (Recent Actions, top menu, etc.), fetch each
-        page title, and return the one whose <title> contains "Editorial"
-        and the contest ID.
+        Scrapes the problem page for blog entry links and checks the most
+        recent ones for an editorial title matching the contest.
+
+        The editorial is almost always in the "Recent Actions" sidebar,
+        which shows ~10 most recent blog posts.  By scanning the first
+        N unique entries (newest first), we reliably find it without
+        fetching every blog link on the page.
         """
         import re as _re
 
@@ -1086,41 +1103,53 @@ class CodeforcesCrawler(BaseCrawler):
         if not html:
             return None
 
-        # Collect unique blog entry IDs from the page
-        blog_ids: set[int] = set()
+        # Collect unique blog entry IDs, preserving order (newest first).
+        # Entries typically appear in the sidebar's "Recent Actions" list
+        # before any other sections.
+        blog_ids_deduped: list[int] = []
+        seen: set[int] = set()
         for m in _re.finditer(r'/blog/entry/(\d+)', html):
-            blog_ids.add(int(m.group(1)))
-        if not blog_ids:
+            bid = int(m.group(1))
+            if bid not in seen:
+                seen.add(bid)
+                blog_ids_deduped.append(bid)
+
+        if not blog_ids_deduped:
             return None
 
+        # Sort by entry ID descending (newest first) and limit to 20.
+        # The editorial is always among the most recent blog posts; older
+        # entries (2+ pages down in the sidebar) are noise.
+        candidates = sorted(blog_ids_deduped, reverse=True)[:20]
+
         logger.info(
-            "Scanning %d blog entries for editorial (contest %d)…",
-            len(blog_ids), contest_id,
+            "Scanning up to %d blog entries for editorial (contest %d)…",
+            len(candidates), contest_id,
         )
 
-        for bid in blog_ids:
+        for bid in candidates:
             blog_url = f"https://codeforces.com/blog/entry/{bid}"
-            # Only fetch the first few KB — enough for <title>
             result = CodeforcesCrawler._curl_request(blog_url)
             if not result.success:
                 continue
             blog_html = CodeforcesCrawler._extract_html_text(result)
             if not blog_html:
                 continue
-            # Extract <title> from the first 8 KB (CF pages have
-            # large <head> sections with GA / meta / CSRF / MathJax).
+            # Extract <title> from the first 8 KB
             head = blog_html[:8192]
-            title_m = _re.search(r'<title>([^<]*)</title>', head, _re.IGNORECASE)
+            title_m = _re.search(
+                r'<title>([^<]*)</title>', head, _re.IGNORECASE,
+            )
             if not title_m:
                 continue
             title = title_m.group(1)
             if "editorial" not in title.lower():
                 continue
-            # The title rarely contains the contest ID (CF uses round
-            # numbers like "Round 1104" instead).  Verify by checking
-            # the page content for contest URL patterns.  Search the
-            # full HTML — editorial content starts ~50 KB in after CF
-            # boilerplate (header, menus, sidebar).
+
+            # Verify contest ID appears in the page content.
+            # CF editorial pages link to each problem via
+            # /contest/{contest_id}/problem/{idx}, so this is a
+            # reliable signal even for older editorials.
             if _re.search(
                 rf'/contest/{contest_id}\b', blog_html
             ) or _re.search(
@@ -1131,14 +1160,288 @@ class CodeforcesCrawler(BaseCrawler):
 
         return None
 
+    # ── Browser-based editorial fetching ─────────────────────────
+
+    @classmethod
+    def _fetch_editorial_rendered(cls, editorial_url: str) -> str | None:
+        """Load an editorial page with a headless browser so that
+        AJAX-loaded Tutorial text becomes available.
+
+        Uses Scrapling's ``StealthyFetcher`` with Playwright Chromium.
+        The rendered HTML is cached at class level so all problems in
+        the same contest reuse the same page load.
+
+        Returns the fully-rendered HTML string, or None on failure.
+        """
+        import threading as _threading
+
+        # ── Check cache first ────────────────────────────────────
+        with cls._editorial_cache_lock:
+            if editorial_url in cls._editorial_cache:
+                logger.debug(
+                    "Editorial cache hit: %s", editorial_url,
+                )
+                return cls._editorial_cache[editorial_url]
+
+        # ── Load with headless browser ───────────────────────────
+        try:
+            from scrapling.fetchers import StealthyFetcher
+        except ImportError:
+            logger.warning(
+                "Scrapling not installed — falling back to static HTML"
+            )
+            return None
+
+        logger.info(
+            "Loading editorial with headless browser: %s", editorial_url,
+        )
+        import time as _time
+        t0 = _time.monotonic()
+
+        try:
+            # Use the system proxy if configured
+            proxy = getattr(cls, '_scrapling_proxy', None)
+            if proxy:
+                StealthyFetcher.proxy = proxy
+
+            page = StealthyFetcher.fetch(
+                f"{editorial_url}?locale=en",
+                headless=True,
+                network_idle=True,
+                timeout=30_000,
+            )
+            html = page.html_content if hasattr(page, 'html_content') else \
+                   page.body.decode('utf-8', errors='replace')
+        except Exception as exc:
+            elapsed = _time.monotonic() - t0
+            logger.warning(
+                "Headless browser fetch failed after %.1fs: %s",
+                elapsed, exc,
+            )
+            return None
+
+        elapsed = _time.monotonic() - t0
+        logger.info(
+            "Editorial rendered in %.1fs (%d bytes)",
+            elapsed, len(html),
+        )
+
+        # ── Cache and return ─────────────────────────────────────
+        with cls._editorial_cache_lock:
+            cls._editorial_cache[editorial_url] = html
+        return html
+
+    @staticmethod
+    def _parse_editorial_html(html: str, contest_id: int) -> dict:
+        """Parse CF editorial HTML and extract per-problem solutions.
+
+        Each problem in an editorial is structured as:
+          <p><a href="/contest/{cid}/problem/{idx}">{cid}{idx} - Title</a></p>
+          <p>Idea: ... Preparation: ...</p>
+          <div class="spoiler">
+            <b class="spoiler-title">Tutorial</b>
+            <div class="spoiler-content">
+              <div class="problemTutorial">Tutorial is loading...</div>
+              <!-- tutorial text is AJAX-loaded, not in static HTML -->
+            </div>
+          </div>
+          <div class="spoiler">
+            <b class="spoiler-title">Implementation</b>
+            <div class="spoiler-content">
+              <pre><code>// actual solution code</code></pre>
+            </div>
+          </div>
+
+        Returns a dict mapping problem index (e.g. ``"A"``, ``"E1"``) to
+        a solution dict with ``author``, ``title``, ``content``, ``vote_count``.
+        """
+        import re as _re
+        try:
+            from bs4 import BeautifulSoup as _BS, Tag as _Tag
+        except ImportError:
+            return {}
+
+        import html as _html
+
+        soup = _BS(html, "html.parser")
+        # Only the FIRST .ttypography is the main editorial content;
+        # subsequent .ttypography divs are blog comments.
+        ttypography = soup.select_one(".ttypography")
+        if not ttypography:
+            # Fallback: try .content container directly
+            content_div = soup.select_one(".content")
+            if content_div:
+                ttypography = content_div.find("div", class_="ttypography")
+        if not ttypography:
+            return {}
+
+        # Collect top-level Tag children — these are <p>, <div>, etc.
+        # Skip NavigableStrings (whitespace between elements).
+        children: list = [
+            c for c in ttypography.children if isinstance(c, _Tag)
+        ]
+
+        # Find problem boundaries:
+        # <p><a href="/contest/{cid}/problem/{idx}">...</a></p>
+        problem_link_re = _re.compile(
+            rf"^/contest/{contest_id}/problem/([A-Z]\d*)$"
+        )
+        boundaries: list = []  # (child_index, problem_index, header_text)
+        for i, child in enumerate(children):
+            link = child.find(
+                "a", href=_re.compile(
+                    rf"^/contest/{contest_id}/problem/[A-Z]\d*$"
+                )
+            )
+            if link and child.name == "p":
+                href = link.get("href", "")
+                m = problem_link_re.search(href)
+                if m:
+                    boundaries.append((
+                        i, m.group(1), link.get_text(strip=True),
+                    ))
+
+        if not boundaries:
+            logger.debug(
+                "No problem <a> links found in editorial for contest %d",
+                contest_id,
+            )
+            return {}
+
+        # ── Extract solution for each problem ─────────────────────
+        solutions: dict = {}
+        for j, (start_i, idx, header) in enumerate(boundaries):
+            end_i = (
+                boundaries[j + 1][0]
+                if j + 1 < len(boundaries)
+                else len(children)
+            )
+
+            # Walk children between this problem's <p><a> and the next
+            # one's, collecting Tutorial text + Implementation code.
+            tutorial_text = ""
+            code = ""
+            for child in children[start_i + 1 : end_i]:
+                if child.name != "div":
+                    continue
+                classes = child.get("class") or []
+                if "spoiler" not in classes:
+                    continue
+                title_el = child.select_one(".spoiler-title")
+                if not title_el:
+                    continue
+                title_text = title_el.get_text(strip=True)
+
+                if title_text.lower() == "implementation":
+                    # Extract <pre> content — this is the solution code.
+                    # Use raw text extraction to avoid syntax-highlight
+                    # <span> tags (added by the browser) splitting tokens
+                    # onto separate lines.
+                    pre_el = child.find("pre")
+                    if pre_el:
+                        # Strip all tags, then unescape HTML entities
+                        raw = str(pre_el)
+                        raw = _re.sub(r'<[^>]+>', '', raw)
+                        code = _html.unescape(raw).strip()
+                        # Normalise leading whitespace per line
+                        lines = code.split('\n')
+                        # Strip trailing empty lines
+                        while lines and not lines[-1].strip():
+                            lines.pop()
+                        code = '\n'.join(lines)
+
+                elif title_text.lower() == "tutorial":
+                    # Extract tutorial explanation from rendered HTML.
+                    # After JS execution, .spoiler-content contains real
+                    # text (not the "Tutorial is loading..." placeholder).
+                    sc = child.select_one(".spoiler-content")
+                    if sc:
+                        # Clean MathJax: extract <nobr> text, remove
+                        # preview/script/MathML artifacts (same approach
+                        # as _cf_extract for problem statements).
+                        _soup = _BS(str(sc), "html.parser")
+                        # Replace .MathJax wrappers with <nobr> text
+                        for math_el in _soup.select(".MathJax"):
+                            nobr = math_el.find("nobr")
+                            if nobr:
+                                t = nobr.get_text("", strip=True)
+                                if t:
+                                    if _re.search(r'\\[a-zA-Z]', t):
+                                        math_el.replace_with(f" ${t}$ ")
+                                    else:
+                                        math_el.replace_with(f" {t} ")
+                                    continue
+                            math_el.decompose()
+                        # Remove remaining MathJax artifacts
+                        for sel in (".MathJax_Preview",
+                                     "script[type='math/tex']",
+                                     ".MJX_Assistive_MathML"):
+                            for el in _soup.select(sel):
+                                el.decompose()
+                        tutorial_text = _soup.get_text(" ", strip=True)
+                        # Collapse whitespace
+                        tutorial_text = _re.sub(r'\s+', ' ', tutorial_text).strip()
+                        # Strip Russian/localised title prefix that CF
+                        # inserts before the actual explanation (e.g.
+                        # "2237A - Разрушение башен").
+                        # The prefix starts with the contest+index and
+                        # runs until the first English word or sentence.
+                        tutorial_text = _re.sub(
+                            rf'^{_re.escape(str(contest_id))}'
+                            rf'{_re.escape(idx)}\s*[-–—]\s*\S[^a-zA-Z]*',
+                            '', tutorial_text,
+                        ).strip()
+
+            if not code:
+                # No Implementation spoiler found — some editorials
+                # (especially older ones) inline the code differently.
+                # Skip this problem.
+                logger.debug(
+                    "No Implementation spoiler for problem %s in editorial",
+                    idx,
+                )
+                continue
+
+            # ── Build solution markdown content ──────────────────
+            parts: list = [f"## {header}"]
+            # Include tutorial explanation if available
+            if tutorial_text:
+                parts.append(f"\n### 题解\n{tutorial_text}")
+            # Detect programming language from code heuristics
+            lang = "cpp"  # CF default
+            if code.strip().startswith("def ") or code.strip().startswith("import "):
+                lang = "python"
+            elif code.strip().startswith("import java"):
+                lang = "java"
+            parts.append(f"\n### 代码\n```{lang}\n{code}\n```")
+            if not tutorial_text:
+                # Only show the AJAX warning when tutorial is missing
+                parts.append(
+                    "\n> **注意**：题解解释（Tutorial）部分由 Codeforces "
+                    "通过 JavaScript 动态加载，静态爬取仅能获取代码实现。"
+                    "请访问原页面查看完整题解。"
+                )
+
+            solutions[idx] = {
+                "author": "Codeforces Editorial",
+                "title": header,
+                "content": "\n".join(parts),
+                "vote_count": 0,
+                "solution_index": 0,  # CF 每題只有 1 篇 editorial
+            }
+
+        return solutions
+
     def fetch_solutions(
         self, source_id: str, max_editorials: int = 5
     ) -> CrawlResult:
         """Fetch solution content for a Codeforces problem.
 
-        Scrapes editorial blog posts and extracts solution text for the
-        specific problem (matching by problem index letter). Falls back
-        to returning the full editorial content as a single solution.
+        Fetches the contest editorial blog post and extracts the
+        per-problem solution (code from the Implementation spoiler).
+
+        The Tutorial explanation text is AJAX-loaded by CF JavaScript
+        and is NOT available in static HTML; only the code is extracted.
 
         Args:
             source_id: Problem identifier (e.g. ``"1742E"``).
@@ -1156,126 +1459,140 @@ class CodeforcesCrawler(BaseCrawler):
                 source="http",
             )
 
-        problem_url = f"https://codeforces.com/problemset/problem/{contest_id}/{index}"
-        contest_url = f"https://codeforces.com/contest/{contest_id}"
+        problem_url = (
+            f"https://codeforces.com/problemset/problem/"
+            f"{contest_id}/{index}"
+        )
 
         # ── Step 1: find the editorial blog URL ──────────────────
-        # CF's editorial sidebar is loaded via JS (/data/problemTutorial)
-        # which is behind Cloudflare.  Instead, collect all blog/entry
-        # links from the problem page and pick the one whose <title>
-        # contains "Editorial" + the contest ID.
+        cls = type(self)
+        with cls._editorial_cache_lock:
+            if contest_id in cls._editorial_url_cache:
+                editorial_url = cls._editorial_url_cache[contest_id]
+            else:
+                editorial_url = None  # discover outside lock
+
+        if editorial_url is None and contest_id not in cls._editorial_url_cache:
+            editorial_url = self._discover_editorial_url(problem_url, contest_id)
+            with cls._editorial_cache_lock:
+                cls._editorial_url_cache[contest_id] = editorial_url
+
+        if not editorial_url:
+            return CrawlResult(
+                success=False,
+                error=(
+                    f"No editorial found for contest {contest_id} "
+                    f"(problem {source_id})"
+                ),
+                source="http",
+            )
+
+        # ── Step 2: fetch editorial HTML ─────────────────────────
+        # Try headless browser first → gets AJAX-loaded Tutorial text.
+        # Fall back to curl if browser is unavailable or fails.
+        html = self._fetch_editorial_rendered(editorial_url)
+
+        if not html:
+            # Fallback: static curl (fast but no Tutorial text)
+            logger.debug(
+                "Browser unavailable, falling back to curl: %s",
+                editorial_url,
+            )
+            ed_result = self._curl_request(editorial_url)
+            if not ed_result.success:
+                return CrawlResult(
+                    success=False,
+                    error=ed_result.error,
+                    source="http",
+                )
+            html = self._extract_html_text(ed_result)
+
+        if not html:
+            return CrawlResult(
+                success=False,
+                error="Empty editorial HTML",
+                source="http",
+            )
+
+        # Parse ALL solutions from the editorial HTML
+        all_solutions = self._parse_editorial_html(html, contest_id)
+
+        # Return only the solution matching this problem's index
+        if index in all_solutions:
+            return CrawlResult(
+                success=True,
+                data=[all_solutions[index]],
+                source="http",
+            )
+
+        # ── Fallback: try the old markdown-based extraction ──────
+        # for editorials that don't use the standard spoiler format
         try:
             from bs4 import BeautifulSoup as _BS
         except ImportError:
-            return CrawlResult(success=True, data=[], source="http")
+            return CrawlResult(
+                success=False,
+                error=(
+                    f"Problem '{index}' not found in editorial "
+                    f"and no fallback available"
+                ),
+                source="http",
+            )
 
-        tutorial_links: List[str] = []
-        editorial_url = self._discover_editorial_url(problem_url, contest_id)
-        if editorial_url:
-            tutorial_links.append(editorial_url)
+        soup = _BS(html, "html.parser")
+        title_tag = soup.find("title")
+        page_title = (
+            title_tag.get_text(strip=True)
+            if title_tag else "Codeforces Editorial"
+        )
 
-        # ── Step 2: fetch editorial content ───────────────────────
-        solutions: list = []
-
-        for link in tutorial_links[:max_editorials]:
-            logger.debug("CF fetching editorial: %s", link)
-            ed_result = self._curl_request(link)
-            if not ed_result.success:
-                continue
-
-            html = self._extract_html_text(ed_result)
-            if not html:
-                continue
-
-            soup = _BS(html, "html.parser")
-
-            # Extract page title
-            title_tag = soup.find("title")
-            page_title = title_tag.get_text(strip=True) if title_tag else "Codeforces Editorial"
-
-            # Try to find content specific to this problem's index
-            # Editorial format: usually has headers like "1742A - Some Name" or "A. Some Name"
+        ttypography = soup.select_one(
+            ".ttypography, .content"
+        )
+        if ttypography:
             import re as _re
-            problem_pattern = _re.compile(
-                rf"(?:^|\n|<(?:p|div|h\d)[^>]*?>)\s*"
-                rf"(?:{_re.escape(str(contest_id))})?\s*"
-                rf"{_re.escape(index)}[\.\s\-:：]",
+            md_text = self._editorial_html_to_markdown(str(ttypography))
+            lines = md_text.split("\n")
+
+            prob_header_re = _re.compile(
+                rf"^\s*(?:\*\*)?(?:#+\s*)?"
+                rf"(?:{_re.escape(str(contest_id))}\s*)?"
+                rf"{_re.escape(index)}[\s\.\-:：]",
                 _re.IGNORECASE,
             )
-
-            # Strategy A: find the problem-specific section in the editorial.
-            # .ttypography must come BEFORE .content so the innermost content
-            # container is chosen — CF blog pages wrap .ttypography inside
-            # a .content div, and we want the inner one.
-            ttypography = soup.select_one(
-                ".ttypography, .blog-content, .post-content, .entry-content, "
-                ".problem-statement, .content"
+            next_header_re = _re.compile(
+                r"^\s*(?:\*\*)?(?:#+\s*)?(?:\d+)?[A-Z]\d*[\s\.\-:：]",
             )
-            # Fallback: if none matched, use the whole page body
-            if not ttypography:
-                ttypography = soup.find("body")
-            if ttypography:
-                # Convert editorial HTML to Markdown first so that
-                # code fences, math delimiters, and formatting survive.
-                md_text = self._editorial_html_to_markdown(str(ttypography))
-                lines = md_text.split("\n")
 
-                # Look for the section that mentions this problem index.
-                # After Markdown conversion, problem headers may be
-                # wrapped in **bold** (e.g. "**2237I2 - Title**").
-                # Allow optional "**" prefix so the regex still matches.
-                prob_header_re = _re.compile(
-                    rf"^\s*(?:\*\*)?(?:#+\s*)?(?:{_re.escape(str(contest_id))}\s*)?"
-                    rf"{_re.escape(index)}[\s\.\-:：]",
-                    _re.IGNORECASE,
-                )
-                next_header_re = _re.compile(
-                    r"^\s*(?:\*\*)?(?:#+\s*)?(?:\d+)?[A-Z]\d*[\s\.\-:：]",
-                )
+            in_section = False
+            section_lines = []
+            for line in lines:
+                if prob_header_re.match(line):
+                    in_section = True
+                    section_lines = [line]
+                elif in_section:
+                    if next_header_re.match(line) and not prob_header_re.match(line):
+                        break
+                    section_lines.append(line)
 
-                in_section = False
-                section_lines: List[str] = []
-                for line in lines:
-                    if prob_header_re.match(line):
-                        in_section = True
-                        section_lines = [line]
-                    elif in_section:
-                        if next_header_re.match(line) and not prob_header_re.match(line):
-                            break
-                        section_lines.append(line)
-
-                if section_lines:
-                    content = "\n".join(section_lines).strip()
-                    if len(content) > 50:
-                        solutions.append({
+            if section_lines:
+                content = "\n".join(section_lines).strip()
+                if len(content) > 50:
+                    return CrawlResult(
+                        success=True,
+                        data=[{
                             "author": "Codeforces Editorial",
                             "title": f"{source_id} Solution",
                             "content": content,
                             "vote_count": 0,
-                        })
-                        continue
-
-                # Strategy B: return the whole editorial as Markdown
-                clean = md_text.strip()
-                if len(clean) > 100:
-                    solutions.append({
-                        "author": "Codeforces Editorial",
-                        "title": page_title or f"Contest {contest_id} Editorial",
-                        "content": clean,
-                        "vote_count": 0,
-                    })
-                    break  # Got the full editorial, no need to try more links
-
-        if not solutions:
-            return CrawlResult(
-                success=False,
-                error=f"No solution content found for problem '{source_id}'",
-                source="http",
-            )
+                        }],
+                        source="http",
+                    )
 
         return CrawlResult(
-            success=True,
-            data=solutions,
+            success=False,
+            error=f"No solution found for problem '{source_id}' "
+                  f"in editorial",
             source="http",
         )
 
