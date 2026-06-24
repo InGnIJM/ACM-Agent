@@ -782,8 +782,12 @@ class AtCoderCrawler(BaseCrawler):
     ) -> CrawlResult:
         """Fetch solution / editorial content for an AtCoder problem.
 
-        Visits ``/contests/{contest_id}/editorial`` and extracts
-        solution text with KaTeX math and code blocks.
+        AtCoder editorials have a 3-level structure:
+          1. Problem page → link to editorial index
+          2. Editorial index (/contests/{contest}/editorial) → links to
+             per-problem editorial pages
+          3. Per-problem editorial (/contests/{contest}/editorial/{id})
+             → actual solution content
 
         Args:
             source_id: Problem identifier (e.g. ``"abc400_a"``).
@@ -801,8 +805,14 @@ class AtCoderCrawler(BaseCrawler):
                 source="http",
             )
 
+        # Parse problem index (e.g. "abc400_a" → "a")
+        _, index = self._parse_problem_id(source_id)
+        index_lower = index.lower()
+        index_upper = index.upper()
+
+        # ── Step 1: fetch the editorial index page ──────────────
         editorial_url = f"{self.BASE_URL}/contests/{contest_id}/editorial"
-        logger.debug("AtCoder fetching editorial: %s", editorial_url)
+        logger.debug("AtCoder fetching editorial index: %s", editorial_url)
 
         page_result = self.fetch_with_fallback(editorial_url)
         if not page_result.success:
@@ -817,104 +827,77 @@ class AtCoderCrawler(BaseCrawler):
             )
 
         try:
-            from bs4 import BeautifulSoup
+            from bs4 import BeautifulSoup, Tag
         except ImportError:
             return CrawlResult(success=True, data=[], source="http")
 
         import html as _html
+        import re as _re
 
         soup = BeautifulSoup(html, "html.parser")
         solutions: list = []
 
-        # Main content container
-        main_content = soup.select_one(
-            ".editorial-content, .part, #main-container .container, .col-sm-12, .row"
-        )
-        if not main_content:
-            main_content = soup
+        # ── Step 2: find per-problem editorial links ────────────
+        # The editorial index page lists problems in a table or list.
+        # Each row has the problem name and a link to its editorial.
+        # Common patterns:
+        #   <a href="/contests/{cid}/editorial/{num}">Editorial</a>
+        #   <a href="/contests/{cid}/tasks/{pid}/editorial">...</a>
+        #
+        # Strategy: collect ALL editorial links, then match each
+        # to a problem by looking at nearby text (problem letter).
+        editorial_links: list[tuple[str, str]] = []  # (url, context_text)
 
-        # ── Strategy A: Find problem-specific sections by heading ──
-        index_upper = index.upper()
-        prob_heading_re = re.compile(
-            rf"^(?:Task\s*)?{re.escape(index_upper)}[\.\s\-:：]",
-            re.IGNORECASE,
-        )
-
-        sections_found: list = []
-
-        for tag in main_content.find_all(["h2", "h3", "h4"]):
-            tag_text = tag.get_text(strip=True)
-            if not prob_heading_re.match(tag_text):
-                continue
-
-            # Collect content until the next heading
-            content_parts: List[str] = []
-            sibling = tag.next_sibling
-            while sibling is not None:
-                if hasattr(sibling, "name") and sibling.name in (
-                    "h2",
-                    "h3",
-                    "h4",
-                ):
-                    break
-                content_parts.append(str(sibling))
-                sibling = sibling.next_sibling
-
-            section_html = "".join(content_parts)
-            section_soup = BeautifulSoup(section_html, "html.parser")
-            self._process_katex(section_soup)
-            self._process_images(section_soup)
-            text = section_soup.get_text("\n", strip=True)
-            text = _html.unescape(text)
-            text = self._normalize_text(text)
-
-            if len(text) > 50:
-                sections_found.append(
-                    {
-                        "author": "AtCoder Editorial",
-                        "title": tag_text,
-                        "content": text,
-                        "vote_count": 0,
-                    }
-                )
-
-        if sections_found:
-            solutions.extend(sections_found)
-            return CrawlResult(
-                success=True,
-                data=solutions,
-                source=page_result.source,
-            )
-
-        # ── Strategy B: Follow links to detailed editorial pages ──
-        editorial_links: List[str] = []
-        for a in main_content.find_all("a", href=True):
+        # Find links whose href looks like an editorial sub-page
+        for a in soup.find_all("a", href=True):
             href = a.get("href", "")
-            text = a.get_text(strip=True).lower()
-            if any(
-                kw in text
-                for kw in ("editorial", "解説", "solution", "解答", "answer")
-            ):
+            text = a.get_text(strip=True)
+            # Match editorial sub-page URLs
+            if _re.search(rf"/contests/{_re.escape(contest_id)}/editorial/\d+", href):
                 full_url = (
                     f"{self.BASE_URL}{href}"
-                    if href.startswith("/")
-                    else href
+                    if href.startswith("/") else href
                 )
-                if full_url not in editorial_links:
-                    editorial_links.append(full_url)
+                # Get context: walk up to find the row/container
+                row = a.find_parent(["tr", "li", "div", "td"])
+                context = row.get_text(" ", strip=True) if row else text
+                if (full_url, context) not in [(u, _) for u, _ in editorial_links]:
+                    editorial_links.append((full_url, context))
+            # Also match task-specific editorial links
+            elif _re.search(rf"/contests/{_re.escape(contest_id)}/tasks/.*/editorial", href):
+                full_url = (
+                    f"{self.BASE_URL}{href}"
+                    if href.startswith("/") else href
+                )
+                editorial_links.append((full_url, text))
 
-        # Also try problem-letter-specific editorial URLs
-        for suffix in [
-            f"/contests/{contest_id}/editorial/{index_upper}",
-            f"/contests/{contest_id}/editorial#{index_upper}",
-        ]:
-            url = f"{self.BASE_URL}{suffix}"
-            if url not in editorial_links:
-                editorial_links.append(url)
+        logger.debug(
+            "Found %d editorial sub-page links", len(editorial_links),
+        )
 
-        # Fetch linked editorial pages
-        for link in editorial_links[:max_editorials]:
-            logger.debug("AtCoder fetching editorial link: %s", link)
+        # ── Step 3: find the editorial for THIS problem ─────────
+        # Match by problem index: the context text (table row)
+        # typically contains the problem letter.
+        target_links: list[str] = []
+        prob_pattern = _re.compile(
+            rf"\b{_re.escape(index_upper)}\b", _re.IGNORECASE,
+        )
+
+        for url, context in editorial_links:
+            if prob_pattern.search(context):
+                target_links.append(url)
+                logger.debug(
+                    "Matched editorial for %s: %s (context: %s)",
+                    source_id, url, context[:80],
+                )
+
+        # If no link matched by problem letter, try all links
+        if not target_links:
+            target_links = [url for url, _ in editorial_links]
+
+        # ── Step 4: fetch per-problem editorial content ─────────
+        for link in target_links[:max_editorials]:
+            logger.debug("AtCoder fetching per-problem editorial: %s", link)
             ed_result = self.fetch_with_fallback(link)
             if not ed_result.success:
                 continue
@@ -923,49 +906,103 @@ class AtCoderCrawler(BaseCrawler):
                 continue
 
             ed_soup = BeautifulSoup(ed_html, "html.parser")
-            self._process_katex(ed_soup)
-            self._process_images(ed_soup)
 
+            # Find the main editorial content area
+            content_area = ed_soup.select_one(
+                ".editorial-content, .part, "
+                "#main-container .container, "
+                ".col-sm-12, .row, article, main"
+            ) or ed_soup
+
+            # Clean up
+            self._process_katex(content_area)
+            self._process_images(content_area)
             for sel in ("script", "style", "nav", "footer", "header"):
-                for el in ed_soup.find_all(sel):
+                for el in content_area.find_all(sel):
                     el.decompose()
 
-            text = ed_soup.get_text("\n", strip=True)
-            text = _html.unescape(text)
-            text = self._normalize_text(text)
+            # Try to extract problem-specific section by heading
+            prob_heading_re = _re.compile(
+                rf"^(?:Task\s*)?{_re.escape(index_upper)}[\.\s\-:：]",
+                _re.IGNORECASE,
+            )
+            found_text = ""
+            for tag in content_area.find_all(["h2", "h3", "h4"]):
+                tag_text = tag.get_text(strip=True)
+                if not prob_heading_re.match(tag_text):
+                    continue
+                # Collect content until next heading
+                parts: list[str] = []
+                sibling = tag.next_sibling
+                while sibling is not None:
+                    if hasattr(sibling, "name") and sibling.name in (
+                        "h2", "h3", "h4",
+                    ):
+                        break
+                    parts.append(
+                        sibling.get_text("\n", strip=True)
+                        if hasattr(sibling, "get_text")
+                        else str(sibling)
+                    )
+                    sibling = sibling.next_sibling
+                found_text = "\n".join(p for p in parts if p.strip())
+                break
 
-            if len(text) > 100:
-                solutions.append(
-                    {
-                        "author": "AtCoder Editorial",
-                        "title": f"Contest {contest_id} Editorial",
-                        "content": text,
-                        "vote_count": 0,
-                    }
-                )
+            # If no problem-specific heading, use the full content
+            if not found_text:
+                found_text = content_area.get_text("\n", strip=True)
 
+            found_text = _html.unescape(found_text)
+            found_text = self._normalize_text(found_text)
+
+            if len(found_text) > 50:
+                solutions.append({
+                    "author": "AtCoder Editorial",
+                    "title": f"{source_id} Solution",
+                    "content": found_text,
+                    "vote_count": 0,
+                })
+                break  # Found the solution for this problem
+
+        # ── Step 5: fallback — Strategy A on index page ─────────
         if not solutions:
-            # ── Strategy C: Return the full editorial page content ──
-            self._process_katex(main_content)
-            self._process_images(main_content)
+            main_content = soup.select_one(
+                ".editorial-content, .part, #main-container .container, "
+                ".col-sm-12, .row"
+            ) or soup
 
-            for sel in ("script", "style", "nav", "footer", "header"):
-                for el in main_content.find_all(sel):
-                    el.decompose()
-
-            text = main_content.get_text("\n", strip=True)
-            text = _html.unescape(text)
-            text = self._normalize_text(text)
-
-            if len(text) > 100:
-                solutions.append(
-                    {
+            prob_heading_re = _re.compile(
+                rf"^(?:Task\s*)?{_re.escape(index_upper)}[\.\s\-:：]",
+                _re.IGNORECASE,
+            )
+            for tag in main_content.find_all(["h2", "h3", "h4"]):
+                tag_text = tag.get_text(strip=True)
+                if not prob_heading_re.match(tag_text):
+                    continue
+                parts: list[str] = []
+                sibling = tag.next_sibling
+                while sibling is not None:
+                    if hasattr(sibling, "name") and sibling.name in (
+                        "h2", "h3", "h4",
+                    ):
+                        break
+                    parts.append(str(sibling))
+                    sibling = sibling.next_sibling
+                section_html = "".join(parts)
+                section_soup = BeautifulSoup(section_html, "html.parser")
+                self._process_katex(section_soup)
+                self._process_images(section_soup)
+                text = section_soup.get_text("\n", strip=True)
+                text = _html.unescape(text)
+                text = self._normalize_text(text)
+                if len(text) > 50:
+                    solutions.append({
                         "author": "AtCoder Editorial",
-                        "title": f"Contest {contest_id} Editorial",
+                        "title": tag_text,
                         "content": text,
                         "vote_count": 0,
-                    }
-                )
+                    })
+                break
 
         if not solutions:
             return CrawlResult(
