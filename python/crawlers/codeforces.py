@@ -1401,29 +1401,32 @@ class CodeforcesCrawler(BaseCrawler):
                 has_pre = child.find("pre") is not None
 
                 if is_code_title or (is_solution_title and has_pre):
+                    # Try <pre> first, then submission links.
+                    # Prefer submission links if <pre> is empty/whitespace.
                     pre_el = child.find("pre")
-                    if pre_el and not code:
+                    pre_text = ""
+                    if pre_el:
                         raw = str(pre_el)
                         raw = _re.sub(r'<[^>]+>', '', raw)
-                        code = _html.unescape(raw).strip()
-                        lines = code.split('\n')
+                        pre_text = _html.unescape(raw).strip()
+                    # Check for submission links
+                    submission_links: list[str] = []
+                    for a in child.select("a[href*='/submission/']"):
+                        href = a.get("href", "")
+                        text = a.get_text(strip=True)
+                        if href.startswith("/"):
+                            href = f"https://codeforces.com{href}"
+                        submission_links.append(
+                            f"[Submission {text}]({href})"
+                        )
+                    # Decide what to use as code
+                    if submission_links:
+                        code = "\n".join(submission_links)
+                    elif pre_text and not code:
+                        lines = pre_text.split('\n')
                         while lines and not lines[-1].strip():
                             lines.pop()
                         code = '\n'.join(lines)
-                    # No <pre>?  Some editorials link to submission pages
-                    # instead of embedding code.  Collect those links.
-                    if not pre_el and not code:
-                        submission_links: list[str] = []
-                        for a in child.select("a[href*='/submission/']"):
-                            href = a.get("href", "")
-                            text = a.get_text(strip=True)
-                            if href.startswith("/"):
-                                href = f"https://codeforces.com{href}"
-                            submission_links.append(
-                                f"[Submission {text}]({href})"
-                            )
-                        if submission_links:
-                            code = "\n".join(submission_links)
                     continue
 
                 # ── Tutorial / Hint / Solution (text-only) spoilers ─
