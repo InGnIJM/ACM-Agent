@@ -1300,17 +1300,23 @@ class CodeforcesCrawler(BaseCrawler):
 
         # Find problem boundaries:
         # <p><a href="/contest/{cid}/problem/{idx}">...</a></p>
+        # Some editorials use absolute URLs:
+        # <p><a href="https://codeforces.com/contest/{cid}/problem/{idx}">...</a></p>
         problem_link_re = _re.compile(
-            rf"^/contest/{contest_id}/problem/([A-Z]\d*)$"
+            rf"(?:^|codeforces\.com)/contest/{contest_id}/problem/([A-Z]\d*)$"
         )
         boundaries: list = []  # (child_index, problem_index, header_text)
         for i, child in enumerate(children):
-            link = child.find(
+            if child.name != "p":
+                continue
+            # Some <p> contain multiple problem links (e.g. "C1, C2").
+            # Collect ALL matching <a> tags, not just the first one.
+            links = child.find_all(
                 "a", href=_re.compile(
-                    rf"^/contest/{contest_id}/problem/[A-Z]\d*$"
+                    rf"(?:^|codeforces\.com)/contest/{contest_id}/problem/[A-Z]\d*$"
                 )
             )
-            if link and child.name == "p":
+            for link in links:
                 href = link.get("href", "")
                 m = problem_link_re.search(href)
                 if m:
@@ -1325,6 +1331,22 @@ class CodeforcesCrawler(BaseCrawler):
             )
             return {}
 
+        # ── Handle combined same-letter problems ──────────────────
+        # C1 and C2 may share a <p> (same child index) or E1/E2 may
+        # be adjacent <p> elements.  In both cases the second problem
+        # gets no spoilers of its own → inherit from the first that
+        # DOES get content.
+        sibling_map: dict[str, str] = {}  # skipped_idx → source_idx
+        for k in range(len(boundaries)):
+            if k + 1 < len(boundaries):
+                curr_i, curr_idx, _ = boundaries[k]
+                next_i, next_idx, _ = boundaries[k + 1]
+                curr_letter = _re.sub(r'\d+$', '', curr_idx)
+                next_letter = _re.sub(r'\d+$', '', next_idx)
+                if curr_letter == next_letter:
+                    if curr_i == next_i or curr_i + 1 == next_i:
+                        sibling_map[curr_idx] = next_idx
+
         # ── Extract solution for each problem ─────────────────────
         solutions: dict = {}
         for j, (start_i, idx, header) in enumerate(boundaries):
@@ -1335,9 +1357,14 @@ class CodeforcesCrawler(BaseCrawler):
             )
 
             # Walk children between this problem's <p><a> and the next
-            # one's, collecting Tutorial text + Implementation code.
+            # one's, collecting explanation text + solution code.
+            #
+            # CF editorials use several spoiler-title naming conventions:
+            #   Code:   "Implementation" / "Code" / "Solution (…)"
+            #   Text:   "Tutorial" / "Solution" / "Hint N"
             tutorial_text = ""
             code = ""
+            _tutorial_parts: list[str] = []  # collect from Hint+Solution
             for child in children[start_i + 1 : end_i]:
                 if child.name != "div":
                     continue
@@ -1348,79 +1375,106 @@ class CodeforcesCrawler(BaseCrawler):
                 if not title_el:
                     continue
                 title_text = title_el.get_text(strip=True)
+                title_lower = title_text.lower()
 
-                if title_text.lower() == "implementation":
-                    # Extract <pre> content — this is the solution code.
-                    # Use raw text extraction to avoid syntax-highlight
-                    # <span> tags (added by the browser) splitting tokens
-                    # onto separate lines.
+                # ── Code spoilers: title implies code + has <pre> ──
+                # "Implementation" | "Code" | "Code (C1)" |
+                # "Solution (FelixArg)" | "Solution 1 (FelixArg)" |
+                # "Solution E1 (FairyWinx)"
+                is_code_title = (
+                    title_lower == "implementation"
+                    or title_lower.startswith("code")
+                )
+                is_solution_title = (
+                    title_lower == "solution"
+                    or title_lower.startswith("solution ")
+                    or title_lower.startswith("solution(")
+                )
+                has_pre = child.find("pre") is not None
+
+                if is_code_title or (is_solution_title and has_pre):
                     pre_el = child.find("pre")
-                    if pre_el:
-                        # Strip all tags, then unescape HTML entities
+                    if pre_el and not code:
                         raw = str(pre_el)
                         raw = _re.sub(r'<[^>]+>', '', raw)
                         code = _html.unescape(raw).strip()
-                        # Normalise leading whitespace per line
                         lines = code.split('\n')
-                        # Strip trailing empty lines
                         while lines and not lines[-1].strip():
                             lines.pop()
                         code = '\n'.join(lines)
+                    continue
 
-                elif title_text.lower() == "tutorial":
-                    # Extract tutorial explanation from rendered HTML.
-                    # After JS execution, .spoiler-content contains real
-                    # text (not the "Tutorial is loading..." placeholder).
+                # ── Tutorial / Hint / Solution (text-only) spoilers ─
+                elif (title_lower == "tutorial"
+                      or title_lower == "solution"
+                      or title_lower.startswith("solution ")
+                      or title_lower.startswith("solution(")
+                      or title_lower.startswith("hint")):
                     sc = child.select_one(".spoiler-content")
-                    if sc:
-                        _soup = _BS(str(sc), "html.parser")
-                        # Clean MathJax: extract <nobr> text, remove
-                        # preview/script/MathML artifacts.
-                        for math_el in _soup.select(".MathJax"):
-                            nobr = math_el.find("nobr")
-                            if nobr:
-                                t = nobr.get_text("", strip=True)
-                                if t:
-                                    if _re.search(r'\\[a-zA-Z]', t):
-                                        math_el.replace_with(f" ${t}$ ")
-                                    else:
-                                        math_el.replace_with(f" {t} ")
-                                    continue
-                            math_el.decompose()
-                        for sel in (".MathJax_Preview",
-                                     "script[type='math/tex']",
-                                     ".MJX_Assistive_MathML"):
-                            for el in _soup.select(sel):
-                                el.decompose()
-                        # Collect paragraphs: each <p> → one paragraph.
-                        # Using ' '.join(stripped_strings) avoids the
-                        # newline-every-element problem of get_text().
-                        paragraphs: list[str] = []
-                        for p in _soup.select("p"):
-                            text = " ".join(p.stripped_strings)
-                            if text:
-                                paragraphs.append(text)
-                        # If no <p> tags found, fall back to all text
-                        if not paragraphs:
-                            text = " ".join(_soup.stripped_strings)
-                            if text:
-                                paragraphs = [text]
-                        tutorial_text = "\n\n".join(paragraphs)
-                        # Strip Russian/localised title prefix (e.g.
-                        # "2237B - Annoying the Ghost")
-                        tutorial_text = _re.sub(
-                            rf'^{_re.escape(str(contest_id))}'
-                            rf'{_re.escape(idx)}\s*[-–—]\s*\S[^a-zA-Z]*',
-                            '', tutorial_text,
-                        ).strip()
+                    if not sc:
+                        continue
+                    _soup = _BS(str(sc), "html.parser")
+                    # MathJax cleanup
+                    for math_el in _soup.select(".MathJax"):
+                        nobr = math_el.find("nobr")
+                        if nobr:
+                            t = nobr.get_text("", strip=True)
+                            if t:
+                                if _re.search(r'\\[a-zA-Z]', t):
+                                    math_el.replace_with(f" ${t}$ ")
+                                else:
+                                    math_el.replace_with(f" {t} ")
+                                continue
+                        math_el.decompose()
+                    for sel in (".MathJax_Preview",
+                                 "script[type='math/tex']",
+                                 ".MJX_Assistive_MathML"):
+                        for el in _soup.select(sel):
+                            el.decompose()
+                    # Collect paragraphs
+                    paragraphs: list[str] = []
+                    for p in _soup.select("p"):
+                        text = " ".join(p.stripped_strings)
+                        if text:
+                            paragraphs.append(text)
+                    if not paragraphs:
+                        text = " ".join(_soup.stripped_strings)
+                        if text:
+                            paragraphs = [text]
+                    para_text = "\n\n".join(paragraphs)
+                    if para_text:
+                        _tutorial_parts.append(para_text)
+
+            # ── Combine tutorial parts ─────────────────────────────
+            if _tutorial_parts:
+                tutorial_text = "\n\n".join(_tutorial_parts)
+                # Strip Russian/localised title prefix
+                tutorial_text = _re.sub(
+                    rf'^{_re.escape(str(contest_id))}'
+                    rf'{_re.escape(idx)}\s*[-–—]\s*\S[^a-zA-Z]*',
+                    '', tutorial_text,
+                ).strip()
 
             if not code:
-                # No Implementation spoiler found — some editorials
-                # (especially older ones) inline the code differently.
-                # Skip this problem.
+                # No code spoiler for this problem — try to inherit
+                # from a sibling (C2 reuses C1's code, E1 reuses E2's).
+                _sibling_idx = _re.sub(r'\d+$', '', idx)  # "C2" → "C"
+                for _sib_idx, _sib_sol in solutions.items():
+                    if _re.sub(r'\d+$', '', _sib_idx) == _sibling_idx and _sib_idx != idx:
+                        _sib_content = _sib_sol.get("content", "")
+                        _m = _re.search(r'```(?:\w+)?\n(.*?)\n```', _sib_content, _re.DOTALL)
+                        if _m:
+                            code = _m.group(1)
+                            logger.debug(
+                                "Inherited code from sibling %s for %s",
+                                _sib_idx, idx,
+                            )
+                            break
+
+            if not code and not tutorial_text:
+                # Neither code nor explanation — nothing useful.
                 logger.debug(
-                    "No Implementation spoiler for problem %s in editorial",
-                    idx,
+                    "No content for problem %s in editorial", idx,
                 )
                 continue
 
@@ -1451,6 +1505,28 @@ class CodeforcesCrawler(BaseCrawler):
                 "vote_count": 0,
                 "solution_index": 0,  # CF 每題只有 1 篇 editorial
             }
+
+        # ── Inherit solutions for adjacent same-letter problems ────
+        # When E1 and E2 links are adjacent with shared spoilers,
+        # E1 gets no content of its own → clone E2's solution.
+        for skipped_idx, source_idx in sibling_map.items():
+            if skipped_idx not in solutions and source_idx in solutions:
+                src = dict(solutions[source_idx])
+                # Update the title to reflect this problem's header
+                for _bi, _b_idx, _b_header in boundaries:
+                    if _b_idx == skipped_idx:
+                        # Replace the ## header line
+                        src["content"] = _re.sub(
+                            r'^## .*', f'## {_b_header}',
+                            src["content"], count=1,
+                        )
+                        src["title"] = _b_header
+                        break
+                solutions[skipped_idx] = src
+                logger.debug(
+                    "Cloned solution from %s for adjacent problem %s",
+                    source_idx, skipped_idx,
+                )
 
         return solutions
 
