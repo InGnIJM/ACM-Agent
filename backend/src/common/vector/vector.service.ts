@@ -27,13 +27,11 @@ export interface SearchHit {
 @Injectable()
 export class VectorService {
   private readonly logger = new Logger(VectorService.name);
-  private readonly ollamaUrl: string;
-  private readonly model: string;
+  private readonly embedUrl: string;
 
   constructor(private readonly prisma: PrismaService) {
-    this.ollamaUrl =
-      (process.env.OLLAMA_URL || 'http://localhost:11434').replace(/\/$/, '');
-    this.model = process.env.EMBED_MODEL || 'qwen3-embedding:0.6b';
+    this.embedUrl =
+      (process.env.EMBED_URL || 'http://127.0.0.1:8089/v1/embeddings').replace(/\/$/, '');
   }
 
   // ------------------------------------------------------------------
@@ -50,13 +48,21 @@ export class VectorService {
   async embedTexts(texts: string[]): Promise<number[][]> {
     if (!texts.length) return [];
 
-    const url = `${this.ollamaUrl}/api/embed`;
-    const payload = { model: this.model, input: texts };
+    // Truncate to fit the embedding model's context window.
+    // The local qwen3-embedding server has a 2048-token limit;
+    // ~3600 CJK chars ≈ 1800 tokens leaves headroom for the
+    // instruction prefix added by embedContent / embedSummary.
+    const MAX_CHARS = 3600;
+    const payload = {
+      input: texts.map((t) =>
+        t.length > MAX_CHARS ? t.slice(0, MAX_CHARS) : t,
+      ),
+    };
 
     let lastErr: Error | null = null;
     for (let attempt = 0; attempt < 4; attempt++) {
       try {
-        const response = await fetch(url, {
+        const response = await fetch(this.embedUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
@@ -65,24 +71,28 @@ export class VectorService {
         if (!response.ok) {
           const body = await response.text().catch(() => '');
           throw new Error(
-            `Ollama returned ${response.status}: ${body.slice(0, 500)}`,
+            `Embedding server returned ${response.status}: ${body.slice(0, 500)}`,
           );
         }
 
         const data: any = await response.json();
-        if (!data.embeddings || !Array.isArray(data.embeddings)) {
+        const items: Array<{ index: number; embedding: number[] }> = data.data || [];
+        if (!items.length) {
           throw new Error(
-            `Unexpected Ollama response shape: ${JSON.stringify(data).slice(0, 300)}`,
+            `Unexpected embedding response: ${JSON.stringify(data).slice(0, 300)}`,
           );
         }
 
-        return data.embeddings as number[][];
+        // Sort by index to preserve input order
+        return items
+          .sort((a, b) => a.index - b.index)
+          .map((item) => item.embedding);
       } catch (err) {
         lastErr = err instanceof Error ? err : new Error(String(err));
         if (attempt < 3) {
           const delay = 2 ** (attempt + 1) * 1000;
           this.logger.warn(
-            `Ollama embedding attempt ${attempt + 1} failed, retrying in ${delay}ms: ${lastErr.message}`,
+            `Embedding attempt ${attempt + 1} failed, retrying in ${delay}ms: ${lastErr.message}`,
           );
           await new Promise((r) => setTimeout(r, delay));
         }
@@ -90,7 +100,7 @@ export class VectorService {
     }
 
     throw new Error(
-      `Ollama embedding failed after 4 attempts: ${lastErr?.message}`,
+      `Embedding failed after 4 attempts: ${lastErr?.message}`,
     );
   }
 
@@ -126,7 +136,7 @@ export class VectorService {
     '为算法题解法摘要生成用于相似题检索的向量，重点关注算法类型、题目模式、触发条件、核心思想、状态语义、不变量和高区分度易错点。';
   private static readonly INST_QUERY =
     '为用户的算法题检索请求生成向量，重点识别题意、算法意图、题型模式、数据结构、约束条件和学习目标。';
-  private static readonly EMBED_VERSION = 'qwen3-embedding:0.6b@ollama';
+  private static readonly EMBED_VERSION = 'qwen3-embedding:0.6b@llama-cpp';
 
   /** Embed full_content with content instruction prefix. */
   async embedContent(text: string): Promise<number[]> {

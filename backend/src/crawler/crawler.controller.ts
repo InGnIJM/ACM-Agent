@@ -1229,7 +1229,7 @@ export class CrawlerController {
 
             // Generate and store vector embedding from solution_summary only
             try {
-              const vec = await this.vectorService.embedText(summary);
+              const vec = await this.vectorService.embedSummary(summary);
               await this.vectorService.setProblemVector(p.id, vec);
             } catch (embedErr: any) {
               this.logger.warn(`Embedding failed for ${p.sourceId}: ${embedErr?.message || embedErr}`);
