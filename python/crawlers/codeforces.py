@@ -1409,6 +1409,20 @@ class CodeforcesCrawler(BaseCrawler):
                         while lines and not lines[-1].strip():
                             lines.pop()
                         code = '\n'.join(lines)
+                    # No <pre>?  Some editorials link to submission pages
+                    # instead of embedding code.  Collect those links.
+                    if not pre_el and not code:
+                        submission_links: list[str] = []
+                        for a in child.select("a[href*='/submission/']"):
+                            href = a.get("href", "")
+                            text = a.get_text(strip=True)
+                            if href.startswith("/"):
+                                href = f"https://codeforces.com{href}"
+                            submission_links.append(
+                                f"[Submission {text}]({href})"
+                            )
+                        if submission_links:
+                            code = "\n".join(submission_links)
                     continue
 
                 # ── Tutorial / Hint / Solution (text-only) spoilers ─
@@ -1490,13 +1504,17 @@ class CodeforcesCrawler(BaseCrawler):
             # Include tutorial explanation if available
             if tutorial_text:
                 parts.append(f"\n### 题解\n{tutorial_text}")
-            # Detect programming language from code heuristics
-            lang = "cpp"  # CF default
-            if code.strip().startswith("def ") or code.strip().startswith("import "):
-                lang = "python"
-            elif code.strip().startswith("import java"):
-                lang = "java"
-            parts.append(f"\n### 代码\n```{lang}\n{code}\n```")
+            # Add code section: either a code block or submission links
+            if code.startswith("[Submission "):
+                # Submission links instead of inline code
+                parts.append(f"\n### 代码\n{code}")
+            else:
+                lang = "cpp"  # CF default
+                if code.strip().startswith("def ") or code.strip().startswith("import "):
+                    lang = "python"
+                elif code.strip().startswith("import java"):
+                    lang = "java"
+                parts.append(f"\n### 代码\n```{lang}\n{code}\n```")
             if not tutorial_text:
                 # Only show the AJAX warning when tutorial is missing
                 parts.append(
