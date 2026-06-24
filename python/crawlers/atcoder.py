@@ -1318,6 +1318,9 @@ class AtCoderCrawler(BaseCrawler):
         Fetches ``merged-problems.json`` from kenkoooo.com and
         filters problems whose ``id`` starts with *tag*.
 
+        Excludes tutorial / educational problem sets (APG4b, typical90,
+        practice, etc.) — only competitive programming contests.
+
         Args:
             tag: Contest prefix to filter by
                  (e.g. ``"abc"``, ``"arc"``, ``"agc"``).
@@ -1326,6 +1329,17 @@ class AtCoderCrawler(BaseCrawler):
         Returns:
             CrawlResult with a list of matching problem dicts.
         """
+        # ── Tutorial / non-contest prefixes to skip ──────────────
+        _TUTORIAL_PREFIXES = (
+            "apg4b",  # APG4b / APG4bPython — C++ / Python 入门教程
+            "practice",  # practice contest
+            "typical90",  # 競プロ典型 90 問
+            "tessoku",  # 競技プログラミングの鉄則
+            "past",  # アルゴリズム実技検定 (PAST) — not standard contests
+            "math-and-algorithm",  # アルゴリズムと数学
+            "dp",  # Educational DP Contest
+            "tdpc",  # Typical DP Contest
+        )
         merged_url = (
             "https://kenkoooo.com/atcoder/resources/merged-problems.json"
         )
@@ -1348,18 +1362,28 @@ class AtCoderCrawler(BaseCrawler):
             if not isinstance(p, dict):
                 continue
             pid = p.get("id", "")
-            if isinstance(pid, str) and pid.lower().startswith(
-                tag.lower()
-            ):
-                # Attach source_url if missing
-                if "source_url" not in p:
-                    cid = p.get("contest_id", "")
-                    p["source_url"] = (
-                        f"{self.BASE_URL}/contests/{cid}/tasks/{pid}"
-                    )
-                matching.append(p)
-                if len(matching) >= count:
-                    break
+            if not isinstance(pid, str):
+                continue
+            pid_lower = pid.lower()
+
+            # Must match the requested tag prefix
+            if not pid_lower.startswith(tag.lower()):
+                continue
+
+            # Skip tutorial / educational problem sets
+            if any(pid_lower.startswith(pref)
+                   for pref in _TUTORIAL_PREFIXES):
+                continue
+
+            # Attach source_url if missing
+            if "source_url" not in p:
+                cid = p.get("contest_id", "")
+                p["source_url"] = (
+                    f"{self.BASE_URL}/contests/{cid}/tasks/{pid}"
+                )
+            matching.append(p)
+            if len(matching) >= count:
+                break
 
         # ── Fetch difficulty from problem-models.json ───────────────
         try:
