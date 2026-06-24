@@ -705,6 +705,35 @@ class AtCoderCrawler(BaseCrawler):
                 except Exception:
                     pass
 
+        # ── Japanese statement detection ─────────────────────────
+        # Check the raw HTML: if #task-statement has lang-ja but no
+        # lang-en (or empty lang-en), the problem has no English.
+        _ts = BeautifulSoup(html, "html.parser").select_one("#task-statement")
+        if _ts:
+            _lang_en = _ts.select_one("span.lang-en")
+            _lang_ja = _ts.select_one("span.lang-ja")
+            if not _lang_en and _lang_ja:
+                # Only Japanese — skip
+                return CrawlResult(
+                    success=False,
+                    error=(
+                        f"Problem '{source_id}' has Japanese-only "
+                        f"statement (no lang-en), skipping"
+                    ),
+                    source=page_result.source,
+                )
+            if _lang_en and _lang_ja:
+                _en_text = _lang_en.get_text(strip=True)
+                if not _en_text or len(_en_text) < 20:
+                    return CrawlResult(
+                        success=False,
+                        error=(
+                            f"Problem '{source_id}' English section "
+                            f"is empty/too short, skipping"
+                        ),
+                        source=page_result.source,
+                    )
+
         # ── Build base data dict ────────────────────────────────────
         data_dict: Dict[str, object] = {
             "source_id": source_id,
@@ -1477,11 +1506,10 @@ class AtCoderCrawler(BaseCrawler):
     ) -> CrawlResult:
         """Fetch problems filtered by contest tag via kenkoooo API.
 
-        Fetches ``merged-problems.json`` from kenkoooo.com and
-        filters problems whose ``id`` starts with *tag*.
-
-        Excludes tutorial / educational problem sets (APG4b, typical90,
-        practice, etc.) — only competitive programming contests.
+        Only returns problems from competitive programming contests
+        (ABC, ARC, AGC, AHC, custom contests with digits in ID)
+        and DP / TDPC contests.  Tutorials, practice, past exams,
+        and other non-contest problem sets are excluded.
 
         Args:
             tag: Contest prefix to filter by
@@ -1497,9 +1525,19 @@ class AtCoderCrawler(BaseCrawler):
             "practice",  # practice contest
             "typical90",  # 競プロ典型 90 問
             "tessoku",  # 競技プログラミングの鉄則
-            "past",  # アルゴリズム実技検定 (PAST) — not standard contests
+            "past",  # アルゴリズム実技検定 (PAST)
             "math-and-algorithm",  # アルゴリズムと数学
         )
+        # ── Allowed contest patterns ─────────────────────────────
+        # Only contest prefixes that represent real rated/competitive
+        # contests.  dp / tdpc are also allowed.
+        _CONTEST_RE = re.compile(
+            r'^(abc|arc|agc|ahc|pakencamp|joi|jag|utpc|icpc|'
+            r'dp|tdpc)'
+            r'(\d|[_-])'  # must be followed by digit or separator
+        )
+        # Lazy-load contest-problem.json for contest_id validation
+        _contest_map = self._load_contest_map()
         merged_url = (
             "https://kenkoooo.com/atcoder/resources/merged-problems.json"
         )
@@ -1534,6 +1572,27 @@ class AtCoderCrawler(BaseCrawler):
             if any(pid_lower.startswith(pref)
                    for pref in _TUTORIAL_PREFIXES):
                 continue
+
+            # ── Only allow contest + dp/tdpc problems ─────────
+            # Check both the problem ID prefix and the contest_id
+            # from kenkoooo's contest-problem.json.
+            # dp_ / tdpc_ are always allowed (may map to tessoku-book
+            # in kenkoooo data, which would be blocked by tutorial check).
+            _is_dp = pid_lower.startswith("dp_") or pid_lower.startswith("tdpc_")
+            if _is_dp:
+                pass  # always allowed
+            else:
+                cid = _contest_map.get(pid, "")
+                cid_lower = cid.lower() if cid else ""
+                pid_allowed = bool(_CONTEST_RE.match(pid_lower))
+                cid_allowed = bool(
+                    cid_lower
+                    and not any(cid_lower.startswith(pref)
+                               for pref in _TUTORIAL_PREFIXES)
+                    and re.search(r'\d', cid_lower)  # has a digit
+                )
+                if not pid_allowed and not cid_allowed:
+                    continue
 
             # Attach source_url if missing
             if "source_url" not in p:
