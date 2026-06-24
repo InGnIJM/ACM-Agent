@@ -843,9 +843,10 @@ class AtCoderCrawler(BaseCrawler):
         #   <a href=".../editorial/123">解説</a> (Japanese)
         #   <a href=".../editorial/456">Editorial</a> (English)
         #
-        # Group English editorial links under their preceding
-        # problem heading.
+        # Group editorial links under their preceding problem heading.
+        # prob_editorials: English only.  prob_all_editorials: any language.
         prob_editorials: dict[str, str] = {}  # letter → english_url
+        prob_all_editorials: dict[str, str] = {}  # letter → any_url
         current_letter: str | None = None
 
         for tag in soup.find_all(["h2", "h3", "h4", "a"]):
@@ -861,34 +862,31 @@ class AtCoderCrawler(BaseCrawler):
                     href,
                 ):
                     link_text = tag.get_text(strip=True)
-                    # "Editorial" = English; "解説" = Japanese
+                    full_url = (
+                        f"{self.BASE_URL}{href}"
+                        if href.startswith("/") else href
+                    )
+                    # Track first-seen link for this letter as fallback
+                    if current_letter not in prob_all_editorials:
+                        prob_all_editorials[current_letter] = full_url
+                    # "Editorial" / "English" = English
                     if link_text.lower() in ("editorial", "english"):
-                        full_url = (
-                            f"{self.BASE_URL}{href}"
-                            if href.startswith("/") else href
-                        )
                         prob_editorials[current_letter] = full_url
 
         logger.debug(
-            "Found editorials for problems: %s",
+            "Found English editorials for problems: %s",
             ", ".join(sorted(prob_editorials.keys())),
         )
 
+        # ── Step 3: pick links for the target problem ──────────
+        # Prefer English; fall back to any-language for the SAME letter.
+        # NEVER add editorial links from other problems — that was the
+        # root cause of wrong-Japanese-content-for-wrong-problem bugs.
         target_links: list[str] = []
         if index_upper in prob_editorials:
             target_links.append(prob_editorials[index_upper])
-        # Fallback: also try Japanese link if no English found
-        for a in soup.find_all("a", href=True):
-            href = a.get("href", "")
-            if _re.search(
-                rf"/contests/{_re.escape(contest_id)}/editorial/\d+", href,
-            ):
-                full_url = (
-                    f"{self.BASE_URL}{href}"
-                    if href.startswith("/") else href
-                )
-                if full_url not in target_links:
-                    target_links.append(full_url)
+        elif index_upper in prob_all_editorials:
+            target_links.append(prob_all_editorials[index_upper])
 
         target_links = target_links[:max_editorials]
 
@@ -958,7 +956,25 @@ class AtCoderCrawler(BaseCrawler):
             self._process_katex(content_area)
             self._process_images(content_area)
 
-            # Try to extract problem-specific section by heading
+            # Apply HTML processing pipeline BEFORE text extraction so
+            # <p> boundaries, lists, tables, and inline formatting survive.
+            self._unwind_inline(content_area)
+            self._process_lists(content_area)
+            self._process_tables(content_area)
+            self._process_paragraphs(content_area)
+            # Handle <pre> code blocks (math-bearing → plain; else → ```fenced)
+            for pre in content_area.find_all("pre"):
+                self._merge_adjacent_strings(pre)
+                pre_text = pre.get_text()
+                if "$" in pre_text:
+                    pre.replace_with(f"\n{pre_text.strip()}\n")
+                else:
+                    pre.replace_with(f"\n```\n{pre_text}\n```\n")
+
+            # Try to extract problem-specific section by heading.
+            # Per-problem editorial pages typically don't have per-letter
+            # headings — the whole page IS the editorial for one problem.
+            # This path is for multi-problem editorial index pages.
             prob_heading_re = _re.compile(
                 rf"^(?:Task\s*)?{_re.escape(index_upper)}[\.\s\-:：]",
                 _re.IGNORECASE,
@@ -981,11 +997,12 @@ class AtCoderCrawler(BaseCrawler):
                         else str(sibling)
                     )
                     sibling = sibling.next_sibling
-                found_text = "\n".join(p for p in parts if p.strip())
+                found_text = "\n\n".join(p for p in parts if p.strip())
                 break
 
             # If no problem-specific heading, use the full content area
             if not found_text:
+                self._merge_adjacent_strings(content_area)
                 found_text = content_area.get_text("\n", strip=True)
                 # Strip common header noise
                 found_text = _re.sub(

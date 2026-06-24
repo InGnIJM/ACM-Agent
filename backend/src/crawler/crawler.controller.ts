@@ -415,10 +415,10 @@ export class CrawlerController {
         solutionIndex = Math.abs(hash) % 100000;
       }
 
-      // For Codeforces: ensure exactly one solution per problem by cleaning
+      // For CF & AtCoder: ensure exactly one solution per problem by cleaning
       // up old rows created with different content hashes from previous crawl
-      // logic versions.
-      if (platform === 'codeforces') {
+      // logic versions. Both platforms have exactly one official editorial per problem.
+      if (platform === 'codeforces' || platform === 'atcoder') {
         await this.prisma.problemSolution.deleteMany({
           where: {
             problemId: problem.id,
