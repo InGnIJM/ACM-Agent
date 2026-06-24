@@ -983,24 +983,41 @@ class AtCoderCrawler(BaseCrawler):
                 _re.IGNORECASE,
             )
             found_text = ""
+            _is_heading_path = False
             for tag in content_area.find_all(["h2", "h3", "h4"]):
                 tag_text = tag.get_text(strip=True)
                 if not prob_heading_re.match(tag_text):
                     continue
-                parts: list[str] = []
+                # Collect sibling HTML up to the next heading, build a
+                # mini-soup, and run the full HTML pipeline on it — so
+                # paragraph breaks, lists, and code blocks survive.
+                parts_html: list[str] = [str(tag)]  # include heading itself
                 sibling = tag.next_sibling
                 while sibling is not None:
                     if hasattr(sibling, "name") and sibling.name in (
                         "h2", "h3", "h4",
                     ):
                         break
-                    parts.append(
-                        sibling.get_text("\n", strip=True)
-                        if hasattr(sibling, "get_text")
-                        else str(sibling)
-                    )
+                    parts_html.append(str(sibling))
                     sibling = sibling.next_sibling
-                found_text = "\n\n".join(p for p in parts if p.strip())
+                section_html = "".join(parts_html)
+                section_soup = BeautifulSoup(section_html, "html.parser")
+                self._process_katex(section_soup)
+                self._process_images(section_soup)
+                self._unwind_inline(section_soup)
+                self._process_lists(section_soup)
+                self._process_tables(section_soup)
+                self._process_paragraphs(section_soup)
+                for pre in section_soup.find_all("pre"):
+                    self._merge_adjacent_strings(pre)
+                    pre_text = pre.get_text()
+                    if "$" in pre_text:
+                        pre.replace_with(f"\n{pre_text.strip()}\n")
+                    else:
+                        pre.replace_with(f"\n```\n{pre_text}\n```\n")
+                self._merge_adjacent_strings(section_soup)
+                found_text = section_soup.get_text("\n", strip=False).strip()
+                _is_heading_path = True
                 break
 
             # If no problem-specific heading, use the full content area
@@ -1010,6 +1027,12 @@ class AtCoderCrawler(BaseCrawler):
                 # strips the \n NavigableString nodes inserted by
                 # _process_paragraphs, collapsing all paragraph breaks.
                 found_text = content_area.get_text("\n", strip=False).strip()
+            else:
+                # Heading-match path: rebuild from collected siblings so
+                # the HTML pipeline (lists, paragraphs, <pre>) applies.
+                # Sibling iteration with per-sibling get_text(strip=True)
+                # silently loses paragraph breaks from _process_paragraphs.
+                pass  # heading text is already in the first part; just unescape+normalize
                 # Strip common header noise (author avatar, "Official" label, etc.)
                 found_text = _re.sub(
                     r'^.*?Contest Duration:.*?(\n[A-Z][a-z].*?Editorial)',
@@ -1027,6 +1050,16 @@ class AtCoderCrawler(BaseCrawler):
 
             found_text = _html.unescape(found_text)
             found_text = self._normalize_text(found_text)
+
+            # Strip header noise common to AtCoder editorial pages:
+            #   "X - Problem Name\n\nby avatar username\n\n"
+            #   sometimes preceded by "Official\n\n"
+            found_text = _re.sub(
+                r'^\s*(?:Official\s*\n+)?'
+                r'(?:[A-Z]\d*\s*[-–—−–—]\s*.+?\n\n)?'
+                r'\s*by\s+!\[image\]\([^)]+\)\S*\s*\n+',
+                '', found_text, count=1,
+            )
 
             if len(found_text) > 50:
                 solutions.append({
