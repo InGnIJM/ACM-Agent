@@ -1427,6 +1427,22 @@ class CodeforcesCrawler(BaseCrawler):
                         while lines and not lines[-1].strip():
                             lines.pop()
                         code = '\n'.join(lines)
+
+                    # Also extract tutorial text from the same spoiler:
+                    # the content area minus the <pre> and submission
+                    # links often contains explanation text.
+                    sc = child.select_one(".spoiler-content")
+                    if sc:
+                        # Remove <pre> and submission-link paragraphs
+                        for _pre in sc.find_all("pre"):
+                            _pre.decompose()
+                        for _a in sc.select("a[href*='/submission/']"):
+                            _p = _a.find_parent("p")
+                            if _p:
+                                _p.decompose()
+                        _rest = " ".join(sc.stripped_strings)
+                        if _rest:
+                            _tutorial_parts.append(_rest)
                     continue
 
                 # ── Tutorial / Hint / Solution (text-only) spoilers ─
