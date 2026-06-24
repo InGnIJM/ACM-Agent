@@ -53,12 +53,14 @@ class CodeforcesCrawler(BaseCrawler):
     _editorial_cache: dict[str, str] = {}       # URL → rendered HTML
     _editorial_url_cache: dict[int, str | None] = {}  # contest_id → editorial_url
     _editorial_cache_lock: object = __import__('threading').Lock()
+    _editorial_url_lock: object = __import__('threading').Lock()
 
     @classmethod
     def _clear_editorial_cache(cls) -> None:
         """Clear the editorial caches (for testing)."""
         with cls._editorial_cache_lock:
             cls._editorial_cache.clear()
+        with cls._editorial_url_lock:
             cls._editorial_url_cache.clear()
 
     @classmethod
@@ -1171,11 +1173,17 @@ class CodeforcesCrawler(BaseCrawler):
         The rendered HTML is cached at class level so all problems in
         the same contest reuse the same page load.
 
+        The cache lock is held during the (potentially slow) browser
+        load.  This is deliberate: without it, every solver worker
+        thread opens its own browser instance simultaneously, causing
+        resource exhaustion and timeouts.  The wait is bounded to ~8 s
+        and only happens once per editorial URL per process lifetime.
+
         Returns the fully-rendered HTML string, or None on failure.
         """
         import threading as _threading
 
-        # ── Check cache first ────────────────────────────────────
+        # ── Double-check cache under lock ────────────────────────
         with cls._editorial_cache_lock:
             if editorial_url in cls._editorial_cache:
                 logger.debug(
@@ -1183,53 +1191,62 @@ class CodeforcesCrawler(BaseCrawler):
                 )
                 return cls._editorial_cache[editorial_url]
 
-        # ── Load with headless browser ───────────────────────────
-        try:
-            from scrapling.fetchers import StealthyFetcher
-        except ImportError:
-            logger.warning(
-                "Scrapling not installed — falling back to static HTML"
-            )
-            return None
-
-        logger.info(
-            "Loading editorial with headless browser: %s", editorial_url,
-        )
-        import time as _time
-        t0 = _time.monotonic()
-
-        try:
-            # Use the system proxy if configured
-            proxy = getattr(cls, '_scrapling_proxy', None)
-            if proxy:
-                StealthyFetcher.proxy = proxy
-
-            page = StealthyFetcher.fetch(
-                f"{editorial_url}?locale=en",
-                headless=True,
-                network_idle=True,
-                timeout=30_000,
-            )
-            html = page.html_content if hasattr(page, 'html_content') else \
-                   page.body.decode('utf-8', errors='replace')
-        except Exception as exc:
-            elapsed = _time.monotonic() - t0
-            logger.warning(
-                "Headless browser fetch failed after %.1fs: %s",
-                elapsed, exc,
-            )
-            return None
-
-        elapsed = _time.monotonic() - t0
-        logger.info(
-            "Editorial rendered in %.1fs (%d bytes)",
-            elapsed, len(html),
-        )
-
-        # ── Cache and return ─────────────────────────────────────
+        # ── Only one thread per URL reaches the loading section ──
+        # The lock is re-acquired and HELD for the entire browser
+        # load.  Other threads requesting the same URL will block at
+        # the top of this method until the load completes and the
+        # result is cached.
         with cls._editorial_cache_lock:
+            # Re-check: another thread may have loaded while we
+            # were waiting for the lock.
+            if editorial_url in cls._editorial_cache:
+                return cls._editorial_cache[editorial_url]
+
+            try:
+                from scrapling.fetchers import StealthyFetcher
+            except ImportError:
+                logger.warning(
+                    "Scrapling not installed — falling back to static HTML"
+                )
+                cls._editorial_cache[editorial_url] = ""  # sentinel
+                return None
+
+            logger.info(
+                "Loading editorial with headless browser: %s",
+                editorial_url,
+            )
+            import time as _time
+            t0 = _time.monotonic()
+
+            try:
+                proxy = getattr(cls, '_scrapling_proxy', None)
+                if proxy:
+                    StealthyFetcher.proxy = proxy
+
+                page = StealthyFetcher.fetch(
+                    f"{editorial_url}?locale=en",
+                    headless=True,
+                    network_idle=True,
+                    timeout=30_000,
+                )
+                html = page.html_content if hasattr(page, 'html_content') else \
+                       page.body.decode('utf-8', errors='replace')
+            except Exception as exc:
+                elapsed = _time.monotonic() - t0
+                logger.warning(
+                    "Headless browser fetch failed after %.1fs: %s",
+                    elapsed, exc,
+                )
+                # Don't cache failures — next caller may succeed
+                return None
+
+            elapsed = _time.monotonic() - t0
+            logger.info(
+                "Editorial rendered in %.1fs (%d bytes)",
+                elapsed, len(html),
+            )
             cls._editorial_cache[editorial_url] = html
-        return html
+            return html
 
     @staticmethod
     def _parse_editorial_html(html: str, contest_id: int) -> dict:
@@ -1466,15 +1483,19 @@ class CodeforcesCrawler(BaseCrawler):
 
         # ── Step 1: find the editorial blog URL ──────────────────
         cls = type(self)
-        with cls._editorial_cache_lock:
+        should_discover = False
+        with cls._editorial_url_lock:
             if contest_id in cls._editorial_url_cache:
                 editorial_url = cls._editorial_url_cache[contest_id]
             else:
-                editorial_url = None  # discover outside lock
+                editorial_url = None
+                should_discover = True
 
-        if editorial_url is None and contest_id not in cls._editorial_url_cache:
-            editorial_url = self._discover_editorial_url(problem_url, contest_id)
-            with cls._editorial_cache_lock:
+        if should_discover:
+            editorial_url = self._discover_editorial_url(
+                problem_url, contest_id,
+            )
+            with cls._editorial_url_lock:
                 cls._editorial_url_cache[contest_id] = editorial_url
 
         if not editorial_url:
