@@ -837,89 +837,126 @@ class AtCoderCrawler(BaseCrawler):
         soup = BeautifulSoup(html, "html.parser")
         solutions: list = []
 
-        # ── Step 2: find per-problem editorial links ────────────
-        # The editorial index page lists problems in a table or list.
-        # Each row has the problem name and a link to its editorial.
-        # Common patterns:
-        #   <a href="/contests/{cid}/editorial/{num}">Editorial</a>
-        #   <a href="/contests/{cid}/tasks/{pid}/editorial">...</a>
+        # ── Step 2: group editorial links per problem ───────────
+        # The index page lists problems as:
+        #   <h4>A - Problem Name</h4>
+        #   <a href=".../editorial/123">解説</a> (Japanese)
+        #   <a href=".../editorial/456">Editorial</a> (English)
         #
-        # Strategy: collect ALL editorial links, then match each
-        # to a problem by looking at nearby text (problem letter).
-        editorial_links: list[tuple[str, str]] = []  # (url, context_text)
+        # Group English editorial links under their preceding
+        # problem heading.
+        prob_editorials: dict[str, str] = {}  # letter → english_url
+        current_letter: str | None = None
 
-        # Find links whose href looks like an editorial sub-page
-        for a in soup.find_all("a", href=True):
-            href = a.get("href", "")
-            text = a.get_text(strip=True)
-            # Match editorial sub-page URLs
-            if _re.search(rf"/contests/{_re.escape(contest_id)}/editorial/\d+", href):
-                full_url = (
-                    f"{self.BASE_URL}{href}"
-                    if href.startswith("/") else href
-                )
-                # Get context: walk up to find the row/container
-                row = a.find_parent(["tr", "li", "div", "td"])
-                context = row.get_text(" ", strip=True) if row else text
-                if (full_url, context) not in [(u, _) for u, _ in editorial_links]:
-                    editorial_links.append((full_url, context))
-            # Also match task-specific editorial links
-            elif _re.search(rf"/contests/{_re.escape(contest_id)}/tasks/.*/editorial", href):
-                full_url = (
-                    f"{self.BASE_URL}{href}"
-                    if href.startswith("/") else href
-                )
-                editorial_links.append((full_url, text))
+        for tag in soup.find_all(["h2", "h3", "h4", "a"]):
+            if tag.name in ("h2", "h3", "h4"):
+                tag_text = tag.get_text(strip=True)
+                m = _re.match(r"([A-Z])\d*\s*[-–—]", tag_text)
+                if m:
+                    current_letter = m.group(1).upper()
+            elif tag.name == "a" and current_letter:
+                href = tag.get("href", "")
+                if _re.search(
+                    rf"/contests/{_re.escape(contest_id)}/editorial/\d+",
+                    href,
+                ):
+                    link_text = tag.get_text(strip=True)
+                    # "Editorial" = English; "解説" = Japanese
+                    if link_text.lower() in ("editorial", "english"):
+                        full_url = (
+                            f"{self.BASE_URL}{href}"
+                            if href.startswith("/") else href
+                        )
+                        prob_editorials[current_letter] = full_url
 
         logger.debug(
-            "Found %d editorial sub-page links", len(editorial_links),
+            "Found editorials for problems: %s",
+            ", ".join(sorted(prob_editorials.keys())),
         )
 
-        # ── Step 3: find the editorial for THIS problem ─────────
-        # Match by problem index: the context text (table row)
-        # typically contains the problem letter.
         target_links: list[str] = []
-        prob_pattern = _re.compile(
-            rf"\b{_re.escape(index_upper)}\b", _re.IGNORECASE,
-        )
-
-        for url, context in editorial_links:
-            if prob_pattern.search(context):
-                target_links.append(url)
-                logger.debug(
-                    "Matched editorial for %s: %s (context: %s)",
-                    source_id, url, context[:80],
+        if index_upper in prob_editorials:
+            target_links.append(prob_editorials[index_upper])
+        # Fallback: also try Japanese link if no English found
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            if _re.search(
+                rf"/contests/{_re.escape(contest_id)}/editorial/\d+", href,
+            ):
+                full_url = (
+                    f"{self.BASE_URL}{href}"
+                    if href.startswith("/") else href
                 )
+                if full_url not in target_links:
+                    target_links.append(full_url)
 
-        # If no link matched by problem letter, try all links
-        if not target_links:
-            target_links = [url for url, _ in editorial_links]
+        target_links = target_links[:max_editorials]
 
         # ── Step 4: fetch per-problem editorial content ─────────
         for link in target_links[:max_editorials]:
+            # AtCoder editorial content is JavaScript-rendered (like CF).
+            # Use Accept-Language header for English; do NOT append
+            # ?lang=en (it can break the editorial page's language
+            # detection and serve Japanese instead).
             logger.debug("AtCoder fetching per-problem editorial: %s", link)
-            ed_result = self.fetch_with_fallback(link)
-            if not ed_result.success:
-                continue
-            ed_html = self._extract_html_text(ed_result)
+            ed_html = None
+            # Try browser rendering
+            try:
+                from scrapling.fetchers import StealthyFetcher
+                proxy = getattr(type(self), '_scrapling_proxy', None)
+                if proxy:
+                    StealthyFetcher.proxy = proxy
+                page = StealthyFetcher.fetch(
+                    link, headless=True, network_idle=True,
+                    timeout=15_000,
+                    headers={"Accept-Language": "en-US,en;q=0.9"},
+                )
+                ed_html = (
+                    page.html_content if hasattr(page, 'html_content')
+                    else page.body.decode('utf-8', errors='replace')
+                )
+            except Exception:
+                pass
+            # Fallback: plain HTTP
+            if not ed_html:
+                ed_result = self.fetch_with_fallback(link)
+                if not ed_result.success:
+                    continue
+                ed_html = self._extract_html_text(ed_result)
             if not ed_html:
                 continue
 
             ed_soup = BeautifulSoup(ed_html, "html.parser")
 
-            # Find the main editorial content area
+            # AtCoder editorial pages: the first .col-sm-12 is the nav
+            # header; the second (or later) .col-sm-12 contains the
+            # actual editorial body.  Browser-rendered pages may also
+            # have .lang-en > .part wrappers.
             content_area = ed_soup.select_one(
-                ".editorial-content, .part, "
-                "#main-container .container, "
-                ".col-sm-12, .row, article, main"
-            ) or ed_soup
+                ".lang-en .part, .part, .editorial-content, "
+                "article, main, #task-statement"
+            )
+            if not content_area:
+                # Try the second .col-sm-12 (first is navigation)
+                cols = ed_soup.select(".col-sm-12")
+                if len(cols) >= 2:
+                    content_area = cols[1]
+                else:
+                    content_area = cols[0] if cols else ed_soup
 
-            # Clean up
+            # Remove navigation/header/sidebar
+            for sel in (
+                "script", "style", "nav", "footer", "header",
+                "#contest-nav-tabs", ".contest-duration",
+                ".pull-right", ".sidebox", ".col-sm-4",
+                ".hidden-xs", ".a2a_kit",
+            ):
+                for el in content_area.select(sel):
+                    el.decompose()
+
+            # Clean KaTeX and images
             self._process_katex(content_area)
             self._process_images(content_area)
-            for sel in ("script", "style", "nav", "footer", "header"):
-                for el in content_area.find_all(sel):
-                    el.decompose()
 
             # Try to extract problem-specific section by heading
             prob_heading_re = _re.compile(
@@ -931,7 +968,6 @@ class AtCoderCrawler(BaseCrawler):
                 tag_text = tag.get_text(strip=True)
                 if not prob_heading_re.match(tag_text):
                     continue
-                # Collect content until next heading
                 parts: list[str] = []
                 sibling = tag.next_sibling
                 while sibling is not None:
@@ -948,9 +984,14 @@ class AtCoderCrawler(BaseCrawler):
                 found_text = "\n".join(p for p in parts if p.strip())
                 break
 
-            # If no problem-specific heading, use the full content
+            # If no problem-specific heading, use the full content area
             if not found_text:
                 found_text = content_area.get_text("\n", strip=True)
+                # Strip common header noise
+                found_text = _re.sub(
+                    r'^.*?Contest Duration:.*?(\n[A-Z][a-z].*?Editorial)',
+                    r'\1', found_text, count=1, flags=_re.DOTALL,
+                )
 
             found_text = _html.unescape(found_text)
             found_text = self._normalize_text(found_text)
