@@ -1337,8 +1337,6 @@ class AtCoderCrawler(BaseCrawler):
             "tessoku",  # 競技プログラミングの鉄則
             "past",  # アルゴリズム実技検定 (PAST) — not standard contests
             "math-and-algorithm",  # アルゴリズムと数学
-            "dp",  # Educational DP Contest
-            "tdpc",  # Typical DP Contest
         )
         merged_url = (
             "https://kenkoooo.com/atcoder/resources/merged-problems.json"
