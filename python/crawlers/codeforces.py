@@ -1145,7 +1145,8 @@ class CodeforcesCrawler(BaseCrawler):
             if not title_m:
                 continue
             title = title_m.group(1)
-            if "editorial" not in title.lower():
+            if ("editorial" not in title.lower()
+                and "tutorial" not in title.lower()):
                 continue
 
             # Verify contest ID appears in the page content.
@@ -1622,8 +1623,41 @@ class CodeforcesCrawler(BaseCrawler):
                 source="http",
             )
 
-        # Parse ALL solutions from the editorial HTML
+        # Parse ALL solutions from the editorial HTML.
+        # For combined Div.1+Div.2 rounds, the editorial may use the
+        # Div.2 contest ID while the DB stores the Div.1 ID (or vice
+        # versa).  Match by problem title across adjacent contests.
         all_solutions = self._parse_editorial_html(html, contest_id)
+
+        if index not in all_solutions:
+            # Look up the problem's title from the CF API
+            meta = self._get_cached_problemset_meta(contest_id, index)
+            prob_name = (meta or {}).get("name", "")
+            # Try adjacent contest IDs
+            for alt_cid in (contest_id - 1, contest_id + 1):
+                alt_solutions = self._parse_editorial_html(html, alt_cid)
+                for alt_idx, alt_sol in alt_solutions.items():
+                    alt_title = alt_sol.get("title", "")
+                    if prob_name and prob_name.lower() in alt_title.lower():
+                        # Clone and re-key under our problem's index
+                        all_solutions[index] = dict(alt_sol)
+                        all_solutions[index]["title"] = (
+                            f"{source_id} - {prob_name}"
+                        )
+                        # Replace the header line with our problem ID
+                        import re as _re3
+                        all_solutions[index]["content"] = _re3.sub(
+                            r'^## .*',
+                            f'## {source_id} - {prob_name}',
+                            alt_sol["content"], count=1,
+                        )
+                        logger.debug(
+                            "Mapped %s (%s) → %s via title match",
+                            source_id, prob_name, alt_idx,
+                        )
+                        break
+                if index in all_solutions:
+                    break
 
         # Return only the solution matching this problem's index
         if index in all_solutions:
