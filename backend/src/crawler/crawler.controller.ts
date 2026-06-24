@@ -394,15 +394,39 @@ export class CrawlerController {
         }
       }
       if (!problem) continue;
-      // Hash the first 200 chars of content as a stable solutionIndex so
-      // same content always maps to the same row (upsert → update instead
-      // of insert duplicate).  Prevents duplicate solutions across re-crawls.
-      const contentFingerprint = content.slice(0, 200);
-      let hash = 0;
-      for (let i = 0; i < contentFingerprint.length; i++) {
-        hash = ((hash << 5) - hash + contentFingerprint.charCodeAt(i)) | 0;
+
+      // Determine solutionIndex:
+      // - Codeforces: each problem has exactly ONE editorial → always use 0.
+      //   This guarantees upsert updates the same row across re-crawls,
+      //   preventing duplicates when the crawling logic changes.
+      // - Other platforms: use content-fingerprint hash so re-crawling the
+      //   same content maps to the same row.
+      let solutionIndex: number;
+      if (platform === 'codeforces' && sol.solution_index !== undefined) {
+        solutionIndex = Number(sol.solution_index) % 100000;
+      } else if (platform === 'codeforces') {
+        solutionIndex = 0;
+      } else {
+        const contentFingerprint = content.slice(0, 200);
+        let hash = 0;
+        for (let i = 0; i < contentFingerprint.length; i++) {
+          hash = ((hash << 5) - hash + contentFingerprint.charCodeAt(i)) | 0;
+        }
+        solutionIndex = Math.abs(hash) % 100000;
       }
-      const solutionIndex = Math.abs(hash) % 100000;
+
+      // For Codeforces: ensure exactly one solution per problem by cleaning
+      // up old rows created with different content hashes from previous crawl
+      // logic versions.
+      if (platform === 'codeforces') {
+        await this.prisma.problemSolution.deleteMany({
+          where: {
+            problemId: problem.id,
+            solutionIndex: { not: solutionIndex },
+          },
+        });
+      }
+
       await this.prisma.problemSolution.upsert({
         where: {
           problemId_solutionIndex: { problemId: problem.id, solutionIndex },
