@@ -1379,9 +1379,8 @@ class CodeforcesCrawler(BaseCrawler):
                 title_text = title_el.get_text(strip=True)
                 title_lower = title_text.lower()
 
-                # Skip non-editorial spoilers: user polls, alt solutions
-                if (title_lower.startswith("rate") or
-                    title_lower.startswith("alternate")):
+                # Skip user-poll spoilers ("Rate the problem", "Rate The Problem! (C1)")
+                if title_lower.startswith("rate"):
                     continue
 
                 # ── Code spoilers: title implies code + has <pre> ──
