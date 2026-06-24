@@ -136,7 +136,9 @@ class AtCoderCrawler(BaseCrawler):
             if not tex:
                 continue
 
-            # Walk up to find the .katex wrapper
+            # Walk up to find the .katex wrapper.
+            # .katex-display wraps .katex as an ancestor — we must keep
+            # walking past .katex to detect display mode.
             el = annotation.parent
             is_display = False
             katex_wrapper = None
@@ -153,9 +155,10 @@ class AtCoderCrawler(BaseCrawler):
                     is_display = True
                     katex_wrapper = el
                     break
-                if "katex" in classes:
+                if "katex" in classes and katex_wrapper is None:
+                    # Save as fallback; keep walking — .katex-display may
+                    # be further up the ancestor chain.
                     katex_wrapper = el
-                    break
                 el = el.parent
 
             if katex_wrapper is None:
@@ -1003,11 +1006,23 @@ class AtCoderCrawler(BaseCrawler):
             # If no problem-specific heading, use the full content area
             if not found_text:
                 self._merge_adjacent_strings(content_area)
-                found_text = content_area.get_text("\n", strip=True)
-                # Strip common header noise
+                # IMPORTANT: strip=False, then manual .strip() — strip=True
+                # strips the \n NavigableString nodes inserted by
+                # _process_paragraphs, collapsing all paragraph breaks.
+                found_text = content_area.get_text("\n", strip=False).strip()
+                # Strip common header noise (author avatar, "Official" label, etc.)
                 found_text = _re.sub(
                     r'^.*?Contest Duration:.*?(\n[A-Z][a-z].*?Editorial)',
                     r'\1', found_text, count=1, flags=_re.DOTALL,
+                )
+                # Also strip leading "Official\n\n" if present
+                found_text = _re.sub(
+                    r'^Official\s*\n+', '', found_text, count=1,
+                )
+                # Strip author line: "\n\nby ![image](...)username\n\n" → "\n\n"
+                found_text = _re.sub(
+                    r'\n\nby\s+!\[image\]\([^)]+\)\S*\s*\n\n',
+                    '\n\n', found_text, count=1,
                 )
 
             found_text = _html.unescape(found_text)
@@ -1050,7 +1065,13 @@ class AtCoderCrawler(BaseCrawler):
                 section_soup = BeautifulSoup(section_html, "html.parser")
                 self._process_katex(section_soup)
                 self._process_images(section_soup)
-                text = section_soup.get_text("\n", strip=True)
+                # Apply HTML pipeline so paragraph/lists survive
+                self._unwind_inline(section_soup)
+                self._process_lists(section_soup)
+                self._process_tables(section_soup)
+                self._process_paragraphs(section_soup)
+                self._merge_adjacent_strings(section_soup)
+                text = section_soup.get_text("\n", strip=False).strip()
                 text = _html.unescape(text)
                 text = self._normalize_text(text)
                 if len(text) > 50:
