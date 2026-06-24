@@ -218,8 +218,12 @@ class AtCoderCrawler(BaseCrawler):
                 var_el.clear()
                 var_el.append(_NS(f"${inner}$"))
 
-        # Wrap <code> content in backticks before unwrapping
+        # Wrap <code> content in backticks before unwrapping.
+        # BUT skip <code> inside <pre> — those are code blocks, not
+        # inline code; backticks would break the later <pre> handling.
         for code_el in root_el.find_all("code"):
+            if code_el.find_parent("pre") is not None:
+                continue
             inner = code_el.get_text("", strip=True)
             if inner and "`" not in inner:
                 code_el.clear()
@@ -951,6 +955,9 @@ class AtCoderCrawler(BaseCrawler):
                 "#contest-nav-tabs", ".contest-duration",
                 ".pull-right", ".sidebox", ".col-sm-4",
                 ".hidden-xs", ".a2a_kit",
+                ".div-btn-copy", ".btn-copy",  # "Copy" button
+                ".monaco-editor",  # Monaco editor (JS code viewer)
+                ".prettyprint", ".prettyprinted",  # code blocks with line numbers (clean copy <pre> preferred)
             ):
                 for el in content_area.select(sel):
                     el.decompose()
@@ -965,8 +972,19 @@ class AtCoderCrawler(BaseCrawler):
             self._process_lists(content_area)
             self._process_tables(content_area)
             self._process_paragraphs(content_area)
-            # Handle <pre> code blocks (math-bearing → plain; else → ```fenced)
+            # Handle <pre> code blocks (math-bearing → plain; else → ```fenced).
+            # Skip hidden <pre> blocks (AtCoder has display:none fallback).
             for pre in content_area.find_all("pre"):
+                style = pre.get("style", "")
+                if "display:none" in style.replace(" ", "").lower():
+                    pre.decompose()
+                    continue
+                self._merge_adjacent_strings(pre)
+                pre_text = pre.get_text()
+                if "$" in pre_text:
+                    pre.replace_with(f"\n{pre_text.strip()}\n")
+                else:
+                    pre.replace_with(f"\n```\n{pre_text}\n```\n")
                 self._merge_adjacent_strings(pre)
                 pre_text = pre.get_text()
                 if "$" in pre_text:
@@ -1052,11 +1070,17 @@ class AtCoderCrawler(BaseCrawler):
             found_text = self._normalize_text(found_text)
 
             # Strip header noise common to AtCoder editorial pages:
-            #   "X - Problem Name\n\nby avatar username\n\n"
-            #   sometimes preceded by "Official\n\n"
+            #   Official:  "X - Problem Name\n\nby avatar username\n\n"
+            #   User:      "B16 - Frog 1 Editorial\n\nby avatar iastm\n\n"
             found_text = _re.sub(
                 r'^\s*(?:Official\s*\n+)?'
                 r'(?:[A-Z]\d*\s*[-–—−–—]\s*.+?\n\n)?'
+                r'\s*by\s+!\[image\]\([^)]+\)\S*\s*\n+',
+                '', found_text, count=1,
+            )
+            # User-editorial variant: "B16 - Frog 1 Editorial\n\n by avatar iastm\n\n"
+            found_text = _re.sub(
+                r'^[A-Z]\d+\s*[-–—−–—]\s*.+?(?:Editorial|题解|解説)\s*\n+'
                 r'\s*by\s+!\[image\]\([^)]+\)\S*\s*\n+',
                 '', found_text, count=1,
             )
@@ -1210,6 +1234,9 @@ class AtCoderCrawler(BaseCrawler):
                                 "#contest-nav-tabs", ".contest-duration",
                                 ".pull-right", ".sidebox", ".col-sm-4",
                                 ".hidden-xs", ".a2a_kit",
+                                ".div-btn-copy", ".btn-copy",
+                                ".monaco-editor",
+                                ".prettyprint", ".prettyprinted",
                             ):
                                 for el in content_area.select(sel):
                                     el.decompose()
@@ -1221,6 +1248,10 @@ class AtCoderCrawler(BaseCrawler):
                             self._process_tables(content_area)
                             self._process_paragraphs(content_area)
                             for pre in content_area.find_all("pre"):
+                                style = pre.get("style", "")
+                                if "display:none" in style.replace(" ", "").lower():
+                                    pre.decompose()
+                                    continue
                                 self._merge_adjacent_strings(pre)
                                 pre_text = pre.get_text()
                                 if "$" in pre_text:
@@ -1231,6 +1262,13 @@ class AtCoderCrawler(BaseCrawler):
                             found_text = content_area.get_text("\n", strip=False).strip()
                             found_text = _html.unescape(found_text)
                             found_text = self._normalize_text(found_text)
+                            # Strip user-editorial header:
+                            #   "B16 - Frog 1 Editorial\n\n by avatar iastm\n\n"
+                            found_text = _re.sub(
+                                r'^[A-Z]\d+\s*[-–—−–—]\s*.+?(?:Editorial|题解|解説)\s*\n+'
+                                r'\s*by\s+!\[image\]\([^)]+\)\S*\s*\n+',
+                                '', found_text, count=1,
+                            )
                             if len(found_text) > 50:
                                 solutions.append({
                                     "author": "AtCoder Editorial",
