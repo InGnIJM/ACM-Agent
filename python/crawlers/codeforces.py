@@ -1362,6 +1362,8 @@ class CodeforcesCrawler(BaseCrawler):
             # CF editorials use several spoiler-title naming conventions:
             #   Code:   "Implementation" / "Code" / "Solution (…)"
             #   Text:   "Tutorial" / "Solution" / "Hint N"
+            # Skip:   "Rate the problem" / "Alternate …" (user polls,
+            #          alternative solutions — not official editorial)
             tutorial_text = ""
             code = ""
             _tutorial_parts: list[str] = []  # collect from Hint+Solution
@@ -1376,6 +1378,11 @@ class CodeforcesCrawler(BaseCrawler):
                     continue
                 title_text = title_el.get_text(strip=True)
                 title_lower = title_text.lower()
+
+                # Skip non-editorial spoilers: user polls, alt solutions
+                if (title_lower.startswith("rate") or
+                    title_lower.startswith("alternate")):
+                    continue
 
                 # ── Code spoilers: title implies code + has <pre> ──
                 # "Implementation" | "Code" | "Code (C1)" |
