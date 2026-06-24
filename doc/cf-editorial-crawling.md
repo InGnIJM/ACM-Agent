@@ -99,6 +99,14 @@ Scrapling 不可用时自动回退到静态 `curl` 抓取：
 - 仍能提取 Implementation 代码
 - Tutorial 部分显示提示信息，引导用户访问原页面
 
+## 相关 Commits
+
+| SHA | 说明 |
+|---|---|
+| `0e5d667` | fix(crawler): extract CF editorial solutions with Scrapling browser + HTML parser |
+| `21271fe` | fix(import): deduplicate CF solutions with fixed solutionIndex=0 |
+| `c4529ce` | chore(scripts): add CF duplicate solutions cleanup script |
+
 ## 相关文件
 
 | 文件 | 职责 |
