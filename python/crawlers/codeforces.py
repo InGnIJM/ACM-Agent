@@ -1307,9 +1307,9 @@ class CodeforcesCrawler(BaseCrawler):
         )
         boundaries: list = []  # (child_index, problem_index, header_text)
         for i, child in enumerate(children):
-            if child.name != "p":
+            if child.name not in ("p", "h1", "h2", "h3", "h4", "h5", "h6"):
                 continue
-            # Some <p> contain multiple problem links (e.g. "C1, C2").
+            # Some <p>/<hN> contain multiple problem links (e.g. "C1, C2").
             # Collect ALL matching <a> tags, not just the first one.
             links = child.find_all(
                 "a", href=_re.compile(
