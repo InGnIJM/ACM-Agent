@@ -1373,11 +1373,9 @@ class CodeforcesCrawler(BaseCrawler):
                     # text (not the "Tutorial is loading..." placeholder).
                     sc = child.select_one(".spoiler-content")
                     if sc:
-                        # Clean MathJax: extract <nobr> text, remove
-                        # preview/script/MathML artifacts (same approach
-                        # as _cf_extract for problem statements).
                         _soup = _BS(str(sc), "html.parser")
-                        # Replace .MathJax wrappers with <nobr> text
+                        # Clean MathJax: extract <nobr> text, remove
+                        # preview/script/MathML artifacts.
                         for math_el in _soup.select(".MathJax"):
                             nobr = math_el.find("nobr")
                             if nobr:
@@ -1389,20 +1387,27 @@ class CodeforcesCrawler(BaseCrawler):
                                         math_el.replace_with(f" {t} ")
                                     continue
                             math_el.decompose()
-                        # Remove remaining MathJax artifacts
                         for sel in (".MathJax_Preview",
                                      "script[type='math/tex']",
                                      ".MJX_Assistive_MathML"):
                             for el in _soup.select(sel):
                                 el.decompose()
-                        tutorial_text = _soup.get_text(" ", strip=True)
-                        # Collapse whitespace
-                        tutorial_text = _re.sub(r'\s+', ' ', tutorial_text).strip()
-                        # Strip Russian/localised title prefix that CF
-                        # inserts before the actual explanation (e.g.
-                        # "2237A - Разрушение башен").
-                        # The prefix starts with the contest+index and
-                        # runs until the first English word or sentence.
+                        # Collect paragraphs: each <p> → one paragraph.
+                        # Using ' '.join(stripped_strings) avoids the
+                        # newline-every-element problem of get_text().
+                        paragraphs: list[str] = []
+                        for p in _soup.select("p"):
+                            text = " ".join(p.stripped_strings)
+                            if text:
+                                paragraphs.append(text)
+                        # If no <p> tags found, fall back to all text
+                        if not paragraphs:
+                            text = " ".join(_soup.stripped_strings)
+                            if text:
+                                paragraphs = [text]
+                        tutorial_text = "\n\n".join(paragraphs)
+                        # Strip Russian/localised title prefix (e.g.
+                        # "2237B - Annoying the Ghost")
                         tutorial_text = _re.sub(
                             rf'^{_re.escape(str(contest_id))}'
                             rf'{_re.escape(idx)}\s*[-–—]\s*\S[^a-zA-Z]*',
