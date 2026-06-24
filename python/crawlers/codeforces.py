@@ -1380,8 +1380,9 @@ class CodeforcesCrawler(BaseCrawler):
                 title_text = title_el.get_text(strip=True)
                 title_lower = title_text.lower()
 
-                # Skip user-poll spoilers ("Rate the problem", "Rate The Problem! (C1)")
-                if title_lower.startswith("rate"):
+                # Skip user-poll / meta spoilers
+                if (title_lower.startswith("rate")
+                    or title_lower.startswith("leave a comment")):
                     continue
 
                 # ── Code spoilers: title implies code + has <pre> ──
@@ -1430,7 +1431,9 @@ class CodeforcesCrawler(BaseCrawler):
                       or title_lower == "solution"
                       or title_lower.startswith("solution ")
                       or title_lower.startswith("solution(")
-                      or title_lower.startswith("hint")):
+                      or "solution" in title_lower
+                      or title_lower.startswith("hint")
+                      or title_lower.startswith("step")):
                     sc = child.select_one(".spoiler-content")
                     if not sc:
                         continue
@@ -1477,22 +1480,28 @@ class CodeforcesCrawler(BaseCrawler):
                 ).strip()
 
             if not code:
-                # No code spoiler for this problem — try to inherit
-                # from a sibling (C2 reuses C1's code, E1 reuses E2's).
-                _sibling_idx = _re.sub(r'\d+$', '', idx)  # "C2" → "C"
+                # No code for this problem — try to inherit from a
+                # sibling (C2 reuses C1, E1 reuses E2).
+                _sibling_idx = _re.sub(r'\d+$', '', idx)
                 for _sib_idx, _sib_sol in solutions.items():
                     if _re.sub(r'\d+$', '', _sib_idx) == _sibling_idx and _sib_idx != idx:
                         _sib_content = _sib_sol.get("content", "")
                         _m = _re.search(r'```(?:\w+)?\n(.*?)\n```', _sib_content, _re.DOTALL)
                         if _m:
                             code = _m.group(1)
+                        else:
+                            # Try submission links from sibling
+                            _sm = _re.search(r'### 代码\n(.*)', _sib_content)
+                            if _sm:
+                                code = _sm.group(1).strip()
+                        if code:
                             logger.debug(
                                 "Inherited code from sibling %s for %s",
                                 _sib_idx, idx,
                             )
                             break
 
-            if not code and not tutorial_text:
+            if not tutorial_text and not code:
                 # Neither code nor explanation — nothing useful.
                 logger.debug(
                     "No content for problem %s in editorial", idx,
