@@ -48,11 +48,10 @@ export class VectorService {
   async embedTexts(texts: string[]): Promise<number[][]> {
     if (!texts.length) return [];
 
-    // Truncate to fit the embedding model's context window.
-    // The local qwen3-embedding server has a 2048-token limit;
-    // ~3600 CJK chars ≈ 1800 tokens leaves headroom for the
-    // instruction prefix added by embedContent / embedSummary.
-    const MAX_CHARS = 3600;
+    // Safety ceiling: qwen3-embedding supports 32 768 tokens.
+    // ~60 000 CJK chars ≈ 30 000 tokens — well within the limit,
+    // only guards against accidentally huge inputs.
+    const MAX_CHARS = 60_000;
     const payload = {
       input: texts.map((t) =>
         t.length > MAX_CHARS ? t.slice(0, MAX_CHARS) : t,
