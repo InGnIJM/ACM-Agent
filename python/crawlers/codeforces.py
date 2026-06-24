@@ -1483,6 +1483,62 @@ class CodeforcesCrawler(BaseCrawler):
                 ).strip()
 
             if not code:
+                # ── Fallback: scan remaining children for code ──
+                # Some editorials use non-standard spoiler titles
+                # ("Spoiler", "SDSXC's solution", "code" with links).
+                # Collect any <pre> or submission links from ALL
+                # remaining children that weren't already matched.
+                _fallback_pre_parts: list[str] = []
+                _fallback_sub_links: list[str] = []
+                for _fc in children[start_i + 1 : end_i]:
+                    if _fc.name != "div":
+                        continue
+                    _fc_classes = _fc.get("class") or []
+                    if "spoiler" not in _fc_classes:
+                        # Non-spoiler <pre> or <a> with submission link
+                        for _pre in _fc.find_all("pre"):
+                            _pt = _pre.get_text().strip()
+                            if _pt and _pt not in _fallback_pre_parts:
+                                _fallback_pre_parts.append(_pt)
+                        for _a in _fc.select("a[href*='/submission/']"):
+                            _href = _a.get("href", "")
+                            _text = _a.get_text(strip=True)
+                            if _href.startswith("/"):
+                                _href = f"https://codeforces.com{_href}"
+                            _link = f"[Submission {_text}]({_href})"
+                            if _link not in _fallback_sub_links:
+                                _fallback_sub_links.append(_link)
+                        continue
+                    # Skipped spoiler — check for missed code/link
+                    _ftitle_el = _fc.select_one(".spoiler-title")
+                    _ftitle = _ftitle_el.get_text(strip=True).lower() if _ftitle_el else ""
+                    # Skip poll/tutorial spoilers that we already processed
+                    if (_ftitle.startswith("rate")
+                        or _ftitle.startswith("leave a comment")
+                        or _ftitle == "tutorial"
+                        or _ftitle.startswith("tutorial ")
+                        or _ftitle.startswith("hint")
+                        or _ftitle.startswith("step")):
+                        continue
+                    for _pre in _fc.find_all("pre"):
+                        _pt = _pre.get_text().strip()
+                        if _pt:
+                            _fallback_pre_parts.append(_pt)
+                    for _a in _fc.select("a[href*='/submission/']"):
+                        _href = _a.get("href", "")
+                        _text = _a.get_text(strip=True)
+                        if _href.startswith("/"):
+                            _href = f"https://codeforces.com{_href}"
+                        _link = f"[Submission {_text}]({_href})"
+                        if _link not in _fallback_sub_links:
+                            _fallback_sub_links.append(_link)
+                # Prefer submission links; fall back to <pre> code
+                if _fallback_sub_links:
+                    code = "\n".join(_fallback_sub_links)
+                elif _fallback_pre_parts:
+                    code = "\n\n".join(_fallback_pre_parts)
+
+            if not code:
                 # No code for this problem — try to inherit from a
                 # sibling (C2 reuses C1, E1 reuses E2).
                 _sibling_idx = _re.sub(r'\d+$', '', idx)
@@ -1516,17 +1572,18 @@ class CodeforcesCrawler(BaseCrawler):
             # Include tutorial explanation if available
             if tutorial_text:
                 parts.append(f"\n### 题解\n{tutorial_text}")
-            # Add code section: either a code block or submission links
-            if code.startswith("[Submission "):
-                # Submission links instead of inline code
-                parts.append(f"\n### 代码\n{code}")
-            else:
-                lang = "cpp"  # CF default
-                if code.strip().startswith("def ") or code.strip().startswith("import "):
-                    lang = "python"
-                elif code.strip().startswith("import java"):
-                    lang = "java"
-                parts.append(f"\n### 代码\n```{lang}\n{code}\n```")
+            # Add code section only if code is non-empty
+            if code and code.strip():
+                if code.startswith("[Submission "):
+                    # Submission links instead of inline code
+                    parts.append(f"\n### 代码\n{code}")
+                else:
+                    lang = "cpp"  # CF default
+                    if code.strip().startswith("def ") or code.strip().startswith("import "):
+                        lang = "python"
+                    elif code.strip().startswith("import java"):
+                        lang = "java"
+                    parts.append(f"\n### 代码\n```{lang}\n{code}\n```")
             if not tutorial_text:
                 # Only show the AJAX warning when tutorial is missing
                 parts.append(
