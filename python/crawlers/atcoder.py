@@ -1116,6 +1116,130 @@ class AtCoderCrawler(BaseCrawler):
                     })
                 break
 
+        # ── Step 6: fallback — editorial link on problem page ──
+        # Some contests (tessoku-book / dp / tdpc) have a nested
+        # editorial structure:
+        #   problem page → /tasks/{id}/editorial → User Editorial link
+        # The problem page has a "题解" / "Editorial" button that
+        # points to a task-level hub listing user editorials.
+        if not solutions:
+            problem_url = (
+                f"{self.BASE_URL}/contests/{contest_id}/tasks/{source_id}"
+            )
+            logger.debug("AtCoder trying problem-page editorial: %s", problem_url)
+            prob_result = self.fetch_with_fallback(problem_url)
+            if prob_result.success:
+                prob_html = self._extract_html_text(prob_result)
+                prob_soup = BeautifulSoup(prob_html, "html.parser")
+                # Find the editorial button on the problem page
+                task_ed_url: str | None = None
+                for a in prob_soup.find_all("a", href=True):
+                    href = a.get("href", "")
+                    txt = a.get_text(strip=True)
+                    if txt in ("Editorial", "题解", "解説") and f"/tasks/{source_id}/editorial" in href:
+                        task_ed_url = (
+                            f"{self.BASE_URL}{href}"
+                            if href.startswith("/") else href
+                        )
+                        break
+                if task_ed_url:
+                    logger.debug(
+                        "Found task editorial hub: %s", task_ed_url,
+                    )
+                    hub_result = self.fetch_with_fallback(task_ed_url)
+                    if hub_result.success:
+                        hub_html = self._extract_html_text(hub_result)
+                        hub_soup = BeautifulSoup(hub_html, "html.parser")
+                        # Collect user editorial links
+                        user_ed_urls: list[str] = []
+                        for a in hub_soup.find_all("a", href=True):
+                            href = a.get("href", "")
+                            txt = a.get_text(strip=True)
+                            if txt in ("User Editorial", "Editorial") and _re.search(
+                                rf"/contests/{_re.escape(contest_id)}/editorial/\d+",
+                                href,
+                            ):
+                                full_url = (
+                                    f"{self.BASE_URL}{href}"
+                                    if href.startswith("/") else href
+                                )
+                                if full_url not in user_ed_urls:
+                                    user_ed_urls.append(full_url)
+                        # Fetch each user editorial (reuse Step 4 logic)
+                        for ed_url in user_ed_urls[:max_editorials]:
+                            logger.debug(
+                                "AtCoder fetching user editorial: %s", ed_url,
+                            )
+                            try:
+                                from scrapling.fetchers import StealthyFetcher
+                                proxy = getattr(type(self), '_scrapling_proxy', None)
+                                if proxy:
+                                    StealthyFetcher.proxy = proxy
+                                page = StealthyFetcher.fetch(
+                                    ed_url, headless=True, network_idle=True,
+                                    timeout=15_000,
+                                    headers={"Accept-Language": "en-US,en;q=0.9"},
+                                )
+                                ed_html = (
+                                    page.html_content if hasattr(page, 'html_content')
+                                    else page.body.decode('utf-8', errors='replace')
+                                )
+                            except Exception:
+                                ed_html = None
+                            if not ed_html:
+                                ed_result = self.fetch_with_fallback(ed_url)
+                                if ed_result.success:
+                                    ed_html = self._extract_html_text(ed_result)
+                            if not ed_html:
+                                continue
+                            ed_soup = BeautifulSoup(ed_html, "html.parser")
+                            # Select content area (same as Step 4)
+                            content_area = ed_soup.select_one(
+                                ".lang-en .part, .part, .editorial-content, "
+                                "article, main, #task-statement"
+                            )
+                            if not content_area:
+                                cols = ed_soup.select(".col-sm-12")
+                                if len(cols) >= 2:
+                                    content_area = cols[1]
+                                else:
+                                    content_area = cols[0] if cols else ed_soup
+                            # Remove nav/header
+                            for sel in (
+                                "script", "style", "nav", "footer", "header",
+                                "#contest-nav-tabs", ".contest-duration",
+                                ".pull-right", ".sidebox", ".col-sm-4",
+                                ".hidden-xs", ".a2a_kit",
+                            ):
+                                for el in content_area.select(sel):
+                                    el.decompose()
+                            # Run HTML pipeline
+                            self._process_katex(content_area)
+                            self._process_images(content_area)
+                            self._unwind_inline(content_area)
+                            self._process_lists(content_area)
+                            self._process_tables(content_area)
+                            self._process_paragraphs(content_area)
+                            for pre in content_area.find_all("pre"):
+                                self._merge_adjacent_strings(pre)
+                                pre_text = pre.get_text()
+                                if "$" in pre_text:
+                                    pre.replace_with(f"\n{pre_text.strip()}\n")
+                                else:
+                                    pre.replace_with(f"\n```\n{pre_text}\n```\n")
+                            self._merge_adjacent_strings(content_area)
+                            found_text = content_area.get_text("\n", strip=False).strip()
+                            found_text = _html.unescape(found_text)
+                            found_text = self._normalize_text(found_text)
+                            if len(found_text) > 50:
+                                solutions.append({
+                                    "author": "AtCoder Editorial",
+                                    "title": f"{source_id} Solution",
+                                    "content": found_text,
+                                    "vote_count": 0,
+                                })
+                                break
+
         if not solutions:
             return CrawlResult(
                 success=False,
