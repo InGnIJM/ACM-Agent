@@ -706,14 +706,35 @@ class AtCoderCrawler(BaseCrawler):
                     pass
 
         # ── Japanese statement detection ─────────────────────────
-        # Check the raw HTML: if #task-statement has lang-ja but no
-        # lang-en (or empty lang-en), the problem has no English.
+        # Check #task-statement: skip if only Japanese content.
+        # Three cases:
+        #   1. No spans at all (old contests) → check for CJK chars
+        #   2. lang-ja exists but no lang-en → skip
+        #   3. Both exist but lang-en is empty/short → skip
         _ts = BeautifulSoup(html, "html.parser").select_one("#task-statement")
         if _ts:
             _lang_en = _ts.select_one("span.lang-en")
             _lang_ja = _ts.select_one("span.lang-ja")
-            if not _lang_en and _lang_ja:
-                # Only Japanese — skip
+            if not _lang_en and not _lang_ja:
+                # Old-style page: no language spans.
+                # Check if the content is Japanese by looking for
+                # CJK characters + Japanese-specific patterns.
+                _ts_text = _ts.get_text()
+                _has_cjk = bool(re.search(r'[぀-ヿ一-鿿]', _ts_text))
+                _has_eng = bool(re.search(
+                    r'\b(Problem|Constraints?|Input|Output|Sample)\b',
+                    _ts_text, re.IGNORECASE,
+                ))
+                if _has_cjk and not _has_eng:
+                    return CrawlResult(
+                        success=False,
+                        error=(
+                            f"Problem '{source_id}' has Japanese-only "
+                            f"statement (old-style, no lang spans), skipping"
+                        ),
+                        source=page_result.source,
+                    )
+            elif not _lang_en and _lang_ja:
                 return CrawlResult(
                     success=False,
                     error=(
@@ -722,7 +743,7 @@ class AtCoderCrawler(BaseCrawler):
                     ),
                     source=page_result.source,
                 )
-            if _lang_en and _lang_ja:
+            elif _lang_en and _lang_ja:
                 _en_text = _lang_en.get_text(strip=True)
                 if not _en_text or len(_en_text) < 20:
                     return CrawlResult(
