@@ -1547,7 +1547,8 @@ class AtCoderCrawler(BaseCrawler):
             "typical90",  # 競プロ典型 90 問
             "tessoku",  # 競技プログラミングの鉄則
             "past",  # アルゴリズム実技検定 (PAST)
-            "math-and-algorithm",  # アルゴリズムと数学
+            "math-and-algorithm",  # contest_id uses hyphens
+            "math_and_algorithm",  # problem_id uses underscores
         )
         # ── Allowed contest patterns ─────────────────────────────
         # Only contest prefixes that represent real rated/competitive
