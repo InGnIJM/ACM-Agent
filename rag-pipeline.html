@@ -1,0 +1,921 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="scroll-smooth">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ACM-Agent RAG 系统流程详解</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      fontFamily: {
+        sans: ['"Geist"', '"Noto Sans SC"', 'system-ui', '-apple-system', 'sans-serif'],
+        mono: ['"Geist Mono"', '"JetBrains Mono"', 'ui-monospace', 'monospace'],
+      },
+      colors: {
+        accent: { DEFAULT: '#059669', light: '#34d399', dark: '#047857' },
+      }
+    }
+  }
+}
+</script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap');
+
+  :root {
+    --accent: #059669;
+    --accent-light: #34d399;
+  }
+
+  .pipeline-node {
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+  }
+  .pipeline-node:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 25px rgba(5, 150, 105, 0.15);
+  }
+
+  .code-block {
+    font-family: 'Geist Mono', 'JetBrains Mono', ui-monospace, monospace;
+    tab-size: 2;
+  }
+
+  .highlight-box {
+    border-left: 3px solid var(--accent);
+  }
+
+  .step-badge {
+    width: 28px; height: 28px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 50%;
+    font-size: 13px; font-weight: 600;
+    flex-shrink: 0;
+  }
+</style>
+</head>
+<body class="bg-[#fafafa] dark:bg-[#0a0a0a] text-gray-900 dark:text-gray-100 font-sans antialiased">
+
+<!-- ===== 导航 ===== -->
+<nav class="sticky top-0 z-50 bg-white/85 dark:bg-black/85 backdrop-blur-lg border-b border-gray-200 dark:border-gray-800">
+  <div class="max-w-6xl mx-auto px-6 h-14 flex items-center gap-8 text-sm">
+    <a href="#" class="font-semibold text-accent dark:text-accent-light tracking-tight">ACM-Agent RAG</a>
+    <a href="#overview" class="text-gray-500 hover:text-gray-900 dark:hover:text-gray-100 transition-colors">概述</a>
+    <a href="#pipeline" class="text-gray-500 hover:text-gray-900 dark:hover:text-gray-100 transition-colors">全景图</a>
+    <a href="#ingestion" class="text-gray-500 hover:text-gray-900 dark:hover:text-gray-100 transition-colors">数据录入</a>
+    <a href="#query" class="text-gray-500 hover:text-gray-900 dark:hover:text-gray-100 transition-colors">查询检索</a>
+    <a href="#example" class="text-gray-500 hover:text-gray-900 dark:hover:text-gray-100 transition-colors">实例演示</a>
+  </div>
+</nav>
+
+<!-- ===== 主标题 ===== -->
+<header class="max-w-4xl mx-auto px-6 pt-24 pb-16 text-center">
+  <p class="text-xs font-mono uppercase tracking-[0.22em] text-accent dark:text-accent-light mb-4">Retrieval-Augmented Generation</p>
+  <h1 class="text-4xl md:text-5xl font-bold tracking-tight leading-tight">
+    ACM-Agent<br><span class="text-accent dark:text-accent-light">RAG 系统</span>流程详解
+  </h1>
+  <p class="mt-5 text-gray-500 dark:text-gray-400 max-w-[60ch] mx-auto leading-relaxed">
+    RAG 是让大语言模型能够查找外部知识库的技术。下面我们用一道算法题的实际旅程，把整个流程讲清楚。适合 RAG 初学者阅读，每个概念都配了具体例子。
+  </p>
+</header>
+
+<!-- ===== 一、概述 ===== -->
+<section id="overview" class="max-w-5xl mx-auto px-6 py-20 border-t border-gray-200 dark:border-gray-800">
+  <h2 class="text-2xl font-bold tracking-tight mb-8">一、什么是 RAG？</h2>
+
+  <div class="grid md:grid-cols-2 gap-8">
+    <div class="space-y-4">
+      <p class="text-gray-500 dark:text-gray-400 leading-relaxed">
+        <strong class="text-gray-900 dark:text-gray-100">RAG = Retrieval-Augmented Generation</strong>（检索增强生成）。
+        简单说：<span class="bg-accent/10 text-accent dark:text-accent-light px-1 rounded">不让 LLM 凭空回答</span>，而是先从一个知识库里搜出相关资料，再把资料连同问题一起交给 LLM 生成答案。
+      </p>
+      <p class="text-gray-500 dark:text-gray-400 leading-relaxed">
+        在这个项目中，知识库是 <strong>5 个 OJ 平台（Codeforces, AtCoder, LeetCode, Luogu, NowCoder）上的数万道算法题</strong>。用户可以用自然语言搜索——比如 "适合初学者的动态规划入门题" ——系统会找到语义最匹配的题目。
+      </p>
+      <div class="highlight-box pl-5 py-3 bg-gray-50 dark:bg-[#111] rounded-r-lg text-sm text-gray-500 dark:text-gray-400 leading-relaxed">
+        <p class="font-semibold text-gray-800 dark:text-gray-200 mb-1">生活类比</p>
+        就像考试时你可以翻课本——问题是你没见过的，但课本里有相关的知识点和例题。你翻书找到相关内容（<em>Retrieval</em>），然后结合自己理解写出答案（<em>Generation</em>）。LLM 自己没刷过所有算法题，但通过 RAG 它可以"翻书"。
+      </div>
+    </div>
+    <div class="bg-white dark:bg-[#141414] border border-gray-200 dark:border-gray-800 rounded-xl p-6 space-y-3">
+      <h3 class="font-semibold text-sm text-gray-500">RAG 的两个阶段</h3>
+      <div class="flex gap-4">
+        <div class="flex-1 bg-emerald-50 dark:bg-emerald-950/20 rounded-lg p-4 border border-emerald-200 dark:border-emerald-900/30">
+          <p class="text-xs font-mono uppercase tracking-wider text-accent dark:text-accent-light mb-1">阶段一</p>
+          <p class="font-semibold text-sm">离线录入 Offline</p>
+          <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 leading-relaxed">题目爬取 → LLM 摘要 → 向量嵌入 → 存入数据库。这个过程不面向用户，在后台批量完成。</p>
+        </div>
+        <div class="flex-1 bg-blue-50 dark:bg-blue-950/20 rounded-lg p-4 border border-blue-200 dark:border-blue-900/30">
+          <p class="text-xs font-mono uppercase tracking-wider text-blue-600 dark:text-blue-400 mb-1">阶段二</p>
+          <p class="font-semibold text-sm">在线查询 Online</p>
+          <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 leading-relaxed">用户输入 → 向量化 → 三路召回 → 重排序 → 返回结果。毫秒级响应。</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== 二、管道全景 ===== -->
+<section id="pipeline" class="max-w-5xl mx-auto px-6 py-20 border-t border-gray-200 dark:border-gray-800">
+  <h2 class="text-2xl font-bold tracking-tight mb-8">二、管道全景图</h2>
+
+  <div class="bg-white dark:bg-[#141414] border border-gray-200 dark:border-gray-800 rounded-2xl p-6 md:p-8 overflow-x-auto">
+    <div class="min-w-[900px]">
+      <!-- SVG 管道图 -->
+      <svg viewBox="0 0 900 620" class="w-full" style="max-width:900px">
+        <defs>
+          <marker id="arrowGreen" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+            <path d="M0,0 L8,3 L0,6 Z" fill="#059669"/>
+          </marker>
+          <marker id="arrowBlue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+            <path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+          <marker id="arrowGray" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+            <path d="M0,0 L8,3 L0,6 Z" fill="#6b7280"/>
+          </marker>
+          <linearGradient id="grad1" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0%" stop-color="#059669" stop-opacity="0.06"/>
+            <stop offset="100%" stop-color="#059669" stop-opacity="0.02"/>
+          </linearGradient>
+          <linearGradient id="grad2" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0%" stop-color="#2563eb" stop-opacity="0.06"/>
+            <stop offset="100%" stop-color="#2563eb" stop-opacity="0.02"/>
+          </linearGradient>
+        </defs>
+
+        <!-- 阶段一背景 -->
+        <rect x="20" y="20" width="860" height="240" rx="14" fill="url(#grad1)" stroke="#059669" stroke-opacity="0.12"/>
+        <text x="860" y="44" text-anchor="end" font-family="ui-monospace,monospace" font-size="11" fill="#059669" font-weight="600">阶段一 · 离线数据录入</text>
+
+        <!-- 阶段一节点 -->
+        <g transform="translate(45, 75)">
+          <rect width="135" height="52" rx="10" fill="white" stroke="#059669" stroke-opacity="0.25" class="pipeline-node"/>
+          <text x="67" y="22" text-anchor="middle" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">爬虫</text>
+          <text x="67" y="40" text-anchor="middle" font-size="13" fill="#111827" font-weight="600">抓取原始题目</text>
+        </g>
+        <line x1="180" y1="101" x2="218" y2="101" stroke="#059669" stroke-width="1.5" marker-end="url(#arrowGreen)" stroke-dasharray="4 3"/>
+
+        <g transform="translate(228, 75)">
+          <rect width="135" height="52" rx="10" fill="white" stroke="#059669" stroke-opacity="0.25" class="pipeline-node"/>
+          <text x="67" y="22" text-anchor="middle" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">LLM 摘要</text>
+          <text x="67" y="40" text-anchor="middle" font-size="13" fill="#111827" font-weight="600">DeepSeek 生成摘要</text>
+        </g>
+        <line x1="363" y1="101" x2="401" y2="101" stroke="#059669" stroke-width="1.5" marker-end="url(#arrowGreen)" stroke-dasharray="4 3"/>
+
+        <g transform="translate(411, 75)">
+          <rect width="135" height="52" rx="10" fill="white" stroke="#059669" stroke-opacity="0.25" class="pipeline-node"/>
+          <text x="67" y="22" text-anchor="middle" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">向量嵌入</text>
+          <text x="67" y="40" text-anchor="middle" font-size="13" fill="#111827" font-weight="600">Qwen3-Embedding</text>
+        </g>
+        <line x1="546" y1="101" x2="584" y2="101" stroke="#059669" stroke-width="1.5" marker-end="url(#arrowGreen)" stroke-dasharray="4 3"/>
+
+        <g transform="translate(594, 75)">
+          <rect width="135" height="52" rx="10" fill="white" stroke="#059669" stroke-opacity="0.25" class="pipeline-node"/>
+          <text x="67" y="22" text-anchor="middle" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">向量存储</text>
+          <text x="67" y="40" text-anchor="middle" font-size="13" fill="#111827" font-weight="600">PG + pgvector</text>
+        </g>
+
+        <!-- 阶段一细节标注 -->
+        <text x="62" y="165" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">5个OJ平台</text>
+        <text x="245" y="165" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">展示摘要+检索摘要+关键词</text>
+        <text x="428" y="165" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">3个向量列并行嵌入</text>
+        <text x="610" y="165" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">HNSW索引(cosine)</text>
+        <text x="62" y="183" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">Codeforces·AtCoder·LeetCode·Luogu·NowCoder</text>
+        <text x="245" y="183" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">+ 算法标签 + 标准化难度 1-10</text>
+        <text x="428" y="183" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">content · solution · summary</text>
+        <text x="610" y="183" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">GIN索引(关键词全文搜索)</text>
+
+        <!-- 过渡箭头 -->
+        <path d="M450,255 L450,283" stroke="#6b7280" stroke-width="1.5" marker-end="url(#arrowGray)" stroke-dasharray="6 4"/>
+
+        <!-- 阶段二背景 -->
+        <rect x="20" y="295" width="860" height="250" rx="14" fill="url(#grad2)" stroke="#2563eb" stroke-opacity="0.12"/>
+        <text x="860" y="319" text-anchor="end" font-family="ui-monospace,monospace" font-size="11" fill="#2563eb" font-weight="600">阶段二 · 在线查询检索</text>
+
+        <!-- 阶段二节点 -->
+        <g transform="translate(45, 340)">
+          <rect width="130" height="52" rx="10" fill="white" stroke="#2563eb" stroke-opacity="0.25" class="pipeline-node"/>
+          <text x="65" y="22" text-anchor="middle" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">查询分析</text>
+          <text x="65" y="40" text-anchor="middle" font-size="13" fill="#111827" font-weight="600">意图识别+扩展</text>
+        </g>
+        <line x1="175" y1="366" x2="213" y2="366" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlue)" stroke-dasharray="4 3"/>
+
+        <g transform="translate(223, 328)">
+          <rect width="145" height="76" rx="10" fill="white" stroke="#2563eb" stroke-opacity="0.25" class="pipeline-node"/>
+          <text x="72" y="20" text-anchor="middle" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">三路并行召回</text>
+          <text x="72" y="38" text-anchor="middle" font-size="11" fill="#374151">content向量 Top-80</text>
+          <text x="72" y="54" text-anchor="middle" font-size="11" fill="#374151">solution向量 Top-80</text>
+          <text x="72" y="70" text-anchor="middle" font-size="11" fill="#374151">关键词全文搜索 Top-50</text>
+        </g>
+        <line x1="368" y1="366" x2="406" y2="366" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlue)" stroke-dasharray="4 3"/>
+
+        <g transform="translate(416, 340)">
+          <rect width="135" height="52" rx="10" fill="white" stroke="#2563eb" stroke-opacity="0.25" class="pipeline-node"/>
+          <text x="67" y="22" text-anchor="middle" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">合并+粗排序</text>
+          <text x="67" y="40" text-anchor="middle" font-size="13" fill="#111827" font-weight="600">Min-Max归一化</text>
+        </g>
+        <line x1="551" y1="366" x2="589" y2="366" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlue)" stroke-dasharray="4 3"/>
+
+        <g transform="translate(599, 340)">
+          <rect width="135" height="52" rx="10" fill="white" stroke="#2563eb" stroke-opacity="0.25" class="pipeline-node"/>
+          <text x="67" y="22" text-anchor="middle" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">重排序</text>
+          <text x="67" y="40" text-anchor="middle" font-size="13" fill="#111827" font-weight="600">Qwen3-Reranker</text>
+        </g>
+
+        <!-- 阶段二细节标注 -->
+        <text x="60" y="428" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">语义/算法/错误 三意图</text>
+        <text x="60" y="443" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">动态调整各通路权重</text>
+        <text x="240" y="428" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">3秒超时·降级容错</text>
+        <text x="240" y="443" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">某路失败不影响整体</text>
+        <text x="430" y="428" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">w1×s1 + w2×s2 + w3×s3</text>
+        <text x="430" y="443" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">Top-50送重排序</text>
+        <text x="615" y="428" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">LLM精排·退化检测</text>
+        <text x="615" y="443" font-size="11" fill="#6b7280" font-family="ui-monospace,monospace">方差<0.01自动回退</text>
+
+        <!-- 结果输出 -->
+        <line x1="666" y1="416" x2="666" y2="485" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+
+        <g transform="translate(598, 495)">
+          <rect width="136" height="40" rx="20" fill="#2563eb" fill-opacity="0.08" stroke="#2563eb" stroke-opacity="0.25"/>
+          <text x="68" y="25" text-anchor="middle" font-size="13" fill="#2563eb" font-weight="600">返回 Top-10 结果</text>
+        </g>
+
+        <!-- 消费者标注 -->
+        <text x="780" y="383" font-size="10" fill="#6b7280" font-family="ui-monospace,monospace">训练Agent消费</text>
+        <text x="780" y="398" font-size="10" fill="#6b7280" font-family="ui-monospace,monospace">前端向量搜索UI</text>
+      </svg>
+    </div>
+  </div>
+</section>
+
+<!-- ===== 三、离线录入详解 ===== -->
+<section id="ingestion" class="max-w-5xl mx-auto px-6 py-20 border-t border-gray-200 dark:border-gray-800">
+  <h2 class="text-2xl font-bold tracking-tight mb-8">三、离线录入阶段 —— 题目如何变成可搜索的向量</h2>
+
+  <!-- 3.1 爬虫 -->
+  <div class="mb-14">
+    <div class="flex items-center gap-3 mb-4">
+      <span class="step-badge bg-emerald-100 dark:bg-emerald-900/30 text-accent dark:text-accent-light">1</span>
+      <h3 class="text-lg font-semibold">爬虫抓取原始题目</h3>
+    </div>
+    <div class="grid md:grid-cols-3 gap-6">
+      <div class="md:col-span-2 space-y-3">
+        <p class="text-gray-500 dark:text-gray-400 leading-relaxed text-sm">
+          系统支持 <strong>5 个 OJ 平台</strong>的题目抓取。管理员通过 API 触发抓取后，Python 爬虫把题目保存为 JSON 文件，后端再读入 PostgreSQL 数据库。
+        </p>
+        <div class="flex flex-wrap gap-2">
+          <span class="px-3 py-1.5 bg-gray-100 dark:bg-gray-800 rounded-full text-xs font-medium">Codeforces</span>
+          <span class="px-3 py-1.5 bg-gray-100 dark:bg-gray-800 rounded-full text-xs font-medium">AtCoder</span>
+          <span class="px-3 py-1.5 bg-gray-100 dark:bg-gray-800 rounded-full text-xs font-medium">LeetCode</span>
+          <span class="px-3 py-1.5 bg-gray-100 dark:bg-gray-800 rounded-full text-xs font-medium">Luogu</span>
+          <span class="px-3 py-1.5 bg-gray-100 dark:bg-gray-800 rounded-full text-xs font-medium">NowCoder</span>
+        </div>
+        <p class="text-xs text-gray-400 dark:text-gray-500 mt-2">
+          代码位置: <code class="bg-gray-100 dark:bg-gray-800 px-1 rounded text-[11px]">python/crawlers/*.py</code>
+          和 <code class="bg-gray-100 dark:bg-gray-800 px-1 rounded text-[11px]">backend/src/crawler/crawler.controller.ts</code>
+        </p>
+      </div>
+      <div class="bg-gray-50 dark:bg-[#111] border border-gray-200 dark:border-gray-800 rounded-xl p-4">
+        <p class="text-xs font-mono text-gray-500 mb-2">抓到的原始数据长这样</p>
+        <pre class="code-block text-[11px] text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-[#1a1a1a] p-3 rounded-lg overflow-x-auto leading-relaxed">{
+  "title": "Two Sum",
+  "description": "Given an array
+    of integers nums and
+    an integer target,
+    return indices...",
+  "platform": "leetcode",
+  "difficulty": "EASY",
+  "tags": ["array","hash-table"]
+}</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3.2 LLM 摘要 (详细) -->
+  <div class="mb-14">
+    <div class="flex items-center gap-3 mb-4">
+      <span class="step-badge bg-emerald-100 dark:bg-emerald-900/30 text-accent dark:text-accent-light">2</span>
+      <h3 class="text-lg font-semibold">LLM 生成结构化摘要</h3>
+    </div>
+    <div class="space-y-4">
+      <p class="text-gray-500 dark:text-gray-400 leading-relaxed text-sm">
+        爬下来的原始题目是 HTML 格式的英文或中文描述，不适合直接做语义搜索——有的题面 2000 字，有的只有 200 字，语言还不统一。系统调用 <strong>DeepSeek API</strong> 为每道题自动生成以下几种文本：
+      </p>
+
+      <div class="grid sm:grid-cols-3 gap-4">
+        <div class="bg-white dark:bg-[#141414] border border-gray-200 dark:border-gray-800 rounded-xl p-5">
+          <p class="text-xs font-mono text-accent dark:text-accent-light font-semibold mb-2">solution_summary</p>
+          <p class="text-xs text-gray-500 dark:text-gray-400 leading-relaxed mb-2">面向人类阅读的完整中文摘要 (300-500字)</p>
+          <p class="text-[11px] text-gray-400 dark:text-gray-500">用于前端展示 + 生成 solution 向量做语义检索</p>
+        </div>
+        <div class="bg-white dark:bg-[#141414] border border-gray-200 dark:border-gray-800 rounded-xl p-5">
+          <p class="text-xs font-mono text-blue-600 dark:text-blue-400 font-semibold mb-2">retrieval_summary</p>
+          <p class="text-xs text-gray-500 dark:text-gray-400 leading-relaxed mb-2">为向量搜索优化的精炼摘要 (150-350字)</p>
+          <p class="text-[11px] text-gray-400 dark:text-gray-500">专门用于生成 content 向量，跨题目相似度匹配</p>
+        </div>
+        <div class="bg-white dark:bg-[#141414] border border-gray-200 dark:border-gray-800 rounded-xl p-5">
+          <p class="text-xs font-mono text-purple-600 dark:text-purple-400 font-semibold mb-2">sparse_text</p>
+          <p class="text-xs text-gray-500 dark:text-gray-400 leading-relaxed mb-2">以空格分隔的关键词列表字符串</p>
+          <p class="text-[11px] text-gray-400 dark:text-gray-500">用于 PostgreSQL 全文搜索 (tsvector)，精确匹配算法术语</p>
+        </div>
+      </div>
+
+      <div class="bg-gray-50 dark:bg-[#111] border border-gray-200 dark:border-gray-800 rounded-xl p-5">
+        <p class="text-xs font-mono text-gray-500 mb-3">实际例子: LeetCode 1 "两数之和" → DeepSeek 生成的摘要</p>
+        <div class="grid sm:grid-cols-2 gap-5">
+          <div>
+            <p class="text-[11px] font-semibold text-accent dark:text-accent-light mb-1">solution_summary (展示用)</p>
+            <p class="text-xs text-gray-600 dark:text-gray-400 leading-relaxed">
+              给定一个整数数组 nums 和一个目标值 target，要求找出数组中和为目标值的两个数字的下标。通过维护一个哈希表记录已遍历元素的值和下标的映射，在遍历时检查 target - nums[i] 是否已存在于哈希表中，实现 O(n) 时间复杂度。关键点：哈希表同时承担了存储和查找的双重职责。常见陷阱：不能重复使用同一个元素，需要保证两个下标不同。
+            </p>
+          </div>
+          <div>
+            <p class="text-[11px] font-semibold text-blue-600 dark:text-blue-400 mb-1">retrieval_summary (检索用)</p>
+            <p class="text-xs text-gray-600 dark:text-gray-400 leading-relaxed">
+              题目：数组中两数之和等于目标值，返回下标。解法：哈希表一次遍历，存储已访问元素值和下标的映射，检查当前元素补数是否在哈希表中。算法：哈希表、数组遍历。时间复杂度 O(n)，空间复杂度 O(n)。
+            </p>
+          </div>
+        </div>
+        <p class="text-[11px] text-gray-400 dark:text-gray-500 mt-3">
+          注意 retrieval_summary 比 solution_summary 更精炼、更多关键词、更少冗余描述——这就是为什么要分开：展示给用户看要详细，给向量搜索用要聚焦关键信息。
+        </p>
+      </div>
+
+      <div class="grid sm:grid-cols-3 gap-3 text-xs">
+        <div class="bg-gray-50 dark:bg-[#111] rounded-lg p-3 border border-gray-200 dark:border-gray-800">
+          <p class="font-semibold text-gray-700 dark:text-gray-300 mb-1">标签标准化</p>
+          <p class="text-gray-500 dark:text-gray-400 leading-relaxed">不同平台的标签体系不同（Luogu叫"动态规划dp"，LeetCode叫"Dynamic Programming"），系统用 <code class="bg-gray-100 dark:bg-gray-800 px-1 rounded text-[11px]">taxonomy.json</code> 映射到统一的 200+ 标签词汇表。</p>
+        </div>
+        <div class="bg-gray-50 dark:bg-[#111] rounded-lg p-3 border border-gray-200 dark:border-gray-800">
+          <p class="font-semibold text-gray-700 dark:text-gray-300 mb-1">难度标准化</p>
+          <p class="text-gray-500 dark:text-gray-400 leading-relaxed">CF 的 800-3500、Luogu 的 1-7、LeetCode 的 E/M/H 全部映射到统一的 1-10 难度体系。</p>
+        </div>
+        <div class="bg-gray-50 dark:bg-[#111] rounded-lg p-3 border border-gray-200 dark:border-gray-800">
+          <p class="font-semibold text-gray-700 dark:text-gray-300 mb-1">算法分类</p>
+          <p class="text-gray-500 dark:text-gray-400 leading-relaxed">LLM 还输出 primaryAlgo（主算法）、subAlgos（辅助算法）、problemPatterns（问题模式），用于训练 Agent 的个性化推荐。</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3.3 向量嵌入 -->
+  <div class="mb-14">
+    <div class="flex items-center gap-3 mb-4">
+      <span class="step-badge bg-emerald-100 dark:bg-emerald-900/30 text-accent dark:text-accent-light">3</span>
+      <h3 class="text-lg font-semibold">文本转向量 (Embedding)</h3>
+    </div>
+    <div class="space-y-4">
+      <p class="text-gray-500 dark:text-gray-400 leading-relaxed text-sm">
+        摘要文本通过嵌入模型转换成<strong> 1024 维的浮点数向量</strong>。一句话理解：嵌入模型把"意思"编码成数学坐标——意思相近的文本，向量在空间中距离就近。
+      </p>
+
+      <div class="flex gap-3 bg-white dark:bg-[#141414] border border-gray-200 dark:border-gray-800 rounded-xl p-4">
+          <div class="w-8 h-8 flex-shrink-0 bg-emerald-100 dark:bg-emerald-900/30 rounded-lg flex items-center justify-center">
+            <span class="text-xs font-bold text-accent">E</span>
+          </div>
+          <div>
+            <p class="text-sm font-semibold mb-0.5">Qwen3-Embedding-0.6B (llama.cpp)</p>
+            <p class="text-xs text-gray-500 leading-relaxed">llama-server · 端口 8089 · Q8_0 量化 · CUDA 加速 · Python 摄录管道和 NestJS 后端共用</p>
+          </div>
+        </div>
+
+      <div class="highlight-box pl-5 py-4 bg-amber-50 dark:bg-amber-950/20 rounded-r-lg text-sm">
+        <p class="font-semibold text-amber-800 dark:text-amber-300 mb-1">关键设计: 指令感知嵌入 (Instruction-aware Embedding)</p>
+        <p class="text-amber-700 dark:text-amber-400 leading-relaxed text-xs">
+          嵌入时给模型加一段"指令前缀"，告诉模型这段文本在系统中的角色。同样的文本在不同场景下产生的向量不同：
+        </p>
+        <div class="mt-2 space-y-1 text-[11px] font-mono">
+          <div class="flex gap-2">
+            <span class="text-amber-600 dark:text-amber-400 flex-shrink-0">存储 content:</span>
+            <code class="bg-amber-100 dark:bg-amber-950/50 px-1.5 py-0.5 rounded">"为算法题题面生成用于题意相似检索的向量" + [检索摘要文本]</code>
+          </div>
+          <div class="flex gap-2">
+            <span class="text-amber-600 dark:text-amber-400 flex-shrink-0">存储 solution:</span>
+            <code class="bg-amber-100 dark:bg-amber-950/50 px-1.5 py-0.5 rounded">"为算法题解法摘要生成用于相似题检索的向量" + [解法摘要文本]</code>
+          </div>
+          <div class="flex gap-2">
+            <span class="text-amber-600 dark:text-amber-400 flex-shrink-0">查询:</span>
+            <code class="bg-amber-100 dark:bg-amber-950/50 px-1.5 py-0.5 rounded">"为用户的算法题检索请求生成向量" + [用户查询文本]</code>
+          </div>
+        </div>
+        <p class="text-amber-700 dark:text-amber-400 text-xs mt-2 leading-relaxed">
+          为什么要这样？因为"两数之和用哈希表解决"这句话，出现在题目描述中（作为答案）和出现在用户查询中（作为提问）的语义角色完全不同。指令前缀帮助嵌入模型意识到这一点。
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3.4 存储 -->
+  <div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="step-badge bg-emerald-100 dark:bg-emerald-900/30 text-accent dark:text-accent-light">4</span>
+      <h3 class="text-lg font-semibold">向量存储与索引</h3>
+    </div>
+    <div class="grid md:grid-cols-2 gap-6">
+      <div class="space-y-3">
+        <p class="text-gray-500 dark:text-gray-400 leading-relaxed text-sm">
+          使用 <strong>PostgreSQL + pgvector</strong> 扩展存储。每道题的 <strong>3 个向量列</strong>分别建了 HNSW 索引，关键词列建了 GIN 全文搜索索引。
+        </p>
+        <div class="bg-gray-50 dark:bg-[#111] rounded-xl p-4 border border-gray-200 dark:border-gray-800">
+          <p class="text-[11px] font-mono text-gray-500 mb-2">数据库向量列一览</p>
+          <table class="w-full text-xs">
+            <thead><tr class="text-gray-500 text-left"><th class="pb-2 pr-4 font-medium">列名</th><th class="pb-2 pr-4 font-medium">内容来源</th><th class="pb-2 font-medium">索引类型</th></tr></thead>
+            <tbody class="text-gray-700 dark:text-gray-300 font-mono">
+              <tr><td class="py-1.5 pr-4">vector_embedding</td><td class="py-1.5 pr-4 text-gray-500">solution_summary</td><td class="py-1.5">HNSW (cosine)</td></tr>
+              <tr><td class="py-1.5 pr-4">content_vector</td><td class="py-1.5 pr-4 text-gray-500">retrieval_summary</td><td class="py-1.5">HNSW (cosine)</td></tr>
+              <tr><td class="py-1.5 pr-4">summary_vector</td><td class="py-1.5 pr-4 text-gray-500">full_content (题面全文)</td><td class="py-1.5">HNSW (cosine)</td></tr>
+              <tr><td class="py-1.5 pr-4">sparse_text</td><td class="py-1.5 pr-4 text-gray-500">关键词列表</td><td class="py-1.5">GIN (全文搜索)</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="space-y-3">
+        <div class="bg-gray-50 dark:bg-[#111] border border-gray-200 dark:border-gray-800 rounded-xl p-4">
+          <p class="text-[11px] font-semibold text-gray-500 mb-2">HNSW 索引原理 (类比理解)</p>
+          <p class="text-xs text-gray-500 dark:text-gray-400 leading-relaxed">
+            把每道题想象成空间中的一个点。两题"意思相近"，在向量空间中距离就近。HNSW 索引就像预先建好的导航路线——查询时不用遍历所有点，沿索引路径就能快速找到最近邻居。
+          </p>
+          <div class="mt-2 flex gap-2 text-[11px]">
+            <span class="px-2 py-0.5 bg-emerald-100 dark:bg-emerald-900/30 text-accent rounded font-mono">m=16</span>
+            <span class="px-2 py-0.5 bg-emerald-100 dark:bg-emerald-900/30 text-accent rounded font-mono">ef_construction=64</span>
+            <span class="px-2 py-0.5 bg-gray-200 dark:bg-gray-700 text-gray-500 rounded font-mono">cosine 距离</span>
+          </div>
+        </div>
+        <div class="bg-gray-50 dark:bg-[#111] border border-gray-200 dark:border-gray-800 rounded-xl p-4">
+          <p class="text-[11px] font-semibold text-gray-500 mb-2">为什么用 pgvector 而不是专用向量库？</p>
+          <p class="text-xs text-gray-500 dark:text-gray-400 leading-relaxed">
+            题目数据本身就是结构化的（有标签、难度、平台等字段），需要 SQL 过滤 + 向量搜索同时进行。pgvector 把向量存在 PostgreSQL 里，一条 SQL 就能完成 "向量相似 + 平台=CF + 难度 3-7" 的复合查询。
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== 四、在线查询检索 ===== -->
+<section id="query" class="max-w-5xl mx-auto px-6 py-20 border-t border-gray-200 dark:border-gray-800">
+  <h2 class="text-2xl font-bold tracking-tight mb-8">四、在线查询阶段 —— 用户搜索如何找到题目</h2>
+
+  <!-- 4.1 查询分析 -->
+  <div class="mb-14">
+    <div class="flex items-center gap-3 mb-4">
+      <span class="step-badge bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400">1</span>
+      <h3 class="text-lg font-semibold">查询意图分析与扩展</h3>
+    </div>
+    <div class="grid md:grid-cols-5 gap-6">
+      <div class="md:col-span-3 space-y-3">
+        <p class="text-gray-500 dark:text-gray-400 leading-relaxed text-sm">
+          用户输入不直接做嵌入，先经过 <code class="bg-gray-100 dark:bg-gray-800 px-1.5 py-0.5 rounded text-xs font-mono">QueryAnalysisService</code> 分析意图。系统内置了包含 <strong>88 个算法词条的扩展字典</strong>，自动识别算法术语并扩展同义词（比如 "dp" 扩展为 "dynamic programming"）。
+        </p>
+        <div class="bg-gray-50 dark:bg-[#111] rounded-xl p-4 border border-gray-200 dark:border-gray-800">
+          <p class="text-[11px] font-semibold text-gray-500 mb-2">三种查询类型及其权重分配</p>
+          <table class="w-full text-xs">
+            <thead><tr class="text-gray-500"><th class="text-left pb-2 pr-4 font-medium">类型</th><th class="text-center pb-2 pr-4 font-medium">content 通路</th><th class="text-center pb-2 pr-4 font-medium">solution 通路</th><th class="text-center pb-2 font-medium">keyword 通路</th></tr></thead>
+            <tbody class="font-mono">
+              <tr class="border-t border-gray-200 dark:border-gray-700">
+                <td class="py-2 pr-4 text-gray-800 dark:text-gray-200">problem_semantic (语义搜索)</td>
+                <td class="py-2 pr-4 text-center text-accent font-semibold">0.60</td>
+                <td class="py-2 pr-4 text-center">0.30</td>
+                <td class="py-2 text-center">0.10</td>
+              </tr>
+              <tr class="border-t border-gray-200 dark:border-gray-700">
+                <td class="py-2 pr-4 text-gray-800 dark:text-gray-200">algorithm_intent (算法意图)</td>
+                <td class="py-2 pr-4 text-center">0.20</td>
+                <td class="py-2 pr-4 text-center text-accent font-semibold">0.55</td>
+                <td class="py-2 text-center">0.25</td>
+              </tr>
+              <tr class="border-t border-gray-200 dark:border-gray-700">
+                <td class="py-2 pr-4 text-gray-800 dark:text-gray-200">error_reason (错误原因搜索)</td>
+                <td class="py-2 pr-4 text-center">0.20</td>
+                <td class="py-2 pr-4 text-center text-accent font-semibold">0.60</td>
+                <td class="py-2 text-center">0.20</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="text-xs text-gray-400 dark:text-gray-500">
+          代码位置: <code class="bg-gray-100 dark:bg-gray-800 px-1 rounded text-[11px]">backend/src/common/query-analysis/query-analysis.service.ts</code>
+        </p>
+      </div>
+      <div class="md:col-span-2">
+        <div class="bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-900/30 rounded-xl p-4">
+          <p class="text-xs font-semibold text-blue-700 dark:text-blue-300 mb-2">举例: 查询分析全过程</p>
+          <p class="text-[11px] text-gray-500 leading-relaxed mb-3">
+            用户输入：<em class="text-gray-800 dark:text-gray-200">"动态规划 背包"</em>
+          </p>
+          <div class="space-y-2 text-[11px]">
+            <div class="flex items-start gap-2">
+              <span class="text-blue-500 mt-0.5 flex-shrink-0">&rarr;</span>
+              <span class="text-gray-600 dark:text-gray-400">检测到算法名 "动态规划"、"背包"</span>
+            </div>
+            <div class="flex items-start gap-2">
+              <span class="text-blue-500 mt-0.5 flex-shrink-0">&rarr;</span>
+              <span class="text-gray-600 dark:text-gray-400">分类为 <strong>algorithm_intent</strong></span>
+            </div>
+            <div class="flex items-start gap-2">
+              <span class="text-blue-500 mt-0.5 flex-shrink-0">&rarr;</span>
+              <span class="text-gray-600 dark:text-gray-400">扩展 "dp" &rarr; "dynamic programming"</span>
+            </div>
+            <div class="flex items-start gap-2">
+              <span class="text-blue-500 mt-0.5 flex-shrink-0">&rarr;</span>
+              <span class="text-gray-600 dark:text-gray-400">权重偏向 solution 通路 (0.55) —— 用户更关心解法</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 4.2 三路并行召回 -->
+  <div class="mb-14">
+    <div class="flex items-center gap-3 mb-4">
+      <span class="step-badge bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400">2</span>
+      <h3 class="text-lg font-semibold">三路并行召回 (Hybrid Recall) —— 核心设计</h3>
+    </div>
+    <p class="text-gray-500 dark:text-gray-400 leading-relaxed text-sm mb-5">
+      查询向量同时走三条通路，<strong>并行执行，3 秒超时保护</strong>。任意一条通路失败不影响其他路。每路独立返回 Top-K 结果。
+    </p>
+
+    <div class="grid sm:grid-cols-3 gap-5 mb-5">
+      <div class="bg-white dark:bg-[#141414] border border-gray-200 dark:border-gray-800 rounded-xl p-5">
+        <div class="w-9 h-9 bg-emerald-100 dark:bg-emerald-900/30 rounded-lg flex items-center justify-center mb-3">
+          <span class="text-sm font-bold text-accent">C</span>
+        </div>
+        <p class="font-semibold text-sm mb-2">content 向量检索</p>
+        <p class="text-xs text-gray-500 leading-relaxed mb-2">ANN 搜索 content_vector 列</p>
+        <p class="text-[11px] text-gray-500 font-mono">&rarr; 返回 Top-80</p>
+        <div class="mt-3 pt-3 border-t border-gray-100 dark:border-gray-800">
+          <p class="text-[10px] text-gray-400">适合：题目描述的语义相似匹配</p>
+        </div>
+      </div>
+
+      <div class="bg-white dark:bg-[#141414] border border-gray-200 dark:border-gray-800 rounded-xl p-5">
+        <div class="w-9 h-9 bg-blue-100 dark:bg-blue-900/30 rounded-lg flex items-center justify-center mb-3">
+          <span class="text-sm font-bold text-blue-600">S</span>
+        </div>
+        <p class="font-semibold text-sm mb-2">solution 向量检索</p>
+        <p class="text-xs text-gray-500 leading-relaxed mb-2">ANN 搜索 vector_embedding 列</p>
+        <p class="text-[11px] text-gray-500 font-mono">&rarr; 返回 Top-80</p>
+        <div class="mt-3 pt-3 border-t border-gray-100 dark:border-gray-800">
+          <p class="text-[10px] text-gray-400">适合：解法和算法思路相似匹配</p>
+        </div>
+      </div>
+
+      <div class="bg-white dark:bg-[#141414] border border-gray-200 dark:border-gray-800 rounded-xl p-5">
+        <div class="w-9 h-9 bg-purple-100 dark:bg-purple-900/30 rounded-lg flex items-center justify-center mb-3">
+          <span class="text-sm font-bold text-purple-600">K</span>
+        </div>
+        <p class="font-semibold text-sm mb-2">关键词全文搜索</p>
+        <p class="text-xs text-gray-500 leading-relaxed mb-2"><code class="bg-gray-100 dark:bg-gray-800 px-1 rounded text-[11px]">ts_rank</code> 搜索 sparse_text 列</p>
+        <p class="text-[11px] text-gray-500 font-mono">&rarr; 返回 Top-50</p>
+        <div class="mt-3 pt-3 border-t border-gray-100 dark:border-gray-800">
+          <p class="text-[10px] text-gray-400">适合：精确算法名/术语匹配</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-gray-50 dark:bg-[#111] border border-gray-200 dark:border-gray-800 rounded-xl p-5">
+      <p class="text-xs font-semibold text-gray-500 mb-3">为什么必须三条通路？各有所长</p>
+      <div class="grid sm:grid-cols-2 gap-4 text-xs text-gray-600 dark:text-gray-400 leading-relaxed">
+        <div>
+          <p><strong class="text-gray-800 dark:text-gray-200">向量检索 (C + S)</strong>：擅长语义理解。"最短路径"能找到"Dijkstra"的题，即使题目里没有"Dijkstra"这个词。数学上，向量空间中相似概念天然聚集。但它不擅长精确术语匹配——"01背包"可能和"完全背包"混淆。</p>
+        </div>
+        <div>
+          <p><strong class="text-gray-800 dark:text-gray-200">关键词搜索 (K)</strong>：擅长精确匹配。"01背包"直接命中标签为"01背包"的题目，不会混入完全背包。但"最优子结构"这种描述性语言搜不到任何东西——因为 sparse_text 里存的是关键词，不是自然语言描述。</p>
+        </div>
+      </div>
+      <p class="text-xs text-gray-400 dark:text-gray-500 mt-3">
+        三条通路取交集，既保证了语义覆盖率（向量通路），又保证了精确命中率（关键词通路）。这就是 "混合检索" 优于纯向量检索的原因。
+      </p>
+    </div>
+  </div>
+
+  <!-- 4.3 合并归一化 -->
+  <div class="mb-14">
+    <div class="flex items-center gap-3 mb-4">
+      <span class="step-badge bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400">3</span>
+      <h3 class="text-lg font-semibold">合并去重 + Min-Max 归一化 + 动态加权</h3>
+    </div>
+    <div class="grid md:grid-cols-5 gap-6">
+      <div class="md:col-span-3 space-y-3">
+        <p class="text-gray-500 dark:text-gray-400 leading-relaxed text-sm">
+          三条通路返回的分数尺度不同（向量用余弦距离，关键词用 ts_rank），需要统一尺度才能公平比较。系统使用 <strong>Min-Max 归一化</strong>将所有分数映射到 [0, 1] 区间，然后根据查询意图的权重计算最终粗分。
+        </p>
+        <div class="bg-gray-50 dark:bg-[#111] rounded-xl p-4 border border-gray-200 dark:border-gray-800">
+          <p class="text-[11px] font-mono text-gray-500 mb-2">归一化与加权公式</p>
+          <code class="code-block block text-xs bg-gray-100 dark:bg-[#1a1a1a] p-3 rounded-lg text-gray-700 dark:text-gray-300">
+score_norm = (score - min_score) / (max_score - min_score)<br>
+roughScore = w1 * score_content + w2 * score_solution + w3 * score_keyword
+          </code>
+        </div>
+        <p class="text-xs text-gray-400 dark:text-gray-500">
+          去重后约 150-200 条候选，按 roughScore 降序取 Top-50 送入重排序。
+        </p>
+      </div>
+      <div class="md:col-span-2">
+        <div class="bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-900/30 rounded-xl p-4">
+          <p class="text-xs font-semibold text-blue-700 dark:text-blue-300 mb-2">具体例子 (algorithm_intent)</p>
+          <p class="text-xs text-gray-500 leading-relaxed mb-3">
+            weight = {content: 0.20, solution: 0.55, keyword: 0.25}
+          </p>
+          <div class="space-y-1.5 text-[11px] font-mono">
+            <div class="flex justify-between">
+              <span class="text-gray-500">CF 1081D 背包</span>
+              <span>roughScore = 0.20*0.62 + 0.55*0.91 + 0.25*0.88 = <strong class="text-accent">0.83</strong></span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-gray-500">Luogu P1048 采药</span>
+              <span>roughScore = 0.20*0.55 + 0.55*0.87 + 0.25*0.85 = <strong>0.79</strong></span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-gray-500">AtCoder abc032_d</span>
+              <span>roughScore = 0.20*0.48 + 0.55*0.82 + 0.25*0.65 = <strong>0.71</strong></span>
+            </div>
+          </div>
+          <p class="text-[10px] text-gray-400 mt-3">CF 1081D 虽然是 solution 匹配最高的，但因为 keyword 权重偏低，总体仍然排第一。</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 4.4 重排序 -->
+  <div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="step-badge bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400">4</span>
+      <h3 class="text-lg font-semibold">LLM 重排序 (Reranking)</h3>
+    </div>
+    <div class="grid md:grid-cols-2 gap-6">
+      <div class="space-y-3 text-sm text-gray-600 dark:text-gray-400 leading-relaxed">
+        <p>
+          粗排序只看向量距离，<strong>可能遗漏语义细节</strong>。重排序阶段把 Top-20 候选的标题、摘要、标签一起发给 <strong>Qwen3-Reranker-0.6B 模型</strong>，让它逐对评估每道题与查询的<strong>语义相关性</strong>，而不是简单的向量距离。
+        </p>
+        <p>
+          举个典型场景：查询 "two pointers"，粗排可能把包含 "two" 和 "pointer" 两个单词的题目排得很高（关键词通路的字面匹配），但重排序会判断这些题是否真的用了<strong>双指针算法</strong>。"CF 279B Books" 虽然不含 "two pointers" 关键词，但解法确实是双指针，重排序后会被提升。
+        </p>
+        <div class="bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-900/30 rounded-lg p-3 mt-3">
+          <p class="text-xs font-semibold text-amber-800 dark:text-amber-300 mb-1">容错设计: 双重保障</p>
+          <p class="text-xs text-amber-700 dark:text-amber-400 leading-relaxed">
+            如果重排序服务器不可用 → 自动回退到粗排序结果。<br>
+            如果重排序分数方差 &lt; 0.01（退化/所有题目分数一样） → 自动回退到粗排序结果。<br>
+            用户始终能搜到东西，只是质量可能略降。
+          </p>
+        </div>
+      </div>
+      <div class="bg-gray-50 dark:bg-[#111] border border-gray-200 dark:border-gray-800 rounded-xl p-4">
+        <p class="text-[11px] font-semibold text-gray-500 mb-2">重排序前后对比 (查询: "two pointers 滑动窗口")</p>
+        <table class="w-full text-xs font-mono">
+          <thead><tr class="text-gray-500 text-left"><th class="pb-2 pr-3">题目</th><th class="pb-2 pr-3 text-center">粗排</th><th class="pb-2 text-center">重排后</th></tr></thead>
+          <tbody>
+            <tr class="border-t border-gray-200 dark:border-gray-700">
+              <td class="py-1.5 pr-3 text-gray-800 dark:text-gray-200">CF 279B Books (双指针)</td>
+              <td class="py-1.5 pr-3 text-center text-gray-500">3</td>
+              <td class="py-1.5 text-center text-green-600 font-semibold">1 &uarr;</td>
+            </tr>
+            <tr class="border-t border-gray-200 dark:border-gray-700">
+              <td class="py-1.5 pr-3 text-gray-800 dark:text-gray-200">Luogu P1102 (含"two"关键词但非双指针)</td>
+              <td class="py-1.5 pr-3 text-center text-gray-500">1</td>
+              <td class="py-1.5 text-center text-red-500 font-semibold">3 &darr;</td>
+            </tr>
+            <tr class="border-t border-gray-200 dark:border-gray-700">
+              <td class="py-1.5 pr-3 text-gray-800 dark:text-gray-200">LeetCode 3 (滑动窗口+哈希)</td>
+              <td class="py-1.5 pr-3 text-center text-gray-500">2</td>
+              <td class="py-1.5 text-center text-green-600 font-semibold">2 -</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="text-[10px] text-gray-400 mt-3 leading-relaxed">
+          Luogu P1102 因为标题含 "two" 关键词被粗排提到第一，但重排序发现它跟双指针算法无关，被降级。CF 279B 虽然关键词匹配弱，但语义上确实是双指针，重排序后升到第一。这就是重排序的价值。
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== 五、完整实例 ===== -->
+<section id="example" class="max-w-5xl mx-auto px-6 py-20 border-t border-gray-200 dark:border-gray-800">
+  <h2 class="text-2xl font-bold tracking-tight mb-8">五、完整实例演示</h2>
+  <p class="text-gray-500 dark:text-gray-400 leading-relaxed text-sm mb-8">
+    以一次真实查询为例，追踪数据在管道中的完整旅程。假设用户在前端搜索框中输入了一句话。
+  </p>
+
+  <div class="bg-white dark:bg-[#141414] border border-gray-200 dark:border-gray-800 rounded-2xl p-6 mb-6">
+    <div class="flex items-center gap-3 mb-6">
+      <div class="w-10 h-10 bg-blue-100 dark:bg-blue-900/30 rounded-full flex items-center justify-center text-blue-600 font-bold text-sm flex-shrink-0">Q</div>
+      <div>
+        <p class="font-semibold">用户在前端输入</p>
+        <p class="text-gray-500 text-sm">"查找使用滑动窗口和哈希表解决的字符串问题"</p>
+      </div>
+    </div>
+
+    <div class="space-y-0">
+      <!-- 步骤条 -->
+      <div class="relative pl-10 pb-7 border-l-2 border-gray-200 dark:border-gray-700 ml-1">
+        <div class="absolute -left-[13px] top-0 w-6 h-6 rounded-full bg-blue-100 dark:bg-blue-900/30 border-2 border-blue-500 flex items-center justify-center text-[10px] font-bold text-blue-600">1</div>
+        <p class="font-semibold text-sm mb-1">查询分析</p>
+        <p class="text-xs text-gray-500 leading-relaxed">
+          系统检测到 "滑动窗口" 和 "哈希表" 两个算法名 &rarr; 分类为 <strong>algorithm_intent</strong> &rarr;
+          权重: <span class="font-mono bg-gray-100 dark:bg-gray-800 px-1 rounded">content=0.20, solution=0.55, keyword=0.25</span>
+        </p>
+      </div>
+
+      <div class="relative pl-10 pb-7 border-l-2 border-gray-200 dark:border-gray-700 ml-1">
+        <div class="absolute -left-[13px] top-0 w-6 h-6 rounded-full bg-blue-100 dark:bg-blue-900/30 border-2 border-blue-500 flex items-center justify-center text-[10px] font-bold text-blue-600">2</div>
+        <p class="font-semibold text-sm mb-1">查询嵌入</p>
+        <p class="text-xs text-gray-500 leading-relaxed">
+          查询文本加上指令前缀 <code class="bg-gray-100 dark:bg-gray-800 px-1 rounded text-[11px]">"为用户的算法题检索请求生成向量"</code> &rarr;
+          Qwen3-Embedding-0.6B 生成 1024 维向量 <code class="bg-gray-100 dark:bg-gray-800 px-1 rounded text-[11px]">[0.023, -0.451, 0.782, ...]</code>
+        </p>
+      </div>
+
+      <div class="relative pl-10 pb-7 border-l-2 border-gray-200 dark:border-gray-700 ml-1">
+        <div class="absolute -left-[13px] top-0 w-6 h-6 rounded-full bg-blue-100 dark:bg-blue-900/30 border-2 border-blue-500 flex items-center justify-center text-[10px] font-bold text-blue-600">3</div>
+        <p class="font-semibold text-sm mb-1">三路并行召回</p>
+        <div class="space-y-1 text-xs text-gray-500">
+          <p>&middot; content 向量 ANN &rarr; 80 题 (侧重题目描述相似的字符串/滑动窗口题)</p>
+          <p>&middot; solution 向量 ANN &rarr; 80 题 (侧重用滑动窗口+哈希表解的题)</p>
+          <p>&middot; 关键词全文搜索 &rarr; 50 题 (精确匹配 "sliding window" "hash" 等标签)</p>
+        </div>
+        <p class="text-[11px] text-gray-400 mt-1">三条通路并行，各自 3 秒超时，互不影响。</p>
+      </div>
+
+      <div class="relative pl-10 pb-7 border-l-2 border-gray-200 dark:border-gray-700 ml-1">
+        <div class="absolute -left-[13px] top-0 w-6 h-6 rounded-full bg-blue-100 dark:bg-blue-900/30 border-2 border-blue-500 flex items-center justify-center text-[10px] font-bold text-blue-600">4</div>
+        <p class="font-semibold text-sm mb-1">去重合并 + Min-Max 归一化 + 加权排序</p>
+        <p class="text-xs text-gray-500 leading-relaxed">
+          225 条候选去重后约 160 条 &rarr; 每条计算
+          <code class="bg-gray-100 dark:bg-gray-800 px-1 rounded text-[11px]">roughScore = 0.20&times;s_c + 0.55&times;s_s + 0.25&times;s_k</code>
+          &rarr; 按 roughScore 降序取 Top-50 送入重排序
+        </p>
+      </div>
+
+      <div class="relative pl-10 ml-1">
+        <div class="absolute -left-[13px] top-0 w-6 h-6 rounded-full bg-blue-100 dark:bg-blue-900/30 border-2 border-blue-500 flex items-center justify-center text-[10px] font-bold text-blue-600">5</div>
+        <p class="font-semibold text-sm mb-1">Qwen3-Reranker-0.6B 重排序 Top-20</p>
+        <p class="text-xs text-gray-500 leading-relaxed">精细评估每道题与查询的语义相关性 &rarr; 重新排序 &rarr; 返回 Top-10 给用户</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- 最终结果 -->
+  <div class="bg-emerald-50 dark:bg-emerald-950/20 border border-emerald-200 dark:border-emerald-900/30 rounded-2xl p-6">
+    <p class="text-sm font-semibold text-accent dark:text-accent-light mb-4">最终返回给用户的结果</p>
+    <div class="space-y-2">
+      <div class="flex items-center gap-4 bg-white dark:bg-[#141414] rounded-lg p-3 border border-gray-100 dark:border-gray-800 text-sm">
+        <span class="step-badge bg-emerald-100 dark:bg-emerald-900/30 text-accent text-xs">1</span>
+        <span class="font-medium min-w-0 truncate">LeetCode 3 - Longest Substring Without Repeating Characters</span>
+        <span class="text-xs text-gray-500 flex-shrink-0 font-mono">0.94</span>
+      </div>
+      <div class="flex items-center gap-4 bg-white dark:bg-[#141414] rounded-lg p-3 border border-gray-100 dark:border-gray-800 text-sm">
+        <span class="step-badge bg-gray-100 dark:bg-gray-800 text-gray-500 text-xs">2</span>
+        <span class="font-medium min-w-0 truncate">LeetCode 76 - Minimum Window Substring</span>
+        <span class="text-xs text-gray-500 flex-shrink-0 font-mono">0.91</span>
+      </div>
+      <div class="flex items-center gap-4 bg-white dark:bg-[#141414] rounded-lg p-3 border border-gray-100 dark:border-gray-800 text-sm">
+        <span class="step-badge bg-gray-100 dark:bg-gray-800 text-gray-500 text-xs">3</span>
+        <span class="font-medium min-w-0 truncate">LeetCode 438 - Find All Anagrams in a String</span>
+        <span class="text-xs text-gray-500 flex-shrink-0 font-mono">0.88</span>
+      </div>
+      <div class="flex items-center gap-4 bg-white dark:bg-[#141414] rounded-lg p-3 border border-gray-100 dark:border-gray-800 text-sm opacity-60">
+        <span class="step-badge bg-gray-100 dark:bg-gray-800 text-gray-500 text-xs">4-10</span>
+        <span class="font-medium text-gray-500">... 更多结果 (CF 279B, AtCoder abc032_c, ...)</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== 六、关键概念 ===== -->
+<section class="max-w-5xl mx-auto px-6 py-20 border-t border-gray-200 dark:border-gray-800">
+  <h2 class="text-2xl font-bold tracking-tight mb-8">六、RAG 初学者的几个关键概念</h2>
+
+  <div class="space-y-8">
+    <div class="grid sm:grid-cols-2 gap-5">
+      <div class="bg-white dark:bg-[#141414] border border-gray-200 dark:border-gray-800 rounded-xl p-5">
+        <p class="font-semibold text-sm mb-2">多向量表示 (Multi-Vector)</p>
+        <p class="text-xs text-gray-500 dark:text-gray-400 leading-relaxed">
+          为什么不为整道题生成一个向量？因为题目描述（"给你一个数组..."）和解题思路（"用哈希表 O(n)"）的语言风格完全不同，在向量空间中偏向不同方向。分开嵌入可以在不同维度上匹配用户意图——用户搜索"哈希表"时 solution 向量通路权重更高，搜索"数组处理"时 content 向量通路权重更高。
+        </p>
+      </div>
+      <div class="bg-white dark:bg-[#141414] border border-gray-200 dark:border-gray-800 rounded-xl p-5">
+        <p class="font-semibold text-sm mb-2">混合检索 (Hybrid Search)</p>
+        <p class="text-xs text-gray-500 dark:text-gray-400 leading-relaxed">
+          纯向量检索对"01背包"这类精确术语不敏感——它会把所有含"0""1""背包"的向量都拉近，但不如直接全文搜索精确。纯关键词搜索对"寻找数组中两个数的和"这种自然语言描述完全无效。两者互补，取各自优势。
+        </p>
+      </div>
+    </div>
+
+    <div class="grid sm:grid-cols-2 gap-5">
+      <div class="bg-white dark:bg-[#141414] border border-gray-200 dark:border-gray-800 rounded-xl p-5">
+        <p class="font-semibold text-sm mb-2">两阶段检索 (Two-Stage Retrieval)</p>
+        <p class="text-xs text-gray-500 dark:text-gray-400 leading-relaxed">
+          向量检索速度快（ANN 索引，毫秒级）但粗糙（只看向量方向）。重排序慢但精细（逐字理解语义，百毫秒级）。先用向量快速从万级候选中筛出 Top-N，再用重排序精排——这种"粗筛+精排"是 RAG 系统的经典架构。
+        </p>
+      </div>
+      <div class="bg-white dark:bg-[#141414] border border-gray-200 dark:border-gray-800 rounded-xl p-5">
+        <p class="font-semibold text-sm mb-2">指令感知嵌入</p>
+        <p class="text-xs text-gray-500 dark:text-gray-400 leading-relaxed">
+          同一段文本 "两数之和用哈希表解决"，在"作为题目存储"和"作为用户查询"时嵌入结果不同——因为任务目标不同。在文本前加指令前缀，告诉嵌入模型这段话在系统中的角色，可以显著提高检索精度。这是近两年嵌入模型的标配功能。
+        </p>
+      </div>
+    </div>
+
+    <div class="bg-white dark:bg-[#141414] border border-gray-200 dark:border-gray-800 rounded-xl p-6">
+      <p class="font-semibold text-sm mb-3">本系统使用的全部模型一览</p>
+      <div class="overflow-x-auto">
+        <table class="w-full text-xs">
+          <thead>
+            <tr class="text-gray-500 text-left border-b border-gray-200 dark:border-gray-700">
+              <th class="pb-2 pr-4 font-medium">模型</th>
+              <th class="pb-2 pr-4 font-medium">做什么</th>
+              <th class="pb-2 pr-4 font-medium">阶段</th>
+              <th class="pb-2 pr-4 font-medium">运行位置</th>
+              <th class="pb-2 font-medium">典型延迟</th>
+            </tr>
+          </thead>
+          <tbody class="font-mono">
+            <tr class="border-b border-gray-100 dark:border-gray-800">
+              <td class="py-2.5 pr-4 text-gray-800 dark:text-gray-200">DeepSeek API</td>
+              <td class="py-2.5 pr-4 text-gray-500 text-xs">题目摘要生成 (solution_summary + retrieval_summary)</td>
+              <td class="py-2.5 pr-4"><span class="text-[11px] px-2 py-0.5 bg-emerald-100 dark:bg-emerald-900/30 text-accent rounded-full">离线录入</span></td>
+              <td class="py-2.5 pr-4 text-gray-500 text-xs">阿里云百炼</td>
+              <td class="py-2.5 text-gray-500 text-xs">2-5秒/题</td>
+            </tr>
+            <tr class="border-b border-gray-100 dark:border-gray-800">
+              <td class="py-2.5 pr-4 text-gray-800 dark:text-gray-200">Qwen3-Embedding-0.6B (1024维)</td>
+              <td class="py-2.5 pr-4 text-gray-500 text-xs">Python管道文本转向量 + 后端查询/存储向量嵌入</td>
+              <td class="py-2.5 pr-4"><span class="text-[11px] px-2 py-0.5 bg-emerald-100 dark:bg-emerald-900/30 text-accent rounded-full">离线录入</span> <span class="text-[11px] px-2 py-0.5 bg-blue-100 dark:bg-blue-900/30 text-blue-600 rounded-full">在线查询</span></td>
+              <td class="py-2.5 pr-4 text-gray-500 text-xs">llama.cpp 本地服务</td>
+              <td class="py-2.5 text-gray-500 text-xs">~30-50ms/条</td>
+            </tr>
+            <tr>
+              <td class="py-2.5 pr-4 text-gray-800 dark:text-gray-200">Qwen3-Reranker-0.6B</td>
+              <td class="py-2.5 pr-4 text-gray-500 text-xs">候选精排序（逐对评估相关性）</td>
+              <td class="py-2.5 pr-4"><span class="text-[11px] px-2 py-0.5 bg-blue-100 dark:bg-blue-900/30 text-blue-600 rounded-full">在线查询</span></td>
+              <td class="py-2.5 pr-4 text-gray-500 text-xs">llama.cpp 本地服务</td>
+              <td class="py-2.5 text-gray-500 text-xs">~200ms/批</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== 七、RAG 与训练 Agent ===== -->
+<section class="max-w-5xl mx-auto px-6 py-20 border-t border-gray-200 dark:border-gray-800">
+  <h2 class="text-2xl font-bold tracking-tight mb-8">七、RAG 如何服务于训练 Agent</h2>
+
+  <div class="grid md:grid-cols-3 gap-6">
+    <div class="md:col-span-2 space-y-4 text-sm text-gray-500 dark:text-gray-400 leading-relaxed">
+      <p>
+        RAG 系统不仅是前端搜索框的后台，更是 <strong>训练 Agent (TrainingAgent)</strong> 的核心基础设施。这是一个基于 LangGraph 的智能体，为每个用户自动生成个性化周训练计划。
+      </p>
+      <p>
+        Agent 工作流: <span class="font-mono text-xs">加载用户画像 &rarr; 确定训练阶段 &rarr; 选择目标算法 &rarr; 计算难度曲线 &rarr; <strong class="text-accent dark:text-accent-light">调用向量搜索获取候选题目</strong> &rarr; LLM 编排计划 &rarr; 保存</span>
+      </p>
+      <p>
+        在 "调用向量搜索" 这一步，Agent 不只是用相似度排序，而是使用<strong>五维评分函数</strong>综合评估每道候选题目对当前用户的适合程度：
+      </p>
+      <p class="text-xs text-gray-400">
+        代码位置: <code class="bg-gray-100 dark:bg-gray-800 px-1 rounded text-[11px]">python/agents/training_agent.py</code>
+      </p>
+    </div>
+    <div class="bg-white dark:bg-[#141414] border border-gray-200 dark:border-gray-800 rounded-xl p-5">
+      <p class="text-xs font-semibold text-gray-500 mb-3">五维评分函数</p>
+      <div class="space-y-2.5 text-xs">
+        <div>
+          <div class="flex justify-between items-center mb-1"><span class="text-gray-700 dark:text-gray-300">标签匹配</span><span class="font-mono font-semibold text-accent">0.30</span></div>
+          <div class="w-full bg-gray-100 dark:bg-gray-800 rounded-full h-1.5"><div class="bg-accent h-1.5 rounded-full" style="width:30%"></div></div>
+        </div>
+        <div>
+          <div class="flex justify-between items-center mb-1"><span class="text-gray-700 dark:text-gray-300">难度匹配</span><span class="font-mono font-semibold text-accent">0.25</span></div>
+          <div class="w-full bg-gray-100 dark:bg-gray-800 rounded-full h-1.5"><div class="bg-accent h-1.5 rounded-full" style="width:25%"></div></div>
+        </div>
+        <div>
+          <div class="flex justify-between items-center mb-1"><span class="text-gray-700 dark:text-gray-300">向量相似度</span><span class="font-mono font-semibold text-gray-600">0.15</span></div>
+          <div class="w-full bg-gray-100 dark:bg-gray-800 rounded-full h-1.5"><div class="bg-gray-400 h-1.5 rounded-full" style="width:15%"></div></div>
+        </div>
+        <div>
+          <div class="flex justify-between items-center mb-1"><span class="text-gray-700 dark:text-gray-300">新颖度</span><span class="font-mono font-semibold text-gray-600">0.15</span></div>
+          <div class="w-full bg-gray-100 dark:bg-gray-800 rounded-full h-1.5"><div class="bg-gray-400 h-1.5 rounded-full" style="width:15%"></div></div>
+        </div>
+        <div>
+          <div class="flex justify-between items-center mb-1"><span class="text-gray-700 dark:text-gray-300">依赖满足度</span><span class="font-mono font-semibold text-gray-600">0.15</span></div>
+          <div class="w-full bg-gray-100 dark:bg-gray-800 rounded-full h-1.5"><div class="bg-gray-400 h-1.5 rounded-full" style="width:15%"></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== 页脚 ===== -->
+<footer class="max-w-5xl mx-auto px-6 py-16 border-t border-gray-200 dark:border-gray-800 text-center">
+  <p class="text-xs text-gray-500">
+    ACM-Agent RAG System · PostgreSQL pgvector + Qwen3-Embedding + Qwen3-Reranker + DeepSeek
+  </p>
+  <p class="text-[10px] text-gray-400 mt-1">
+    向量维度 1024 · HNSW 索引 (m=16, ef_construction=64) · 余弦相似度 · 指令感知嵌入
+  </p>
+</footer>
+
+</body>
+</html>
