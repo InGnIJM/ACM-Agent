@@ -682,17 +682,32 @@ export class CrawlerController {
     child.on('exit', async (code) => {
       try {
         if (code === 0) {
+          // Read summary from Python's state file BEFORE marking completed,
+          // so the frontend sees total_problems on its very first poll.
+          let stateSummary: Record<string, any> | null = null;
+          const stateFilePath = path.resolve(this.dataDir, platform, '_crawl_state.json');
+          try {
+            if (fs.existsSync(stateFilePath)) {
+              const stateData = JSON.parse(fs.readFileSync(stateFilePath, 'utf-8'));
+              stateSummary = stateData.summary || null;
+            }
+          } catch (readErr: any) {
+            this.logger.warn(`Failed to read state file summary: ${readErr?.message || readErr}`);
+          }
+
+          const mergedSummary = { ...(job.summary as Record<string, any> || {}), ...(stateSummary || {}) };
           await this.prisma.crawlJob.update({
             where: { id: job.id },
-            data: { status: 'completed', phase: null, finishedAt: new Date() },
+            data: { status: 'completed', phase: null, finishedAt: new Date(), summary: mergedSummary },
           });
-          this.logger.log(`Bulk crawl completed: jobId=${job.id}`);
+          this.logger.log(`Bulk crawl completed: jobId=${job.id}, summary=${JSON.stringify(mergedSummary)}`);
           // Auto-import after completion
           try {
             const imported = await this.importPlatformData(platform);
+            // Merge imported count into existing summary (preserve total_problems etc.)
             await this.prisma.crawlJob.update({
               where: { id: job.id },
-              data: { summary: { imported: imported.total } },
+              data: { summary: { ...mergedSummary, imported: imported.total } },
             });
             this.logger.log(`Auto-import done for bulk crawl ${job.id}: ${imported.total} records (${imported.problems} problems, ${imported.solutions} solutions, ${imported.records} records)`);
             // Fire-and-forget: auto-summarize newly imported problems
@@ -1166,9 +1181,12 @@ export class CrawlerController {
       return { embedded: 0, skipped: 0 };
     }
 
-    // Build WHERE clause — if sourceIds provided, only target those specific problems
+    // Build WHERE clause — if sourceIds provided, only target those specific problems.
+    // When sourceIds is empty (e.g. solutions imported without new problem files),
+    // skip the sourceId filter so summarization covers all unprocessed problems.
     const whereBase: any = { sourcePlatform: platform as any };
-    if (sourceIds && sourceIds.length > 0) {
+    const hasSourceIds = sourceIds && sourceIds.length > 0;
+    if (hasSourceIds) {
       whereBase.sourceId = { in: sourceIds };
     }
 

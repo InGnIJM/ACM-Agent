@@ -138,7 +138,8 @@ Return a Chinese summary with these sections (2-3 sentences each):
       model: DEEPSEEK_MODEL,
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.3,
-      max_tokens: 16384,
+      max_tokens: 4096,
+      thinking: { type: 'disabled' },
     }),
   });
 
