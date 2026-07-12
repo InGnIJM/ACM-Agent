@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from crawlers.atcoder import AtCoderCrawler
 from crawlers.base import BaseCrawler, CrawlResult, CrawlerExecutor, RateLimiter
 from crawlers.codeforces import CodeforcesCrawler
 from crawlers.leetcode import LeetCodeCrawler, _PROBLEMSET_QUERY as _LC_PROBLEMSET_QUERY
@@ -55,6 +56,7 @@ PLATFORM_CRAWLERS: Dict[str, type] = {
     "luogu": LuoguCrawler,
     "leetcode": LeetCodeCrawler,
     "codeforces": CodeforcesCrawler,
+    "atcoder": AtCoderCrawler,
     "nowcoder": NowCoderCrawler,
 }
 
@@ -62,6 +64,7 @@ PLATFORM_QPS: Dict[str, float] = {
     "luogu": 2.0,
     "leetcode": 2.0,
     "codeforces": 3.0,
+    "atcoder": 3.0,
     "nowcoder": 1.0,
 }
 
@@ -229,13 +232,12 @@ class BulkCrawler:
         _write_state(self.state_dir, state)
 
         all_problems: List[Dict[str, Any]] = []
-        # Account for skip_ids: need extra pages to compensate
-        effective_count = count + len(skip_ids)
-        max_pages = (effective_count // 20) + 3
         page_start_time = time.monotonic()
         total_page_ms = 0.0
+        page = 0
 
-        for page in range(1, max_pages + 1):
+        while True:
+            page += 1
             if self._shutdown_requested:
                 state["status"] = "cancelled"
                 _write_state(self.state_dir, state)
@@ -269,10 +271,16 @@ class BulkCrawler:
 
             # Filter out already-imported problems
             # pid may be truncated in DB (VARCHAR(50)), check both full and [:50]
+            prev_count = len(all_problems)
             for p in problems:
                 pid = p.get("pid", "")
                 if pid not in skip_ids and pid[:50] not in skip_ids:
                     all_problems.append(p)
+            new_on_page = len(all_problems) - prev_count
+            logger.info(
+                "List page %d: %d problems, %d new (total new: %d/%d)",
+                page, len(problems), new_on_page, len(all_problems), count,
+            )
 
             # Track page timing
             page_ms = (time.monotonic() - page_start_time) * 1000
@@ -325,6 +333,8 @@ class BulkCrawler:
             return self._fetch_list_page_leetcode(tag, page)
         if self.platform == "codeforces":
             return self._fetch_list_page_codeforces(tag, page)
+        if self.platform == "atcoder":
+            return self._fetch_list_page_atcoder(tag, page)
         if self.platform == "nowcoder":
             return self._fetch_list_page_nowcoder(tag, page)
         return CrawlResult(
@@ -375,19 +385,34 @@ class BulkCrawler:
 
         result = self.crawler._graphql(_LC_PROBLEMSET_QUERY, variables=variables)
         if not result.success:
+            logger.warning("[LC list] page %d API FAILED: %s", page, result.error)
             return result
         data = result.data
         if not isinstance(data, dict):
+            logger.warning("[LC list] page %d unexpected data type: %s", page, type(data))
             return CrawlResult(
                 success=False, error="Unexpected LeetCode GraphQL response",
                 source="http",
             )
-        pql = data.get("problemsetQuestionList", {})
+        pql = data.get("problemsetQuestionList")
+        if pql is None:
+            logger.warning("[LC list] page %d problemsetQuestionList is None. Raw data keys: %s", page, list(data.keys()))
+            return CrawlResult(
+                success=True, data={"problems": []}, source="http",
+                retry_count=result.retry_count,
+            )
         questions = pql.get("questions", []) if isinstance(pql, dict) else []
+        total_in_api = pql.get("total", "?") if isinstance(pql, dict) else "?"
+        logger.info("[LC list] page %d: skip=%d, API returned %d questions (total_in_api=%s), paidOnly=%d",
+                    page, variables["skip"], len(questions), total_in_api,
+                    sum(1 for q in questions if q.get("paidOnly", False)))
 
         # Normalize: use titleSlug as pid (the source_id for detail/solutions)
+        # Skip paid-only problems (Premium) — they have no usable content
         normalized: List[Dict[str, Any]] = []
         for q in questions:
+            if q.get("paidOnly", False):
+                continue
             normalized.append({
                 "pid": q.get("titleSlug", ""),
                 "frontendQuestionId": q.get("frontendQuestionId", ""),
@@ -395,7 +420,6 @@ class BulkCrawler:
                 "titleSlug": q.get("titleSlug", ""),
                 "difficulty": q.get("difficulty", ""),
                 "acRate": q.get("acRate", 0),
-                "paidOnly": q.get("paidOnly", False),
                 "topicTags": q.get("topicTags", []),
                 "status": q.get("status"),
             })
@@ -443,6 +467,36 @@ class BulkCrawler:
             retry_count=result.retry_count,
         )
 
+    # ── _fetch_list_page_AtCoder ──────────────────────────────────
+
+    def _fetch_list_page_atcoder(
+        self, tag: Optional[str], page: int
+    ) -> CrawlResult:
+        # AtCoder's fetch_problems_by_tag returns all matching problems
+        # at once from the kenkoooo API (no pagination).  Only fetch on
+        # page 1; subsequent pages return empty.
+        if page > 1:
+            return CrawlResult(
+                success=True, data={"problems": []}, source="http",
+            )
+        result = self.crawler.fetch_problems_by_tag(
+            tag or "", count=10000,
+        )
+        if not result.success:
+            return result
+        problems = result.data if isinstance(result.data, list) else []
+        # Normalize: ensure pid field exists
+        normalized: List[Dict[str, Any]] = []
+        for p in problems:
+            pid = p.get("id") or p.get("pid") or ""
+            normalized.append({**p, "pid": str(pid)})
+        return CrawlResult(
+            success=True,
+            data={"problems": normalized},
+            source=result.source,
+            retry_count=result.retry_count,
+        )
+
     # ── _fetch_list_page_NowCoder ──────────────────────────────────
 
     def _fetch_list_page_nowcoder(
@@ -474,19 +528,30 @@ class BulkCrawler:
         state: Dict[str, Any],
         problems: List[Dict[str, Any]],
         skip_existing: bool,
+        target_count: Optional[int] = None,
+        tag: Optional[str] = None,
+        skip_ids: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """Fetch full detail for each problem, merge with existing metadata."""
+        """Fetch full detail for each problem, merge with existing metadata.
+
+        Keeps trying until ``target_count`` problems are successfully
+        enriched.  If the initial ``problems`` list is exhausted before
+        reaching the target, more problems are fetched from the list
+        phase on the fly.
+        """
         phase = "detail"
         state["phase"] = phase
         state["phases"][phase]["status"] = "running"
         state["phases"][phase]["started_at"] = _now_iso()
-        state["phases"][phase]["total"] = len(problems)
+        state["phases"][phase]["total"] = target_count or len(problems)
         _write_state(self.state_dir, state)
 
         enriched: List[Dict[str, Any]] = []
         batch_start_time = time.monotonic()
         total_ms = 0.0
         fetched = 0
+        # Track all pids we've already tried (to avoid re-fetching)
+        tried_pids: Set[str] = set()
 
         # Build set of already-fetched pids for resume
         already_fetched: Set[str] = set()
@@ -494,22 +559,70 @@ class BulkCrawler:
             problems_dir = self.data_dir / self.platform / "problems"
             if problems_dir.exists():
                 for f in problems_dir.glob("*.json"):
-                    if f.name.startswith("bulk_list"):
+                    stem = f.stem
+                    # bulk_list / bulk_detail_full / bulk_detail_progress
+                    if stem.startswith("bulk_list"):
                         continue
-                    already_fetched.add(f.stem.split("_")[-1] if "_" in f.stem else f.stem)
+                    if stem.startswith("bulk_detail_full_"):
+                        continue  # date-stamped aggregate file, not per-problem
+                    if stem.startswith("bulk_detail_progress_"):
+                        # Extract pid: "bulk_detail_progress_arc223_f" → "arc223_f"
+                        pid = stem[len("bulk_detail_progress_"):]
+                        if pid:
+                            already_fetched.add(pid)
+                    else:
+                        already_fetched.add(stem)
 
-        for i, prob in enumerate(problems):
+        # Iterator over the problems list; replenished when exhausted
+        prob_iter = iter(problems)
+        consecutive_failures = 0
+        MAX_CONSECUTIVE_FAILURES = 50  # stop if too many in a row
+
+        while True:
+            # Check if we've reached the target
+            if target_count and len(enriched) >= target_count:
+                logger.info(
+                    "Detail phase reached target: %d/%d enriched",
+                    len(enriched), target_count,
+                )
+                break
+
+            # Check shutdown
             if self._shutdown_requested:
                 state["status"] = "cancelled"
                 _write_state(self.state_dir, state)
-                logger.info("Detail phase cancelled at %d/%d", i, len(problems))
+                logger.info("Detail phase cancelled (%d enriched)", len(enriched))
                 return enriched
+
+            # Get next problem from iterator
+            try:
+                prob = next(prob_iter)
+            except StopIteration:
+                # List exhausted — try to fetch more problems on the fly
+                if target_count and len(enriched) < target_count:
+                    logger.info(
+                        "List exhausted (%d enriched/%d target), fetching more...",
+                        len(enriched), target_count,
+                    )
+                    more = self._fetch_more_problems(
+                        tag or "", tried_pids,
+                        skip_ids or set(),
+                        batch_size=target_count * 3,
+                    )
+                    if not more:
+                        logger.warning("No more problems available, stopping")
+                        break
+                    prob_iter = iter(more)
+                    continue
+                break
 
             pid = prob.get("pid", "")
             if not pid:
                 state["phases"][phase]["errors"] += 1
                 enriched.append(prob)
                 continue
+
+            tried_pids.add(pid)
 
             # Resume: skip if already fetched
             if pid in already_fetched:
@@ -527,13 +640,19 @@ class BulkCrawler:
 
             if detail_result and detail_result.success and detail_result.data:
                 merged = dict(detail_result.data)
+                # Preserve pid from list phase (detail data may not have it)
+                if "pid" not in merged:
+                    merged["pid"] = pid
                 # Merge list-level stats if missing in detail
                 for k in ("totalSubmit", "totalAccepted", "total_submit", "total_ac"):
                     if merged.get(k) is None:
                         merged[k] = prob.get(k)
                 enriched.append(merged)
+                consecutive_failures = 0
             else:
-                enriched.append(prob)
+                # Skip this problem - don't add to enriched list
+                # This prevents Japanese-only problems from being included
+                logger.info("Skipping %s: %s", pid, detail_result.error if detail_result else "no result after 3 retries")
                 state["phases"][phase]["errors"] += 1
                 err_record = {
                     "phase": phase,
@@ -543,6 +662,13 @@ class BulkCrawler:
                 }
                 state["errors"].append(err_record)
                 self._append_failed_item(err_record)
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    logger.warning(
+                        "Too many consecutive failures (%d), stopping",
+                        consecutive_failures,
+                    )
+                    break
 
             fetched += 1
             state["phases"][phase]["fetched"] = fetched
@@ -595,6 +721,30 @@ class BulkCrawler:
 
         logger.info("Detail phase complete: %d enriched", len(enriched))
         return enriched
+
+    def _fetch_more_problems(
+        self,
+        tag: str,
+        tried_pids: Set[str],
+        skip_ids: Set[str],
+        batch_size: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """Fetch more problems from the list phase, excluding already-tried IDs."""
+        exclude = tried_pids | skip_ids
+        result = self.crawler.fetch_problems_by_tag(tag, count=batch_size + len(exclude))
+        if not result.success or not result.data:
+            return []
+        problems = result.data if isinstance(result.data, list) else []
+        # Normalize and filter
+        fresh: List[Dict[str, Any]] = []
+        for p in problems:
+            pid = str(p.get("id") or p.get("pid") or "")
+            if pid and pid not in exclude:
+                fresh.append({**p, "pid": pid})
+            if len(fresh) >= batch_size:
+                break
+        logger.info("Fetched %d additional problems (tried=%d, skip=%d)", len(fresh), len(tried_pids), len(skip_ids))
+        return fresh
 
     # ── Phase 3: SOLUTIONS ─────────────────────────────────────
 
@@ -796,6 +946,22 @@ class BulkCrawler:
             logger.warning("No problems to process")
             state["status"] = "completed"
             state["updated_at"] = _now_iso()
+            state["summary"] = {
+                "total_problems": 0,
+                "total_solutions_fetched": 0,
+                "total_errors": sum(
+                    p.get("errors", 0) for p in state.get("phases", {}).values()
+                ),
+                "duration_seconds": None,
+            }
+            if state.get("started_at"):
+                try:
+                    started = datetime.fromisoformat(state["started_at"])
+                    state["summary"]["duration_seconds"] = (
+                        datetime.now(timezone.utc) - started
+                    ).total_seconds()
+                except (ValueError, TypeError):
+                    pass
             _write_state(self.state_dir, state)
             return state
 
@@ -805,7 +971,10 @@ class BulkCrawler:
             if detail_status == "completed":
                 logger.info("Detail phase already completed, skipping")
             else:
-                problems = self.run_detail_phase(state, problems, skip_existing)
+                problems = self.run_detail_phase(
+                    state, problems, skip_existing,
+                    target_count=count, tag=tag, skip_ids=skip_id_set,
+                )
                 if self._shutdown_requested:
                     return state
 

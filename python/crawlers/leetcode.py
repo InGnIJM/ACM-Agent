@@ -472,9 +472,12 @@ class LeetCodeCrawler(BaseCrawler):
         pql = data.get("problemsetQuestionList", {})
         questions = pql.get("questions", []) if isinstance(pql, dict) else []
 
+        # Filter out paid-only problems (Premium) — they have no usable content
+        free_questions = [q for q in questions if not q.get("paidOnly", False)]
+
         return CrawlResult(
             success=True,
-            data=questions[:count],
+            data=free_questions[:count],
             source="http",
             retry_count=result.retry_count,
         )
