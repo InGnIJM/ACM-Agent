@@ -2,6 +2,7 @@ import { Injectable, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { VectorService, SearchHit } from '../common/vector/vector.service';
 import { QueryAnalysisService } from '../common/query-analysis/query-analysis.service';
+import { QueryExpansionService, ExpandedQuery } from '../common/query-analysis/query-expansion.service';
 import { RerankService, RerankCandidate } from '../common/rerank/rerank.service';
 
 @Injectable()
@@ -10,6 +11,7 @@ export class ProblemService {
     private readonly prisma: PrismaService,
     private readonly vectorService: VectorService,
     private readonly queryAnalysis: QueryAnalysisService,
+    private readonly queryExpansion: QueryExpansionService,
     private readonly rerankService: RerankService,
   ) {}
 
@@ -92,7 +94,7 @@ export class ProblemService {
       throw new BadRequestException('查询内容过短，至少输入 2 个字符');
     }
 
-    // 1. Query analysis
+    // 1. Dictionary-based analysis
     let analysis;
     try {
       analysis = this.queryAnalysis.analyze(query);
@@ -100,8 +102,26 @@ export class ProblemService {
       throw new BadRequestException(err.message);
     }
 
-    // 2. Generate query embedding
-    const queryVec = await this.vectorService.embedQuery(query);
+    // 2. LLM-based query expansion (agent)
+    let expansion: ExpandedQuery | null = null;
+    expansion = await this.queryExpansion.expand(query, analysis.algorithmTerms);
+
+    if (expansion) {
+      // Use agent expansion results
+      analysis.expandedQuery = expansion.expandedForEmbedding;
+      analysis.algorithmTerms = expansion.algorithmTerms;
+      analysis.keywords = expansion.keywords;
+    } else if (analysis.algorithmTerms.length === 0) {
+      // Fallback: simple LLM expansion (old behavior)
+      const llmExpanded = await this.expandQueryWithLLM(query);
+      if (llmExpanded) {
+        analysis.expandedQuery = `${query} ${llmExpanded}`;
+        analysis.keywords = [...analysis.keywords, ...llmExpanded.split(/\s+/).filter(k => k.length > 1)];
+      }
+    }
+
+    // 3. Generate query embedding (use expanded query for better recall)
+    const queryVec = await this.vectorService.embedQuery(analysis.expandedQuery);
 
     // 3. Three-path parallel recall (with individual 3s timeout)
     const [contentHits, solutionHits, keywordHits] = await Promise.allSettled([
@@ -227,6 +247,8 @@ export class ProblemService {
         expandedQuery: analysis.expandedQuery,
         algorithmTerms: analysis.algorithmTerms,
         weights: analysis.weights,
+        intent: expansion?.intent,
+        suggestedFilters: expansion?.suggestedFilters,
       },
       results,
       total: results.length,
@@ -340,6 +362,46 @@ export class ProblemService {
       data: { deletedAt: new Date() },
     });
     return { deleted: true, count: ids.length };
+  }
+
+  /**
+   * LLM-based query expansion for natural language queries.
+   * Returns space-separated algorithm/technique keywords, or null on failure.
+   */
+  private async expandQueryWithLLM(query: string): Promise<string | null> {
+    const apiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
+    if (!apiKey || apiKey === 'sk-placeholder') return null;
+
+    const baseUrl = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1';
+    const model = process.env.DEEPSEEK_MODEL || 'deepseek-v4-flash';
+
+    try {
+      const resp = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model,
+          messages: [{
+            role: 'user',
+            content: `你是一个算法竞赛搜索助手。用户输入了一个搜索词，请提取其中涉及的算法、数据结构、解题技巧的关键词（中英文皆可），用空格分隔返回。只返回关键词，不要解释。
+
+搜索词：${query}
+
+关键词：`,
+          }],
+          temperature: 0.1,
+          max_tokens: 100,
+          thinking: { type: 'disabled' },
+        }),
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!resp.ok) return null;
+      const data: any = await resp.json();
+      const text = data?.choices?.[0]?.message?.content?.trim();
+      return text || null;
+    } catch {
+      return null;
+    }
   }
 }
 
