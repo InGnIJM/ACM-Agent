@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 
 export interface RerankCandidate {
   problemId: string;
@@ -16,12 +16,40 @@ export interface RerankResult {
 }
 
 @Injectable()
-export class RerankService {
+export class RerankService implements OnModuleInit {
   private readonly logger = new Logger(RerankService.name);
   private readonly rerankUrl: string;
+  private readonly rerankHealthUrl: string;
+  private readonly rerankTimeoutMs: number;
+  private available = false;
 
   constructor() {
     this.rerankUrl = process.env.RERANK_URL || 'http://127.0.0.1:8088/v1/rerank';
+    this.rerankHealthUrl = this.rerankUrl.replace(/\/rerank$/, '/health');
+    this.rerankTimeoutMs = parseInt(process.env.RERANK_TIMEOUT_MS || '3000', 10);
+  }
+
+  async onModuleInit() {
+    await this.checkHealth();
+    // Periodic health check every 30s
+    setInterval(() => this.checkHealth(), 30_000);
+  }
+
+  private async checkHealth() {
+    try {
+      const resp = await fetch(this.rerankHealthUrl, { signal: AbortSignal.timeout(2000) });
+      if (resp.ok && !this.available) {
+        this.available = true;
+        this.logger.log('Rerank service connected');
+      } else if (!resp.ok) {
+        this.available = false;
+      }
+    } catch {
+      if (this.available) {
+        this.logger.warn('Rerank service disconnected — falling back to rough scores');
+      }
+      this.available = false;
+    }
   }
 
   async rerank(query: string, candidates: RerankCandidate[]): Promise<RerankResult[]> {
@@ -31,7 +59,7 @@ export class RerankService {
 
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 3000);
+      const timeout = setTimeout(() => controller.abort(), this.rerankTimeoutMs);
 
       const resp = await fetch(this.rerankUrl, {
         method: 'POST',
@@ -66,7 +94,7 @@ export class RerankService {
   private formatDocuments(_query: string, candidates: RerankCandidate[]): string[] {
     return candidates.map(c => {
       const summary = (c.retrievalSummary || c.solutionSummary || c.fullContent || '');
-      const truncated = summary.length > 120 ? summary.slice(0, 120) : summary;
+      const truncated = summary.length > 250 ? summary.slice(0, 250) : summary;
       const tags = (c.tagsNormalized || []).join(' ');
       return `${c.title} | ${truncated} | tags: ${tags}`;
     });
