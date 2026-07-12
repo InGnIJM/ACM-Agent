@@ -178,7 +178,7 @@ model UserDailyStat {
 model Problem {
   id                   String                             @id @default(uuid()) @db.Uuid
   sourcePlatform       Platform                           @map("source_platform")
-  sourceId             String                             @map("source_id") @db.VarChar(50)
+  sourceId             String                             @map("source_id") @db.VarChar(200)
   sourceUrl            String?                            @map("source_url") @db.VarChar(500)
   title                String                             @db.VarChar(300)
   difficultyRaw        String?                            @map("difficulty_raw") @db.VarChar(50)
