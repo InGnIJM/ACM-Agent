@@ -97,6 +97,11 @@ if %errorlevel% equ 0 (
 :skip_services
 
 echo.
+echo [5.5/6] Starting Rerank watchdog...
+start "RerankWatchdog" /MIN powershell -ExecutionPolicy Bypass -File "%~dp0ensure-rerank.ps1"
+echo   Rerank watchdog started.
+
+echo.
 echo [6/6] Starting NestJS server on port 3000...
 echo   API : http://localhost:3000
 echo   Docs: http://localhost:3000/api/docs
