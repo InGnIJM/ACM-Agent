@@ -69,6 +69,11 @@ _HTML_NO_CONSTRAINTS_H3 = """\
 
 def _mock_crawler() -> AtCoderCrawler:
     """Return an AtCoderCrawler with internal deps mocked."""
+    # Clear class-level kenkoooo caches to prevent cross-test leakage
+    AtCoderCrawler._contest_map = None
+    AtCoderCrawler._merged_problems = None
+    AtCoderCrawler._problem_models = None
+
     crawler = AtCoderCrawler.__new__(AtCoderCrawler)
     crawler.PLATFORM = "atcoder"
     crawler.BASE_URL = "https://atcoder.jp"
@@ -111,9 +116,13 @@ class TestFetchProblem:
             {"text": _HTML_TEMPLATE}
         )
 
-        # Mock kenkoooo merged-problems.json
+        # Mock kenkoooo HTTP calls
         crawler._http_request.side_effect = [
-            # 1st call: merged-problems.json
+            # 1st call: contest-problem.json
+            _crawl_ok([
+                {"problem_id": "abc400_a", "contest_id": "abc400"},
+            ]),
+            # 2nd call: merged-problems.json
             _crawl_ok([
                 {
                     "id": "abc400_a",
@@ -123,7 +132,7 @@ class TestFetchProblem:
                     "solver_count": 5000,
                 }
             ]),
-            # 2nd call: problem-models.json
+            # 3rd call: problem-models.json
             _crawl_ok({
                 "abc400_a": {"difficulty": 42, "is_experimental": False}
             }),
@@ -169,10 +178,15 @@ class TestFetchProblem:
     def test_unparseable_source_id(self) -> None:
         """Source ID that cannot be parsed returns error immediately."""
         crawler = _mock_crawler()
+        # Mock contest-problem.json (empty, so no mapping for "nocontest")
+        crawler._http_request.side_effect = [
+            _crawl_ok([]),  # contest-problem.json
+        ]
         # "nocontest" has no underscore, so _parse_problem_id returns ("", "nocontest")
+        # and _get_contest_id returns "" → error
         result = crawler.fetch_problem("nocontest")
         assert not result.success
-        assert "Cannot parse problem ID" in str(result.error)
+        assert "Cannot determine contest" in str(result.error)
 
     def test_kenkoooo_api_failure_does_not_break_fetch(self) -> None:
         """If merged-problems.json returns error, fetch_problem still succeeds."""
@@ -357,10 +371,197 @@ class TestFetchProblem:
         # No kenkoooo enrichment but base data is present
         assert result.data["source_id"] == "abc400_a"
 
+    # ── Japanese h3 heading detection ──────────────────────────
 
-# ──────────────────────────────────────────────
-# fetch_problems_by_tag
-# ──────────────────────────────────────────────
+    _HTML_JA_H3_NO_SPANS = """\
+<!DOCTYPE html>
+<html><head><title>H - Takosan Takusan</title></head><body>
+<div id="task-statement">
+<h3>問題文</h3><p>問題の内容...</p>
+<h3>制約</h3><ul><li>2 &le; N &le; 2&times;10^5</li></ul>
+<h3>入力</h3><p>入力形式...</p>
+<h3>出力</h3><p>出力形式...</p>
+<h3>入力例 1</h3><pre>4 4</pre>
+<h3>出力例 1</h3><pre>1 7</pre>
+</div></body></html>"""
+
+    _HTML_JA_ONLY_WITH_SPAN = """\
+<!DOCTYPE html>
+<html><head><title>H - Takosan Takusan</title></head><body>
+<div id="task-statement">
+<span class="lang">
+<span class="lang-ja">
+<h3>問題文</h3><p>問題の内容...</p>
+<h3>制約</h3><ul><li>2 &le; N &le; 2&times;10^5</li></ul>
+<h3>入力</h3><p>入力形式...</p>
+<h3>出力</h3><p>出力形式...</p>
+</span>
+</span>
+</div></body></html>"""
+
+    _HTML_BILINGUAL_VALID_EN = """\
+<!DOCTYPE html>
+<html><head><title>B - vs. DEGwer</title></head><body>
+<div id="task-statement">
+<span class="lang">
+<span class="lang-ja">
+<h3>問題文</h3><p>正整数 X, M が与えられます．</p>
+<h3>制約</h3><ul><li>1 &le; T &le; 100</li></ul>
+<h3>入力</h3><p>入力形式...</p>
+<h3>出力</h3><p>出力形式...</p>
+</span>
+<span class="lang-en">
+<h3>Problem Statement</h3><p>You are given positive integers X, M.</p>
+<h3>Constraints</h3><ul><li>1 &le; T &le; 100</li></ul>
+<h3>Input</h3><p>Input format...</p>
+<h3>Output</h3><p>Output format...</p>
+<h3>Sample Input 1</h3><pre>3\n4 6</pre>
+<h3>Sample Output 1</h3><pre>1 2 5</pre>
+</span>
+</span>
+</div></body></html>"""
+
+    def test_old_style_japanese_h3_headings_cause_skip(self) -> None:
+        """Old-style page (no lang spans) with Japanese h3 headings
+        (問題文/制約/入力/出力) is skipped via content-level h3 check."""
+        crawler = _mock_crawler()
+        crawler.fetch_with_fallback.return_value = _crawl_ok(
+            {"text": self._HTML_JA_H3_NO_SPANS}
+        )
+        crawler._http_request.return_value = _crawl_fail("unused")
+
+        result = crawler.fetch_problem("oldcontest_a")
+        assert not result.success
+        assert "Japanese" in str(result.error)
+        assert "headings" in str(result.error)
+
+    def test_japanese_only_with_span_skipped_by_span_check(self) -> None:
+        """Page with lang-ja span but no lang-en span is skipped by the
+        existing span-based check (情况2), not the h3 check."""
+        crawler = _mock_crawler()
+        crawler.fetch_with_fallback.return_value = _crawl_ok(
+            {"text": self._HTML_JA_ONLY_WITH_SPAN}
+        )
+        crawler._http_request.return_value = _crawl_fail("unused")
+
+        result = crawler.fetch_problem("KeioPC2025_h")
+        assert not result.success
+        assert "Japanese" in str(result.error)
+        assert "no lang-en" in str(result.error)
+
+    def test_bilingual_page_with_valid_english_succeeds(self) -> None:
+        """Bilingual page (both lang-ja and lang-en) with valid English
+        content is NOT skipped — the h3 check must NOT scan hidden
+        lang-ja spans when a valid lang-en exists."""
+        crawler = _mock_crawler()
+        crawler.fetch_with_fallback.return_value = _crawl_ok(
+            {"text": self._HTML_BILINGUAL_VALID_EN}
+        )
+        crawler._http_request.side_effect = [
+            _crawl_ok([
+                {"id": "1202Contest_j", "contest_id": "DEGwer2023",
+                 "point": 100}
+            ]),
+            _crawl_ok({}),
+        ]
+
+        result = crawler.fetch_problem("1202Contest_j")
+        assert result.success, (
+            f"Bilingual page should succeed, got: {result.error}"
+        )
+        assert result.data["source_id"] == "1202Contest_j"
+
+    def test_english_page_without_japanese_h3_passes(self) -> None:
+        """Normal English page is NOT falsely flagged as Japanese
+        (regression guard)."""
+        crawler = _mock_crawler()
+        crawler.fetch_with_fallback.return_value = _crawl_ok(
+            {"text": _HTML_TEMPLATE}
+        )
+        crawler._http_request.side_effect = [
+            _crawl_ok([
+                {"id": "abc400_a", "contest_id": "abc400", "point": 100}
+            ]),
+            _crawl_ok({}),
+        ]
+
+        result = crawler.fetch_problem("abc400_a")
+        assert result.success
+        assert result.data["source_id"] == "abc400_a"
+
+    def test_cloudfront_block_page_detected_and_retried(self) -> None:
+        """HTTP returns a CloudFront ERROR block page → browser retry
+        succeeds with real content."""
+        crawler = _mock_crawler()
+
+        _BLOCK_HTML = (
+            "<html><head><title>ERROR: The request could not be satisfied"
+            "</title></head><body>"
+            "Generated by cloudfront (CloudFront)"
+            "</body></html>"
+        )
+
+        # HTTP returns the block page (sadly with 200 OK so
+        # fetch_with_fallback considers it success).
+        crawler.fetch_with_fallback.return_value = _crawl_ok(
+            {"text": _BLOCK_HTML}
+        )
+
+        # HTTP side (kenkoooo metadata) — unused in this path but needed.
+        crawler._http_request.side_effect = [
+            _crawl_ok([
+                {"id": "abc400_a", "contest_id": "abc400", "point": 100}
+            ]),
+            _crawl_ok({}),
+        ]
+
+        # Mock browser retry — returns real problem page.
+        crawler._browser_request = MagicMock(return_value=_crawl_ok(
+            {"text": _HTML_TEMPLATE, "url": "https://atcoder.jp/..."}
+        ))
+
+        result = crawler.fetch_problem("abc400_a")
+        assert result.success
+        data = result.data
+        assert isinstance(data, dict)
+        assert data["title"] != "ERROR: The request could not be satisfied"
+        assert "AtCoder Beginner Contest 400" in str(data["title"])
+        assert "Given an integer N" in str(data["description"])
+        assert len(data.get("samples", [])) == 1
+        # Browser fallback must have been called.
+        crawler._browser_request.assert_called_once()
+
+    def test_block_page_from_browser_is_fatal_error(self) -> None:
+        """Both HTTP and browser return block pages — the crawl must fail."""
+        crawler = _mock_crawler()
+
+        _BLOCK_HTML = (
+            "<html><head><title>ERROR: The request could not be satisfied"
+            "</title></head><body>"
+            "Generated by cloudfront (CloudFront)"
+            "</body></html>"
+        )
+
+        crawler.fetch_with_fallback.return_value = _crawl_ok(
+            {"text": _BLOCK_HTML}
+        )
+
+        crawler._http_request.side_effect = [
+            _crawl_ok([
+                {"id": "abc400_a", "contest_id": "abc400", "point": 100}
+            ]),
+            _crawl_ok({}),
+        ]
+
+        # Browser retry ALSO returns a block page.
+        crawler._browser_request = MagicMock(return_value=_crawl_ok(
+            {"text": _BLOCK_HTML, "url": "https://atcoder.jp/..."}
+        ))
+
+        result = crawler.fetch_problem("abc400_a")
+        assert not result.success
+        assert "Block page detected" in str(result.error)
+        assert result.source == "browser"
 
 
 class TestFetchProblemsByTag:
@@ -370,6 +571,12 @@ class TestFetchProblemsByTag:
         """Filters merged-problems by tag prefix and adds source_url."""
         crawler = _mock_crawler()
         crawler._http_request.side_effect = [
+            # contest-problem.json
+            _crawl_ok([
+                {"problem_id": "abc400_a", "contest_id": "abc400"},
+                {"problem_id": "abc400_b", "contest_id": "abc400"},
+                {"problem_id": "arc180_a", "contest_id": "arc180"},
+            ]),
             # merged-problems.json
             _crawl_ok([
                 {"id": "abc400_a", "contest_id": "abc400", "title": "A"},
@@ -385,8 +592,10 @@ class TestFetchProblemsByTag:
         data = result.data
         assert isinstance(data, list)
         assert len(data) == 2
-        assert data[0]["id"] == "abc400_a"
-        assert data[1]["id"] == "abc400_b"
+        # Order may vary due to English-first sorting; check both present
+        ids = [d["id"] for d in data]
+        assert "abc400_a" in ids
+        assert "abc400_b" in ids
         assert "source_url" in data[0]
 
     def test_respects_count_limit(self) -> None:
@@ -397,6 +606,7 @@ class TestFetchProblemsByTag:
             for i in range(20)
         ]
         crawler._http_request.side_effect = [
+            _crawl_ok([]),  # contest-problem.json
             _crawl_ok(problems),
             _crawl_ok({}),
         ]
@@ -409,6 +619,7 @@ class TestFetchProblemsByTag:
         """Difficulty from problem-models.json is merged into each problem."""
         crawler = _mock_crawler()
         crawler._http_request.side_effect = [
+            _crawl_ok([]),  # contest-problem.json
             _crawl_ok([
                 {"id": "abc400_a", "contest_id": "abc400", "title": "A"},
                 {"id": "abc400_b", "contest_id": "abc400", "title": "B"},
@@ -421,13 +632,16 @@ class TestFetchProblemsByTag:
 
         result = crawler.fetch_problems_by_tag("abc", count=10)
         assert result.success
-        assert result.data[0]["difficulty"] == 42
-        assert result.data[1]["difficulty"] == 87
+        # Check difficulty is present (order may vary)
+        diff_map = {d["id"]: d.get("difficulty") for d in result.data}
+        assert diff_map["abc400_a"] == 42
+        assert diff_map["abc400_b"] == 87
 
     def test_difficulty_missing_for_some_problems(self) -> None:
         """Problems not in problem-models.json simply lack difficulty field."""
         crawler = _mock_crawler()
         crawler._http_request.side_effect = [
+            _crawl_ok([]),  # contest-problem.json
             _crawl_ok([
                 {"id": "abc400_c", "contest_id": "abc400", "title": "C"},
             ]),
@@ -441,7 +655,10 @@ class TestFetchProblemsByTag:
     def test_merged_problems_not_a_list(self) -> None:
         """Returns error when merged-problems response is not a list."""
         crawler = _mock_crawler()
-        crawler._http_request.return_value = _crawl_ok({"not": "a list"})
+        crawler._http_request.side_effect = [
+            _crawl_ok([]),  # contest-problem.json
+            _crawl_ok({"not": "a list"}),  # merged-problems.json (invalid)
+        ]
 
         result = crawler.fetch_problems_by_tag("abc")
         assert not result.success
@@ -451,6 +668,7 @@ class TestFetchProblemsByTag:
         """If problem-models.json fails, matching is unaffected."""
         crawler = _mock_crawler()
         crawler._http_request.side_effect = [
+            _crawl_ok([]),  # contest-problem.json
             _crawl_ok([
                 {"id": "abc400_a", "contest_id": "abc400", "title": "A"},
             ]),
@@ -466,6 +684,7 @@ class TestFetchProblemsByTag:
         """If problem-models.json returns a list, no difficulty merged."""
         crawler = _mock_crawler()
         crawler._http_request.side_effect = [
+            _crawl_ok([]),  # contest-problem.json
             _crawl_ok([
                 {"id": "abc400_a", "contest_id": "abc400", "title": "A"},
             ]),
@@ -480,6 +699,7 @@ class TestFetchProblemsByTag:
         """Exception in problem-models fetch is swallowed."""
         crawler = _mock_crawler()
         crawler._http_request.side_effect = [
+            _crawl_ok([]),  # contest-problem.json
             _crawl_ok([
                 {"id": "abc400_a", "contest_id": "abc400", "title": "A"},
             ]),
@@ -494,6 +714,7 @@ class TestFetchProblemsByTag:
         """Returns empty list when no problems match the tag."""
         crawler = _mock_crawler()
         crawler._http_request.side_effect = [
+            _crawl_ok([]),  # contest-problem.json
             _crawl_ok([
                 {"id": "arc180_a", "contest_id": "arc180", "title": "C"},
             ]),
@@ -508,6 +729,7 @@ class TestFetchProblemsByTag:
         """source_url is auto-generated from contest_id and problem id."""
         crawler = _mock_crawler()
         crawler._http_request.side_effect = [
+            _crawl_ok([]),  # contest-problem.json
             _crawl_ok([
                 {
                     "id": "abc400_a",
@@ -529,6 +751,7 @@ class TestFetchProblemsByTag:
         """If source_url already exists, it is not overwritten."""
         crawler = _mock_crawler()
         crawler._http_request.side_effect = [
+            _crawl_ok([]),  # contest-problem.json
             _crawl_ok([
                 {
                     "id": "abc400_a",
@@ -926,3 +1149,185 @@ class TestNormalizeText:
         result = AtCoderCrawler._normalize_text(text)
         assert "\r" not in result
         assert result == "line1\nline2\nline3"
+
+
+# ──────────────────────────────────────────────
+# Integration tests — real AtCoder pages
+# ──────────────────────────────────────────────
+
+
+class TestRealPageIntegration:
+    """Integration tests that fetch real AtCoder problem pages to
+    verify the Japanese-detection logic end-to-end.  Kenkoooo API
+    calls are mocked; only the problem-page HTML comes from the
+    live site.
+
+    Run with:  pytest ... -k "TestRealPageIntegration"
+    Skip with: pytest ... -k "not TestRealPageIntegration"
+    """
+
+    _HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+    }
+    _TIMEOUT = 20
+
+    def test_keio_pc2025_f_japanese_only_skipped(self) -> None:
+        """KeioPC2025_f — has lang-ja but NO lang-en → Japanese-only
+        → fetch_problem MUST return success=False."""
+        import requests
+
+        url = "https://atcoder.jp/contests/KeioPC2025/tasks/KeioPC2025_f"
+        resp = requests.get(url, headers=self._HEADERS, timeout=self._TIMEOUT)
+        resp.raise_for_status()
+        resp.encoding = "utf-8"
+
+        crawler = _mock_crawler()
+        crawler.fetch_with_fallback.return_value = _crawl_ok(
+            {"text": resp.text}
+        )
+        crawler._http_request.return_value = _crawl_fail("unused")
+
+        result = crawler.fetch_problem("KeioPC2025_f")
+        assert not result.success, (
+            f"KeioPC2025_f is Japanese-only, must be skipped. "
+            f"Got success with data keys: {list(result.data) if result.data else 'None'}"
+        )
+        assert "Japanese" in str(result.error), (
+            f"Error should mention Japanese, got: {result.error}"
+        )
+
+    def test_degwer2023_j_bilingual_succeeds(self) -> None:
+        """DEGwer2023_j — has BOTH lang-ja and lang-en with valid
+        English content → fetch_problem MUST succeed and extract
+        English problem statement."""
+        import requests
+
+        url = "https://atcoder.jp/contests/DEGwer2023/tasks/1202Contest_j"
+        resp = requests.get(url, headers=self._HEADERS, timeout=self._TIMEOUT)
+        resp.raise_for_status()
+        resp.encoding = "utf-8"
+
+        crawler = _mock_crawler()
+        crawler.fetch_with_fallback.return_value = _crawl_ok(
+            {"text": resp.text}
+        )
+        crawler._http_request.return_value = _crawl_fail("unused")
+        # 1202Contest_j → DEGwer2023 via kenkoooo mapping
+        crawler._contest_map = {"1202Contest_j": "DEGwer2023"}
+
+        result = crawler.fetch_problem("1202Contest_j")
+        assert result.success, (
+            f"DEGwer2023_j has valid English, must succeed. "
+            f"Error: {result.error}"
+        )
+        data = result.data
+        assert isinstance(data, dict)
+        assert data["source_id"] == "1202Contest_j"
+        assert data["contest_id"] == "DEGwer2023"
+        assert data["index"] == "j"
+
+        # Description must contain real English content
+        desc = str(data.get("description", ""))
+        assert len(desc) > 50, (
+            f"Description too short ({len(desc)} chars): {desc[:200]!r}"
+        )
+        assert "positive integers" in desc, (
+            f"Expected English content in description, got: {desc[:300]!r}"
+        )
+
+    def test_japanese_problem_excluded_from_enrich_loop(self) -> None:
+        """Simulate main()'s enrich loop: when fetch_problem returns
+        failure for a Japanese-only problem, the problem must be
+        EXCLUDED from enriched (not kept as a bare stub from the
+        merged-problems list).
+
+        This is the downstream fix — fetch_problem correctly detects
+        Japanese, but main() was previously including the raw prob
+        record as a fallback, causing Japanese problems to leak into
+        the saved JSON / imported data.
+        """
+        import requests
+
+        # KeioPC2025_i — confirmed Japanese-only (lang-ja, no lang-en)
+        url = "https://atcoder.jp/contests/KeioPC2025/tasks/KeioPC2025_i"
+        resp = requests.get(url, headers=self._HEADERS, timeout=self._TIMEOUT)
+        resp.raise_for_status()
+        resp.encoding = "utf-8"
+
+        crawler = _mock_crawler()
+        crawler.fetch_with_fallback.return_value = _crawl_ok(
+            {"text": resp.text}
+        )
+        crawler._http_request.return_value = _crawl_fail("unused")
+
+        # Simulate main()'s enrich loop:
+        # CrawlResult.__bool__ returns success, so a failed result is
+        # falsy.  Must use `is not None` to distinguish "got a result"
+        # from "no result at all".
+        new_items = [
+            {"id": "KeioPC2025_i", "contest_id": "KeioPC2025",
+             "title": "I. Japanese Only"},
+        ]
+        enriched = []
+        for prob in new_items:
+            sid = prob.get("id", "")
+            detail = crawler.fetch_problem(str(sid))
+            if detail is not None:
+                if detail.success and detail.data:
+                    enriched.append(dict(detail.data))
+                else:
+                    # Japanese-only / broken page → skip entirely
+                    continue
+            else:
+                enriched.append(prob)
+
+        assert len(enriched) == 0, (
+            f"Japanese-only problem must be excluded from enriched. "
+            f"Got {len(enriched)} items: {enriched}"
+        )
+
+    def test_english_problem_included_in_enrich_loop(self) -> None:
+        """Counterpart: bilingual problem with valid English must be
+        included in the enrich loop (regression guard)."""
+        import requests
+
+        url = "https://atcoder.jp/contests/DEGwer2023/tasks/1202Contest_j"
+        resp = requests.get(url, headers=self._HEADERS, timeout=self._TIMEOUT)
+        resp.raise_for_status()
+        resp.encoding = "utf-8"
+
+        crawler = _mock_crawler()
+        crawler.fetch_with_fallback.return_value = _crawl_ok(
+            {"text": resp.text}
+        )
+        crawler._http_request.return_value = _crawl_fail("unused")
+        crawler._contest_map = {"1202Contest_j": "DEGwer2023"}
+
+        new_items = [
+            {"id": "1202Contest_j", "contest_id": "DEGwer2023",
+             "title": "B - vs. DEGwer"},
+        ]
+        enriched = []
+        for prob in new_items:
+            sid = prob.get("id", "")
+            detail = crawler.fetch_problem(str(sid))
+            if detail is not None:
+                if detail.success and detail.data:
+                    enriched.append(dict(detail.data))
+                else:
+                    continue
+            else:
+                enriched.append(prob)
+
+        assert len(enriched) == 1, (
+            f"English problem must be included. "
+            f"Got {len(enriched)} items"
+        )
+        assert enriched[0]["source_id"] == "1202Contest_j"
+        assert len(str(enriched[0].get("description", ""))) > 50

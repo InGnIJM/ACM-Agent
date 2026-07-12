@@ -41,17 +41,34 @@ class AtCoderCrawler(BaseCrawler):
     BASE_URL: str = "https://atcoder.jp"
     KENKOO_API: str = "https://kenkoooo.com/atcoder"
 
+    # Japanese section heading patterns in <h3> tags.
+    # Ordered longest-first so 入力例/出力例 match before 入力/出力.
+    _JAPANESE_HEADINGS: tuple = (
+        "問題文", "制約", "入力例", "出力例", "入力", "出力",
+    )
+
+    # Title patterns that indicate a CDN/WAF block page rather than
+    # a real AtCoder problem.  The crawler treats these as fetch
+    # failures so the browser fallback (or retry) is triggered.
+    _BLOCK_PAGE_TITLE_PATTERNS: tuple = (
+        "ERROR: The request could not be satisfied",
+        "Access Denied",
+        "403 ERROR",
+        "404 Not Found",
+    )
+
     @staticmethod
     def _default_qps() -> float:
         return 3.0
 
-    # ── contest_id cache ────────────────────────────────────────
-    # kenkoooo's merged-problems.json has unreliable problem IDs
-    # (e.g. "1202Contest_a" where contest slug is actually "DEGwer2023").
-    # We load contest-problem.json to get the real contest_id for each
-    # problem_id so URLs like /contests/{real_contest}/tasks/{pid} work.
+    # ── kenkoooo caches ────────────────────────────────────────
+    # Caching avoids re-downloading large JSON files (~900 KB total)
+    # for every single fetch_problem call — a 100-problem batch would
+    # otherwise make 300 HTTP requests instead of ~100.
 
-    _contest_map: Optional[dict] = None  # problem_id -> contest_id
+    _contest_map: Optional[dict] = None       # problem_id -> contest_id
+    _merged_problems: Optional[list] = None   # merged-problems.json cache
+    _problem_models: Optional[dict] = None    # problem-models.json cache
 
     def _load_contest_map(self) -> dict:
         """Lazily load contest-problem.json mapping problem_id -> contest_id."""
@@ -76,6 +93,49 @@ class AtCoderCrawler(BaseCrawler):
             logger.warning("Failed to load contest-problem.json: %s", exc)
             self._contest_map = {}
         return self._contest_map
+
+    def _load_merged_problems(self) -> list:
+        """Lazily load merged-problems.json (cached)."""
+        if self._merged_problems is not None:
+            return self._merged_problems
+        try:
+            result = self._http_request(
+                f"{self.KENKOO_API}/resources/merged-problems.json"
+            )
+            if result.success and isinstance(result.data, list):
+                self._merged_problems = result.data
+                logger.info("Loaded %d merged problems", len(self._merged_problems))
+            else:
+                # Don't cache invalid responses — let caller see the
+                # raw data and report "Unexpected format" rather than
+                # "Empty cache".
+                logger.warning(
+                    "merged-problems.json: unexpected format (type=%s)",
+                    type(result.data).__name__,
+                )
+                return result.data if result.success else []
+        except Exception as exc:
+            logger.warning("Failed to load merged-problems.json: %s", exc)
+            self._merged_problems = []
+        return self._merged_problems
+
+    def _load_problem_models(self) -> dict:
+        """Lazily load problem-models.json (cached)."""
+        if self._problem_models is not None:
+            return self._problem_models
+        try:
+            result = self._http_request(
+                f"{self.KENKOO_API}/resources/problem-models.json"
+            )
+            if result.success and isinstance(result.data, dict):
+                self._problem_models = result.data
+                logger.info("Loaded %d problem models", len(self._problem_models))
+            else:
+                self._problem_models = {}
+        except Exception as exc:
+            logger.warning("Failed to load problem-models.json: %s", exc)
+            self._problem_models = {}
+        return self._problem_models
 
     # ── helpers ─────────────────────────────────────────────────
 
@@ -396,15 +456,20 @@ class AtCoderCrawler(BaseCrawler):
         }
 
         # Section labels -> result key mapping
+        # Include both English and Japanese headings for bilingual pages
         SECTION_MAP: Dict[str, str] = {
             "problem statement": "description",
             "problem": "description",
             "story": "description",
+            "問題文": "description",  # Japanese: problem statement
             "constraints": "constraints",
             "constraint": "constraints",
-            "input": "input_format",
+            "制約": "constraints",  # Japanese: constraints
+            "入力": "input_format",  # Japanese: input
             "output": "output_format",
+            "input": "input_format",
             "input format": "input_format",
+            "出力": "output_format",  # Japanese: output
             "output format": "output_format",
         }
 
@@ -437,6 +502,12 @@ class AtCoderCrawler(BaseCrawler):
                     pre.replace_with(f"\n```\n{pre_text}\n```\n")
             AtCoderCrawler._merge_adjacent_strings(soup)
             return AtCoderCrawler._normalize_text(soup.get_text("\n", strip=True))
+
+        # Track if we found an empty Problem Statement section
+        # In some problems, the Problem Statement heading is followed
+        # immediately by another heading with no content in between.
+        # In that case, we should use the next non-empty section as description.
+        _empty_problem_statement = False
 
         for idx, part in enumerate(parts):
             if idx == 0:
@@ -544,11 +615,62 @@ class AtCoderCrawler(BaseCrawler):
                 AtCoderCrawler._merge_adjacent_strings(section_soup)
                 text = section_soup.get_text("\n", strip=True)
                 text = AtCoderCrawler._normalize_text(text)
-                existing = result.get(section_key, "")
-                if isinstance(existing, str) and existing:
-                    result[section_key] = existing + "\n\n" + text
-                else:
-                    result[section_key] = text
+                # Only add non-empty sections
+                if text:
+                    existing = result.get(section_key, "")
+                    if isinstance(existing, str) and existing:
+                        result[section_key] = existing + "\n\n" + text
+                    else:
+                        result[section_key] = text
+                    # Reset empty problem statement flag if we found content
+                    if section_key == "description":
+                        _empty_problem_statement = False
+                elif section_key == "description":
+                    # Mark that we found an empty Problem Statement section
+                    _empty_problem_statement = True
+
+        # ── Handle empty Problem Statement ─────────────────────────
+        # If Problem Statement section was empty, try to find description
+        # from the next non-empty section that looks like content
+        if _empty_problem_statement and not result.get("description"):
+            # Look for content in the next section after Problem Statement
+            # This handles cases where Problem Statement heading is followed
+            # immediately by another heading with the actual content
+            for idx, part in enumerate(parts):
+                if idx == 0:
+                    continue
+                m = re.match(r"(.*?)</h3>(.*)", part, re.DOTALL | re.IGNORECASE)
+                if not m:
+                    continue
+                heading_text = BeautifulSoup(m.group(1), "html.parser").get_text(strip=True)
+                section_html = m.group(2)
+                # Skip sample sections
+                if SAMPLE_INPUT_RE.match(heading_text) or SAMPLE_OUTPUT_RE.match(heading_text) or SAMPLE_RE.match(heading_text):
+                    continue
+                # Check if this section has content
+                section_soup = BeautifulSoup(section_html, "html.parser")
+                text = section_soup.get_text(strip=True)
+                if text and len(text) > 20:
+                    # This looks like it could be the problem description
+                    AtCoderCrawler._process_katex(section_soup)
+                    AtCoderCrawler._process_images(section_soup)
+                    AtCoderCrawler._unwind_inline(section_soup)
+                    AtCoderCrawler._process_lists(section_soup)
+                    AtCoderCrawler._process_tables(section_soup)
+                    AtCoderCrawler._process_paragraphs(section_soup)
+                    for pre in section_soup.find_all("pre"):
+                        AtCoderCrawler._merge_adjacent_strings(pre)
+                        pre_text = pre.get_text()
+                        if "$" in pre_text:
+                            pre.replace_with(f"\n{pre_text.strip()}\n")
+                        else:
+                            pre.replace_with(f"\n```\n{pre_text}\n```\n")
+                    AtCoderCrawler._merge_adjacent_strings(section_soup)
+                    text = section_soup.get_text("\n", strip=True)
+                    text = AtCoderCrawler._normalize_text(text)
+                    if text:
+                        result["description"] = text
+                        break
 
         # ── Pair sample inputs / outputs / notes ────────────────
         # notes align with sample_outputs (explanations live in the
@@ -662,70 +784,67 @@ class AtCoderCrawler(BaseCrawler):
                 retry_count=page_result.retry_count,
             )
 
-        # Extract sections
-        sections = self._extract_sections(html)
-
-        # Try to get a clean title from the page
-        try:
-            from bs4 import BeautifulSoup
-
-            title_soup = BeautifulSoup(html, "html.parser")
-            title_tag = title_soup.find("title")
-            title = title_tag.get_text(strip=True) if title_tag else source_id
-            # Strip "ContestName - " prefix if present
-            if " - " in title:
-                _, _, title = title.partition(" - ")
-            import html as _html
-
-            title = _html.unescape(title)
-        except Exception:
-            title = source_id
-
-        # ── Ensure constraints is extracted ──────────────────────────
-        if not sections.get("constraints"):
-            constraint_match = re.search(
-                r'<h3[^>]*>\s*(?:Constraints|Constraint)\s*</h3>\s*(.*?)(?=<h3[^>]*>|$)',
-                html,
-                re.DOTALL | re.IGNORECASE,
-            )
-            if constraint_match:
-                try:
-                    from bs4 import BeautifulSoup
-
-                    c_soup = BeautifulSoup(
-                        constraint_match.group(1), "html.parser"
-                    )
-                    self._process_katex(c_soup)
-                    self._process_images(c_soup)
-                    self._unwind_inline(c_soup)
-                    self._process_lists(c_soup)
-                    self._process_paragraphs(c_soup)
-                    c_text = c_soup.get_text("\n", strip=True)
-                    sections["constraints"] = self._normalize_text(c_text)
-                except Exception:
-                    pass
-
-        # ── Japanese statement detection ─────────────────────────
+        # ── Japanese statement detection (BEFORE section extraction) ──
         # Check #task-statement: skip if only Japanese content.
-        # Three cases:
-        #   1. No spans at all (old contests) → check for CJK chars
+        # Three cases (with h3 heading check as sub-case of case 1):
+        #   1. No spans at all (old contests) → h3 headings → CJK fallback
         #   2. lang-ja exists but no lang-en → skip
         #   3. Both exist but lang-en is empty/short → skip
+        #
+        # Exception: dp/tdpc problems are always allowed — they are
+        # well-known educational problems that users specifically seek
+        # out, even though they are Japanese-only.
+        # abc/arc problems are also allowed — older problems may be
+        # Japanese-only but _extract_sections can still parse them.
+        _is_dp_tdpc = source_id.startswith(("dp_", "tdpc_"))
+        _skip_japanese = not _is_dp_tdpc
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            return CrawlResult(
+                success=False,
+                error="BeautifulSoup not available",
+                source="http",
+            )
         _ts = BeautifulSoup(html, "html.parser").select_one("#task-statement")
-        if _ts:
+        if _ts and _skip_japanese:
             _lang_en = _ts.select_one("span.lang-en")
             _lang_ja = _ts.select_one("span.lang-ja")
             if not _lang_en and not _lang_ja:
                 # Old-style page: no language spans.
-                # Check if the content is Japanese by looking for
-                # CJK characters + Japanese-specific patterns.
+                # First check h3 headings for Japanese section text
+                # (問題文/制約/入力/出力 etc.) — a content-level check
+                # that catches Japanese pages regardless of missing spans.
+                for _h3 in _ts.find_all("h3"):
+                    _h3_text = _h3.get_text(strip=True)
+                    if any(
+                        _jp in _h3_text
+                        for _jp in self._JAPANESE_HEADINGS
+                    ):
+                        return CrawlResult(
+                            success=False,
+                            error=(
+                                f"Problem '{source_id}' has Japanese "
+                                f"section headings "
+                                f"(問題文/制約/入力/出力), skipping"
+                            ),
+                            source=page_result.source,
+                        )
+                # CJK fallback — check if the content is Japanese by
+                # looking for CJK characters + Japanese-specific patterns.
                 _ts_text = _ts.get_text()
                 _has_cjk = bool(re.search(r'[぀-ヿ一-鿿]', _ts_text))
                 _has_eng = bool(re.search(
                     r'\b(Problem|Constraints?|Input|Output|Sample)\b',
                     _ts_text, re.IGNORECASE,
                 ))
-                if _has_cjk and not _has_eng:
+                # Calculate CJK ratio to detect mixed content
+                # where h3 tags are English but body is Japanese
+                _cjk_chars = len(re.findall(r'[぀-呣一-鿿]', _ts_text))
+                _total_chars = len(_ts_text.strip())
+                _cjk_ratio = _cjk_chars / _total_chars if _total_chars > 0 else 0
+                # Use 15% threshold to catch more Japanese content
+                if _has_cjk and (not _has_eng or _cjk_ratio > 0.15):
                     return CrawlResult(
                         success=False,
                         error=(
@@ -755,6 +874,122 @@ class AtCoderCrawler(BaseCrawler):
                         source=page_result.source,
                     )
 
+        # Extract sections
+        sections = self._extract_sections(html)
+
+        # Try to get a clean title from the page
+        try:
+            from bs4 import BeautifulSoup
+
+            title_soup = BeautifulSoup(html, "html.parser")
+            title_tag = title_soup.find("title")
+            title = title_tag.get_text(strip=True) if title_tag else source_id
+            # Strip "ContestName - " prefix if present
+            if " - " in title:
+                _, _, title = title.partition(" - ")
+            import html as _html
+
+            title = _html.unescape(title)
+        except Exception:
+            title = source_id
+
+        # ── CDN / WAF block-page detection ──────────────────────────
+        # CloudFront / AWS WAF sometimes returns a 200-block-page
+        # whose <title> says "ERROR: The request could not be
+        # satisfied".  The HTTP layer treats it as success, so
+        # fetch_with_fallback never escalates to the browser.
+        # Detect this here and force a browser-only retry.
+        _is_block_title = any(
+            pat in title for pat in self._BLOCK_PAGE_TITLE_PATTERNS
+        )
+        _has_content = bool(
+            sections.get("description")
+            or sections.get("constraints")
+            or sections.get("input_format")
+        )
+        if _is_block_title and not _has_content:
+            if page_result.source == "browser":
+                # Already tried browser — give up.
+                return CrawlResult(
+                    success=False,
+                    error=(
+                        f"Block page detected (title='{title}') "
+                        f"even after browser fallback"
+                    ),
+                    source="browser",
+                )
+            logger.warning(
+                "Block-page title detected (title=%r), forcing browser retry for %s",
+                title,
+                problem_url,
+            )
+            browser_result = self._browser_request(problem_url)
+            if not browser_result.success:
+                return browser_result
+            html2 = self._extract_html_text(browser_result)
+            if not html2:
+                return CrawlResult(
+                    success=False,
+                    error="Empty browser response after block-page retry",
+                    source="browser",
+                )
+            sections = self._extract_sections(html2)
+            # Re-extract title from browser page
+            try:
+                title_soup2 = BeautifulSoup(html2, "html.parser")
+                title_tag2 = title_soup2.find("title")
+                title = title_tag2.get_text(strip=True) if title_tag2 else source_id
+                if " - " in title:
+                    _, _, title = title.partition(" - ")
+                import html as _html2
+                title = _html2.unescape(title)
+            except Exception:
+                title = source_id
+            page_result = browser_result  # update page_result for downstream metadata
+
+            # Double-check: if browser also returned a block page, fail.
+            _is_block_title2 = any(
+                pat in title for pat in self._BLOCK_PAGE_TITLE_PATTERNS
+            )
+            _has_content2 = bool(
+                sections.get("description")
+                or sections.get("constraints")
+                or sections.get("input_format")
+            )
+            if _is_block_title2 and not _has_content2:
+                return CrawlResult(
+                    success=False,
+                    error=(
+                        f"Block page detected (title='{title}') "
+                        f"even after browser fallback"
+                    ),
+                    source="browser",
+                )
+
+        # ── Ensure constraints is extracted ──────────────────────────
+        if not sections.get("constraints"):
+            constraint_match = re.search(
+                r'<h3[^>]*>\s*(?:Constraints|Constraint)\s*</h3>\s*(.*?)(?=<h3[^>]*>|$)',
+                html,
+                re.DOTALL | re.IGNORECASE,
+            )
+            if constraint_match:
+                try:
+                    from bs4 import BeautifulSoup
+
+                    c_soup = BeautifulSoup(
+                        constraint_match.group(1), "html.parser"
+                    )
+                    self._process_katex(c_soup)
+                    self._process_images(c_soup)
+                    self._unwind_inline(c_soup)
+                    self._process_lists(c_soup)
+                    self._process_paragraphs(c_soup)
+                    c_text = c_soup.get_text("\n", strip=True)
+                    sections["constraints"] = self._normalize_text(c_text)
+                except Exception:
+                    pass
+
         # ── Build base data dict ────────────────────────────────────
         data_dict: Dict[str, object] = {
             "source_id": source_id,
@@ -769,37 +1004,23 @@ class AtCoderCrawler(BaseCrawler):
             "source_url": problem_url,
         }
 
-        # ── Fetch kenkoooo merged-problems.json for metadata ────────
+        # ── Attach kenkoooo metadata (cached) ──────────────────────
         try:
-            merged_url = (
-                f"{self.KENKOO_API}/resources/merged-problems.json"
-            )
-            merged_result = self._http_request(merged_url)
-            if merged_result.success and isinstance(
-                merged_result.data, list
-            ):
-                for p in merged_result.data:
-                    if isinstance(p, dict) and p.get("id") == source_id:
-                        if "point" in p and p["point"] is not None:
-                            data_dict["point"] = p["point"]
-                        if "solver_count" in p:
-                            data_dict["solver_count"] = p["solver_count"]
-                        break
+            for p in self._load_merged_problems():
+                if isinstance(p, dict) and p.get("id") == source_id:
+                    if "point" in p and p["point"] is not None:
+                        data_dict["point"] = p["point"]
+                    if "solver_count" in p:
+                        data_dict["solver_count"] = p["solver_count"]
+                    break
         except Exception:
             pass
 
-        # ── Fetch difficulty from problem-models.json ───────────────
+        # ── Attach difficulty from problem-models (cached) ─────────
         try:
-            models_url = (
-                f"{self.KENKOO_API}/resources/problem-models.json"
-            )
-            models_result = self._http_request(models_url)
-            if models_result.success and isinstance(
-                models_result.data, dict
-            ):
-                model = models_result.data.get(source_id)
-                if isinstance(model, dict) and "difficulty" in model:
-                    data_dict["difficulty"] = model["difficulty"]
+            model = self._load_problem_models().get(source_id)
+            if isinstance(model, dict) and "difficulty" in model:
+                data_dict["difficulty"] = model["difficulty"]
         except Exception:
             pass
 
@@ -1551,34 +1772,58 @@ class AtCoderCrawler(BaseCrawler):
             "math_and_algorithm",  # problem_id uses underscores
         )
         # ── Allowed contest patterns ─────────────────────────────
-        # Only contest prefixes that represent real rated/competitive
-        # contests.  dp / tdpc are also allowed.
+        # Only ABC and ARC contests are crawled.
         _CONTEST_RE = re.compile(
-            r'^(abc|arc|agc|ahc|pakencamp|joi|jag|utpc|icpc|'
-            r'dp|tdpc)'
+            r'^(abc|arc|agc)'
             r'(\d|[_-])'  # must be followed by digit or separator
         )
         # Lazy-load contest-problem.json for contest_id validation
         _contest_map = self._load_contest_map()
-        merged_url = (
-            "https://kenkoooo.com/atcoder/resources/merged-problems.json"
-        )
-        logger.debug("AtCoder fetching merged-problems.json")
-
-        result = self._http_request(merged_url)
-        if not result.success:
-            return result
-
-        problems = result.data
+        problems = self._load_merged_problems()
         if not isinstance(problems, list):
             return CrawlResult(
                 success=False,
                 error="Unexpected merged-problems response format",
                 source="http",
             )
+        if not problems:
+            return CrawlResult(
+                success=False,
+                error="Empty merged-problems cache",
+                source="http",
+            )
 
-        matching: List[dict] = []
-        for p in problems:
+        # ── English-first priority ordering ──────────────────────
+        # ABC/ARC/AGC/AHC and dp/tdpc are almost always English;
+        # other contests (xmascon, wupc, yahoo_procon, etc.) are
+        # often Japanese-only.  Two-pass collection ensures the
+        # enrichment loop sees English problems first and doesn't
+        # burn its max_rounds budget on Japanese-only contests.
+        _ENGLISH_PREFIXES = ("abc", "arc", "agc")
+
+        def _is_english_contest(pid_lower: str) -> bool:
+            """Heuristic: problem ID starts with a known English prefix."""
+            return any(pid_lower.startswith(p) for p in _ENGLISH_PREFIXES)
+
+        def _passes_filter(pid: str, pid_lower: str) -> bool:
+            """Return True if this problem passes the contest filter."""
+            if any(pid_lower.startswith(pref)
+                   for pref in _TUTORIAL_PREFIXES):
+                return False
+            cid = _contest_map.get(pid, "")
+            cid_lower = cid.lower() if cid else ""
+            pid_allowed = bool(_CONTEST_RE.match(pid_lower))
+            cid_allowed = bool(
+                cid_lower
+                and not any(cid_lower.startswith(pref)
+                           for pref in _TUTORIAL_PREFIXES)
+                and re.search(r'\d', cid_lower)
+            )
+            return pid_allowed or cid_allowed
+
+        # Collect all matching problems first (tag-filtered + contest-filtered)
+        all_matching: List[dict] = []
+        for p in reversed(problems):
             if not isinstance(p, dict):
                 continue
             pid = p.get("id", "")
@@ -1590,58 +1835,34 @@ class AtCoderCrawler(BaseCrawler):
             if not pid_lower.startswith(tag.lower()):
                 continue
 
-            # Skip tutorial / educational problem sets
-            if any(pid_lower.startswith(pref)
-                   for pref in _TUTORIAL_PREFIXES):
+            if not _passes_filter(pid, pid_lower):
                 continue
 
-            # ── Only allow contest + dp/tdpc problems ─────────
-            # Check both the problem ID prefix and the contest_id
-            # from kenkoooo's contest-problem.json.
-            # dp_ / tdpc_ are always allowed (may map to tessoku-book
-            # in kenkoooo data, which would be blocked by tutorial check).
-            _is_dp = pid_lower.startswith("dp_") or pid_lower.startswith("tdpc_")
-            if _is_dp:
-                pass  # always allowed
-            else:
-                cid = _contest_map.get(pid, "")
-                cid_lower = cid.lower() if cid else ""
-                pid_allowed = bool(_CONTEST_RE.match(pid_lower))
-                cid_allowed = bool(
-                    cid_lower
-                    and not any(cid_lower.startswith(pref)
-                               for pref in _TUTORIAL_PREFIXES)
-                    and re.search(r'\d', cid_lower)  # has a digit
-                )
-                if not pid_allowed and not cid_allowed:
-                    continue
-
-            # Attach source_url if missing
             if "source_url" not in p:
                 cid = p.get("contest_id", "")
                 p["source_url"] = (
                     f"{self.BASE_URL}/contests/{cid}/tasks/{pid}"
                 )
-            matching.append(p)
-            if len(matching) >= count:
-                break
+            all_matching.append(p)
 
-        # ── Fetch difficulty from problem-models.json ───────────────
+        # Sort: English-prefix problems first (newest within each
+        # group), then the rest.  This ensures the enrichment loop
+        # hits English problems before exhausting its round budget.
+        english = [p for p in all_matching
+                   if _is_english_contest(p.get("id", "").lower())]
+        others = [p for p in all_matching
+                  if not _is_english_contest(p.get("id", "").lower())]
+        matching = (english + others)[:count]
+
+        # ── Attach difficulty from problem-models (cached) ─────────
         try:
-            models_url = (
-                f"{self.KENKOO_API}/resources/problem-models.json"
-            )
-            models_result = self._http_request(models_url)
-            if models_result.success and isinstance(
-                models_result.data, dict
-            ):
-                models_data = models_result.data
-                for p in matching:
-                    pid = p.get("id", "")
-                    if pid and pid in models_data:
-                        model = models_data[pid]
-                        if isinstance(model, dict) and "difficulty" in model:
-                            p["difficulty"] = model["difficulty"]
+            models_data = self._load_problem_models()
+            for p in matching:
+                pid = p.get("id", "")
+                if pid and pid in models_data:
+                    model = models_data[pid]
+                    if isinstance(model, dict) and "difficulty" in model:
+                        p["difficulty"] = model["difficulty"]
         except Exception:
             pass
 
@@ -1804,36 +2025,62 @@ def main(argv: Optional[list] = None) -> None:
             tag = params.get("tags", "")
             count = int(params.get("count", 50))
             skip_ids = set(params.get("skip_ids", []))
-            fetch_count = max(count + len(skip_ids), count * 3)
-            result = executor.execute(
-                "fetch_problems_by_tag", str(tag), fetch_count
-            )
-            if result.success and result.data:
-                new_items = []
-                for p in result.data:
-                    pid = p.get("id", "")
-                    if pid not in skip_ids:
-                        new_items.append(p)
-                new_items = new_items[:count]
-                # Enrich with full detail
-                enriched = []
+            # Loop: keep fetching + enriching in batches until we have
+            # `count` valid (non-Japanese) problems or kenkoooo runs dry.
+            enriched: list = []
+            batch_size = max(count * 3, 30)
+            max_rounds = 5
+            fetch_ok = False  # True if at least one API call succeeded
+            for _round in range(max_rounds):
+                fetch_count = batch_size + len(skip_ids)
+                batch_result = executor.execute(
+                    "fetch_problems_by_tag", str(tag), fetch_count
+                )
+                if not batch_result.success or not batch_result.data:
+                    break  # API failure or no more problems
+                fetch_ok = True
+                new_items = [
+                    p for p in batch_result.data
+                    if p.get("id", "") not in skip_ids
+                ]
+                if not new_items:
+                    break  # everything already imported
                 for prob in new_items:
+                    if len(enriched) >= count:
+                        break
                     sid = prob.get("id", "")
-                    if sid:
-                        detail = executor.execute(
-                            "fetch_problem", str(sid)
-                        )
-                        if detail and detail.success and detail.data:
+                    if not sid:
+                        enriched.append(prob)
+                        continue
+                    detail = executor.execute(
+                        "fetch_problem", str(sid)
+                    )
+                    if detail is not None:
+                        if detail.success and detail.data:
                             enriched.append(dict(detail.data))
                         else:
-                            enriched.append(prob)
+                            # Japanese-only / broken page — skip
+                            logger.info(
+                                "Skipping %s: %s", sid, detail.error
+                            )
                     else:
                         enriched.append(prob)
-                result = CrawlResult(
-                    success=True,
-                    data=enriched,
-                    source=result.source,
-                )
+                    # Track as "seen" so next round skips it
+                    skip_ids.add(sid)
+                if len(enriched) >= count:
+                    break
+            # ── Save & fetch solutions ──────────────────────────────
+            result = CrawlResult(
+                success=fetch_ok,
+                data=enriched,
+                error=(
+                    None if fetch_ok
+                    else "No problems fetched (API may be rate-limited "
+                         "or all problems are Japanese-only)"
+                ),
+                source="http",
+            )
+            if enriched:
                 _save_result(
                     crawler, result.data, "problems", str(tag) or "all"
                 )
