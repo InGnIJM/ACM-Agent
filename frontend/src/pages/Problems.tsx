@@ -1,5 +1,5 @@
-import { useState, useMemo, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
+import { useState, useMemo, useCallback, useEffect } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import Box from "@mui/material/Box";
 import Typography from "@mui/material/Typography";
 import Chip from "@mui/material/Chip";
@@ -33,6 +33,10 @@ import Alert from "@mui/material/Alert";
 import DeleteIcon from "@mui/icons-material/Delete";
 import SearchIcon from "@mui/icons-material/Search";
 import PsychologyIcon from "@mui/icons-material/Psychology";
+import FirstPageIcon from "@mui/icons-material/FirstPage";
+import LastPageIcon from "@mui/icons-material/LastPage";
+import NavigateBeforeIcon from "@mui/icons-material/NavigateBefore";
+import NavigateNextIcon from "@mui/icons-material/NavigateNext";
 import useApi from "../hooks/useApi";
 import usePagination from "../hooks/usePagination";
 import * as problemsApi from "../services/problems";
@@ -76,21 +80,49 @@ function diffColor(v: number): string {
 
 export default function Problems() {
   const navigate = useNavigate();
-  const { page, limit, setPage, setLimit, setTotal, total } = usePagination();
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // ── Restore state from URL ─────────────────────────────
+  const initPage = Math.max(1, Number(searchParams.get("page")) || 1);
+  const initLimit = [10, 20, 50, 100, 200].includes(Number(searchParams.get("limit")))
+    ? Number(searchParams.get("limit")) : 20;
+  const initSearch = searchParams.get("q") || "";
+  const initPlatform = searchParams.get("platform") || "";
+  const initDiffRange = Number(searchParams.get("diff")) || 0;
+  const initTagFilter = searchParams.get("tag") || "";
+  const initSearchMode = searchParams.get("mode") === "vector" ? "vector" : "normal";
+  const initVectorQuery = searchParams.get("vq") || "";
+
+  const { page, limit, setPage, setLimit, setTotal, total } = usePagination(initPage, initLimit);
 
   // ── Filters ──────────────────────────────────────────────
-  const [search, setSearch] = useState("");
-  const [platform, setPlatform] = useState("");
-  const [diffRange, setDiffRange] = useState(0);
-  const [tagFilter, setTagFilter] = useState("");
+  const [search, setSearch] = useState(initSearch);
+  const [platform, setPlatform] = useState(initPlatform);
+  const [diffRange, setDiffRange] = useState(initDiffRange);
+  const [tagFilter, setTagFilter] = useState(initTagFilter);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [jumpToPage, setJumpToPage] = useState("");
 
   // ── Vector search ──────────────────────────────────────
-  const [searchMode, setSearchMode] = useState<"normal" | "vector">("normal");
-  const [vectorQuery, setVectorQuery] = useState("");
+  const [searchMode, setSearchMode] = useState<"normal" | "vector">(initSearchMode);
+  const [vectorQuery, setVectorQuery] = useState(initVectorQuery);
   const [vectorLoading, setVectorLoading] = useState(false);
   const [vectorResults, setVectorResults] = useState<VectorSearchResultItem[] | null>(null);
   const [vectorError, setVectorError] = useState("");
+
+  // ── Sync state → URL ───────────────────────────────────
+  useEffect(() => {
+    const next = new URLSearchParams();
+    if (page !== 1) next.set("page", String(page));
+    if (limit !== 20) next.set("limit", String(limit));
+    if (search) next.set("q", search);
+    if (platform) next.set("platform", platform);
+    if (diffRange) next.set("diff", String(diffRange));
+    if (tagFilter) next.set("tag", tagFilter);
+    if (searchMode !== "normal") next.set("mode", searchMode);
+    if (vectorQuery) next.set("vq", vectorQuery);
+    setSearchParams(next, { replace: true });
+  }, [page, limit, search, platform, diffRange, tagFilter, searchMode, vectorQuery]);
 
   const doVectorSearch = async () => {
     if (!vectorQuery.trim()) return;
@@ -425,8 +457,58 @@ export default function Problems() {
           rowsPerPage={limit}
           onPageChange={(_, p) => setPage(p + 1)}
           onRowsPerPageChange={(e) => setLimit(Number(e.target.value))}
-          rowsPerPageOptions={[10, 20, 50]}
+          rowsPerPageOptions={[10, 20, 50, 100, 200]}
           labelRowsPerPage="每页行数"
+          labelDisplayedRows={({ from, to, count }) => `${from}–${to} / 共 ${count} 条 · 第 ${page} / ${Math.ceil(count / limit) || 1} 页`}
+          ActionsComponent={({ count, page: p0, rowsPerPage, onPageChange }) => {
+            const totalPages = Math.ceil(count / rowsPerPage) || 1;
+            return (
+              <Stack direction="row" alignItems="center" spacing={0.5} sx={{ ml: 1 }}>
+                <IconButton size="small" disabled={p0 === 0} onClick={() => onPageChange(null as any, 0)}>
+                  <FirstPageIcon fontSize="small" />
+                </IconButton>
+                <IconButton size="small" disabled={p0 === 0} onClick={() => onPageChange(null as any, p0 - 1)}>
+                  <NavigateBeforeIcon fontSize="small" />
+                </IconButton>
+                <IconButton size="small" disabled={p0 >= totalPages - 1} onClick={() => onPageChange(null as any, p0 + 1)}>
+                  <NavigateNextIcon fontSize="small" />
+                </IconButton>
+                <IconButton size="small" disabled={p0 >= totalPages - 1} onClick={() => onPageChange(null as any, totalPages - 1)}>
+                  <LastPageIcon fontSize="small" />
+                </IconButton>
+                <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, ml: 1 }}>
+                  <Typography variant="body2" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>跳至</Typography>
+                  <TextField
+                    size="small"
+                    variant="outlined"
+                    value={jumpToPage}
+                    onChange={(e) => setJumpToPage(e.target.value.replace(/\D/g, ""))}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && jumpToPage) {
+                        const target = Math.max(1, Math.min(totalPages, Number(jumpToPage)));
+                        onPageChange(null as any, target - 1);
+                        setJumpToPage("");
+                      }
+                    }}
+                    sx={{ width: 64 }}
+                    inputProps={{ style: { textAlign: "center", padding: "4px 8px" } }}
+                  />
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    disabled={!jumpToPage}
+                    onClick={() => {
+                      const target = Math.max(1, Math.min(totalPages, Number(jumpToPage)));
+                      onPageChange(null as any, target - 1);
+                      setJumpToPage("");
+                    }}
+                  >
+                    Go
+                  </Button>
+                </Box>
+              </Stack>
+            );
+          }}
         />
       </TableContainer>
 
