@@ -60,3 +60,6 @@ ollama-models/
 
 # Enriched output data
 data/enriched/
+
+# Raw crawled data
+data/raw/
