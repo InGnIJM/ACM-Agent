@@ -559,3 +559,390 @@ describe('CrawlerController.buildFullContent — AtCoder data-loss regression', 
     });
   });
 });
+
+// ===========================================================================
+// callDeepSeekSummarize — timeout + retry (fetch failed / RPM guard)
+// ===========================================================================
+describe('CrawlerController.callDeepSeekSummarize — retry & timeout', () => {
+  let controller: CrawlerController;
+  const originalFetch = global.fetch;
+  const originalEnv = { ...process.env };
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      controllers: [CrawlerController],
+      providers: [
+        { provide: PythonService, useValue: mockPythonService },
+        { provide: PrismaService, useValue: mockPrisma },
+        { provide: VectorService, useValue: mockVectorService },
+      ],
+    }).compile();
+    controller = moduleRef.get<CrawlerController>(CrawlerController);
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // Ensure API key is set so resolveDeepSeekConfig() returns a config
+    process.env.DEEPSEEK_API_KEY = 'sk-test-key';
+    process.env.DEEPSEEK_PROVIDER = 'deepseek';
+    process.env.DEEPSEEK_BASE_URL = 'https://api.test.com/v1';
+    process.env.DEEPSEEK_MAX_RETRIES = '2'; // keep tests fast
+    process.env.DEEPSEEK_TIMEOUT_MS = '100';
+    delete process.env.DEEPSEEK_CALL_DELAY_MS;
+    delete process.env.DEEPSEEK_RPM;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  afterAll(() => {
+    process.env = originalEnv;
+  });
+
+  const callSummarize = (title = 'Test', content = 'content', diff = 'easy') =>
+    (controller as any).callDeepSeekSummarize(title, content, diff);
+
+  // ------------------------------------------------------------------
+  // Happy path
+  // ------------------------------------------------------------------
+  it('returns summary on first attempt', async () => {
+    global.fetch = jest.fn().mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: '好的总结' } }] }),
+    } as any);
+
+    const result = await callSummarize();
+    expect(result).toBe('好的总结');
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns null when no API key configured', async () => {
+    delete process.env.DEEPSEEK_API_KEY;
+    global.fetch = jest.fn();
+
+    const result = await callSummarize();
+    expect(result).toBeNull();
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  // ------------------------------------------------------------------
+  // Network-error retry
+  // ------------------------------------------------------------------
+  it('retries on fetch failed (network error) and succeeds', async () => {
+    global.fetch = jest.fn()
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: 'retry success' } }] }),
+      } as any);
+
+    const result = await callSummarize();
+    expect(result).toBe('retry success');
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries on ECONNRESET and succeeds', async () => {
+    global.fetch = jest.fn()
+      .mockRejectedValueOnce(new TypeError('ECONNRESET'))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: 'ok' } }] }),
+      } as any);
+
+    const result = await callSummarize();
+    expect(result).toBe('ok');
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries on ECONNREFUSED and succeeds', async () => {
+    global.fetch = jest.fn()
+      .mockRejectedValueOnce(new TypeError('ECONNREFUSED'))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: 'ok' } }] }),
+      } as any);
+
+    const result = await callSummarize();
+    expect(result).toBe('ok');
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries on ENOTFOUND (DNS failure) and succeeds', async () => {
+    global.fetch = jest.fn()
+      .mockRejectedValueOnce(new TypeError('ENOTFOUND'))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: 'ok' } }] }),
+      } as any);
+
+    const result = await callSummarize();
+    expect(result).toBe('ok');
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  // ------------------------------------------------------------------
+  // Timeout (AbortError) retry
+  // ------------------------------------------------------------------
+  it('retries on AbortError (timeout) and succeeds', async () => {
+    const abortErr = new DOMException('The operation was aborted', 'AbortError');
+    global.fetch = jest.fn()
+      .mockRejectedValueOnce(abortErr)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: 'after timeout' } }] }),
+      } as any);
+
+    const result = await callSummarize();
+    expect(result).toBe('after timeout');
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  // ------------------------------------------------------------------
+  // HTTP-error retry
+  // ------------------------------------------------------------------
+  it('retries on 429 rate limit and succeeds', async () => {
+    const rateLimitResp = {
+      ok: false,
+      status: 429,
+      headers: { get: () => null } as any,
+      text: async () => 'rate limited',
+    };
+    global.fetch = jest.fn()
+      .mockResolvedValueOnce(rateLimitResp as any)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: 'after 429' } }] }),
+      } as any);
+
+    const result = await callSummarize();
+    expect(result).toBe('after 429');
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('honors Retry-After header on 429', async () => {
+    const rateLimitResp = {
+      ok: false,
+      status: 429,
+      headers: { get: (_: string) => '1' } as any, // 1 second
+      text: async () => 'rate limited',
+    };
+    global.fetch = jest.fn()
+      .mockResolvedValueOnce(rateLimitResp as any)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: 'ok' } }] }),
+      } as any);
+
+    // Spy on setTimeout to verify Retry-After delay is used
+    const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
+    const result = await callSummarize();
+    expect(result).toBe('ok');
+    // Verify setTimeout was called with ~1000ms (Retry-After value)
+    const delayCall = setTimeoutSpy.mock.calls.find(
+      ([, ms]: any) => typeof ms === 'number' && ms >= 900 && ms <= 1100,
+    );
+    expect(delayCall).toBeTruthy();
+    setTimeoutSpy.mockRestore();
+  });
+
+  it('retries on 500 server error and succeeds', async () => {
+    global.fetch = jest.fn()
+      .mockResolvedValueOnce({
+        ok: false, status: 500, text: async () => 'internal error',
+      } as any)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: 'after 500' } }] }),
+      } as any);
+
+    const result = await callSummarize();
+    expect(result).toBe('after 500');
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries on 503 server error and succeeds', async () => {
+    global.fetch = jest.fn()
+      .mockResolvedValueOnce({
+        ok: false, status: 503, text: async () => 'unavailable',
+      } as any)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: 'ok' } }] }),
+      } as any);
+
+    const result = await callSummarize();
+    expect(result).toBe('ok');
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  // ------------------------------------------------------------------
+  // Non-retryable errors (no retry)
+  // ------------------------------------------------------------------
+  it('does NOT retry on 400 bad request', async () => {
+    global.fetch = jest.fn().mockResolvedValueOnce({
+      ok: false, status: 400, text: async () => 'bad request',
+    } as any);
+
+    await expect(callSummarize()).rejects.toThrow('DeepSeek API error 400');
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT retry on 401 unauthorized', async () => {
+    global.fetch = jest.fn().mockResolvedValueOnce({
+      ok: false, status: 401, text: async () => 'unauthorized',
+    } as any);
+
+    await expect(callSummarize()).rejects.toThrow('DeepSeek API error 401');
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  // ------------------------------------------------------------------
+  // Exhausted retries
+  // ------------------------------------------------------------------
+  it('throws after exhausting all retries on network error', async () => {
+    global.fetch = jest.fn()
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockRejectedValueOnce(new TypeError('fetch failed')); // 3 attempts = maxRetries(2) + 1
+
+    await expect(callSummarize()).rejects.toThrow(
+      'DeepSeek summarize failed after 3 attempts: fetch failed',
+    );
+    expect(global.fetch).toHaveBeenCalledTimes(3);
+  }, 20000);
+
+  it('throws after exhausting all retries on 429', async () => {
+    const rateLimitResp = {
+      ok: false,
+      status: 429,
+      headers: { get: () => null } as any,
+      text: async () => 'rate limited',
+    };
+    global.fetch = jest.fn()
+      .mockResolvedValueOnce(rateLimitResp as any)
+      .mockResolvedValueOnce(rateLimitResp as any)
+      .mockResolvedValueOnce(rateLimitResp as any);
+
+    await expect(callSummarize()).rejects.toThrow(
+      'DeepSeek API error 429: rate limited',
+    );
+    expect(global.fetch).toHaveBeenCalledTimes(3);
+  }, 20000);
+
+  // ------------------------------------------------------------------
+  // AbortController signal is passed to fetch
+  // ------------------------------------------------------------------
+  it('passes AbortController signal to fetch', async () => {
+    global.fetch = jest.fn().mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: 'ok' } }] }),
+    } as any);
+
+    await callSummarize();
+
+    const fetchCall = (global.fetch as jest.Mock).mock.calls[0];
+    expect(fetchCall[1].signal).toBeInstanceOf(AbortSignal);
+  });
+
+  // ------------------------------------------------------------------
+  // thinking disabled (avoid reasoning_token waste)
+  // ------------------------------------------------------------------
+  it('includes thinking: {type: disabled} in request body', async () => {
+    global.fetch = jest.fn().mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: 'ok' } }] }),
+    } as any);
+
+    await callSummarize();
+
+    const fetchCall = (global.fetch as jest.Mock).mock.calls[0];
+    const body = JSON.parse(fetchCall[1].body);
+    expect(body.thinking).toEqual({ type: 'disabled' });
+  });
+});
+
+// ===========================================================================
+// _getSummarizeCallDelay — rate-limit guard
+// ===========================================================================
+describe('CrawlerController._getSummarizeCallDelay', () => {
+  let controller: CrawlerController;
+  const originalEnv = { ...process.env };
+
+  beforeAll(async () => {
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      controllers: [CrawlerController],
+      providers: [
+        { provide: PythonService, useValue: mockPythonService },
+        { provide: PrismaService, useValue: mockPrisma },
+        { provide: VectorService, useValue: mockVectorService },
+      ],
+    }).compile();
+    controller = moduleRef.get<CrawlerController>(CrawlerController);
+  });
+
+  beforeEach(() => {
+    delete process.env.DEEPSEEK_CALL_DELAY_MS;
+    delete process.env.DEEPSEEK_RPM;
+    delete process.env.DEEPSEEK_PROVIDER;
+  });
+
+  afterAll(() => {
+    process.env = originalEnv;
+  });
+
+  const getDelay = () => (controller as any)._getSummarizeCallDelay() as number;
+
+  it('returns explicit DEEPSEEK_CALL_DELAY_MS when set', () => {
+    process.env.DEEPSEEK_CALL_DELAY_MS = '5000';
+    expect(getDelay()).toBe(5000);
+  });
+
+  it('returns 0 when DEEPSEEK_CALL_DELAY_MS is explicitly 0', () => {
+    process.env.DEEPSEEK_CALL_DELAY_MS = '0';
+    process.env.DEEPSEEK_PROVIDER = 'aliyun'; // would default to 3000, but explicit 0 wins
+    expect(getDelay()).toBe(0);
+  });
+
+  it('computes delay from DEEPSEEK_RPM (rounds up)', () => {
+    process.env.DEEPSEEK_RPM = '10';
+    expect(getDelay()).toBe(6000); // 60000 / 10
+  });
+
+  it('computes delay from DEEPSEEK_RPM (ceiling division)', () => {
+    process.env.DEEPSEEK_RPM = '9';
+    expect(getDelay()).toBe(6667); // Math.ceil(60000 / 9)
+  });
+
+  it('DEEPSEEK_CALL_DELAY_MS takes priority over DEEPSEEK_RPM', () => {
+    process.env.DEEPSEEK_CALL_DELAY_MS = '1000';
+    process.env.DEEPSEEK_RPM = '10'; // would give 6000
+    expect(getDelay()).toBe(1000);
+  });
+
+  it('defaults to 3000ms for aliyun provider', () => {
+    process.env.DEEPSEEK_PROVIDER = 'aliyun';
+    expect(getDelay()).toBe(3000);
+  });
+
+  it('defaults to 0ms for deepseek official', () => {
+    process.env.DEEPSEEK_PROVIDER = 'deepseek';
+    expect(getDelay()).toBe(0);
+  });
+
+  it('defaults to 0ms when provider is unset', () => {
+    expect(getDelay()).toBe(0);
+  });
+
+  it('ignores invalid DEEPSEEK_RPM (NaN)', () => {
+    process.env.DEEPSEEK_RPM = 'not-a-number';
+    process.env.DEEPSEEK_PROVIDER = 'deepseek';
+    expect(getDelay()).toBe(0); // falls through to default
+  });
+
+  it('ignores zero DEEPSEEK_RPM', () => {
+    process.env.DEEPSEEK_RPM = '0';
+    process.env.DEEPSEEK_PROVIDER = 'deepseek';
+    expect(getDelay()).toBe(0);
+  });
+});
